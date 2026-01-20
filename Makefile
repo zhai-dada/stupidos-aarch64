@@ -72,9 +72,14 @@ disk:
 	@mv script/disk.img $(DISK_IMG)
 
 .PHONY: mount-disk
-mount-disk: $(DISK_IMG)
+mount-disk:
 	@echo "Mounting disk image..."
 	@mkdir -p $(MOUNT_DIR)
+	@if [ -f $(DISK_IMG) ];then	\
+		echo "no disk";			\
+		else					\
+		make disk;				\
+	fi
 	@sudo losetup -fP --show $(DISK_IMG) | sudo tee /tmp/loopdev
 	@sudo mount $$(cat /tmp/loopdev)p1 $(MOUNT_DIR)
 
@@ -100,7 +105,7 @@ install: $(KERNEL_BIN) mount-disk
 # ============================================
 
 .PHONY: run
-run: $(KERNEL_BIN) $(DISK_IMG) install
+run: $(KERNEL_BIN) install
 	@echo "Starting QEMU..."
 	$(QEMU) -machine virt \
 		-cpu cortex-a72 \
@@ -114,7 +119,7 @@ run: $(KERNEL_BIN) $(DISK_IMG) install
 		-serial mon:stdio
 
 .PHONY: debug
-debug: $(KERNEL_BIN) $(DISK_IMG) install
+debug: $(KERNEL_BIN) install
 	@echo "Starting QEMU for debugging..."
 	@echo "Start GDB with: 'target remote localhost:1234' $(KERNEL_ELF)"
 	$(QEMU) -machine virt \
