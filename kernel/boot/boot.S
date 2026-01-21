@@ -14,6 +14,10 @@ proc_hang:
 master:
 	adr	x0, __bss_start
 	adr	x1, __bss_end
+	sub x2, x1, x0
+	mov x1, #0
+	
+	bl memset
 
 	ldr	x0, =stack
 	mov	sp, x0
