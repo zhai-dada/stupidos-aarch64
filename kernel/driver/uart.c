@@ -1,7 +1,7 @@
 #include "driver/uart.h"
 #include "lib/librw.h"
 
-void uart_send_string(uint8_t *str)
+void uart_send_string(int8_t *str)
 {
     for (int i = 0; str[i] != '\0'; i++)
     {
@@ -36,3 +36,22 @@ void uart_init(void)
     /* Enable UART and RX/TX */
     *base_cr = UART_CR_UARTEN | UART_CR_TXE | UART_CR_RXE;
 }
+
+int32_t uart_printf(int8_t* front, int8_t* back, const int8_t* fmt, ...)
+{
+    int8_t buffer[512];
+    int32_t i = 0;
+
+	va_list args;
+	va_start(args, fmt);
+	i = vsprintf(buffer, fmt, args);
+	va_end(args);
+
+    uart_send_string((int8_t*)front);
+    uart_send_string((int8_t*)back);
+    uart_send_string((int8_t*)buffer);
+    uart_send_string((int8_t*)UART_ATTR_RESET);
+
+    return i;
+}
+

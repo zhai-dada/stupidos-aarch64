@@ -2,6 +2,8 @@
 #define __UART_H__
 
 #include "asm/types.h"
+#include "stdarg.h"
+#include "printk.h"
 
 #define CONSOLE_BAUDRATE       115200
 #define CONSOLE_UART_CLK_IN_HZ 24000000
@@ -73,8 +75,28 @@
 #define UART_IMSC_RTIM (1 << 6)
 #define UART_IMSC_RXIM (1 << 4)
 
+#define UART_ATTR_RESET           "\x1b[0m"
+#define UART_ATTR_FRONT_BLACK     "\x1b[30m"
+#define UART_ATTR_FRONT_RED       "\x1b[31m"
+#define UART_ATTR_FRONT_GREEN     "\x1b[32m"
+#define UART_ATTR_FRONT_YELLOW    "\x1b[33m"
+#define UART_ATTR_FRONT_BLUE      "\x1b[34m"
+#define UART_ATTR_FRONT_MAGENTA   "\x1b[35m"
+#define UART_ATTR_FRONT_CYAN      "\x1b[36m"
+#define UART_ATTR_FRONT_WHITE     "\x1b[37m"
+
+#define UART_ATTR_BACK_BLACK      "\x1b[40m"
+#define UART_ATTR_BACK_RED        "\x1b[41m"
+#define UART_ATTR_BACK_GREEN      "\x1b[42m"
+#define UART_ATTR_BACK_YELLOW     "\x1b[43m"
+#define UART_ATTR_BACK_BLUE       "\x1b[44m"
+#define UART_ATTR_BACK_MAGENTA    "\x1b[45m"
+#define UART_ATTR_BACK_CYAN       "\x1b[46m"
+#define UART_ATTR_BACK_WHITE      "\x1b[47m"
+
 void uart_init(void);
 void uart_putc(uint8_t ch);
-void uart_send_string(uint8_t *str);
+void uart_send_string(int8_t *str);
+int32_t uart_printf(int8_t* front, int8_t* back, const int8_t* fmt, ...);
 
 #endif

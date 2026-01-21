@@ -14,7 +14,7 @@ OBJCOPY         :=  $(CROSS_COMPILE)objcopy
 QEMU           :=  qemu-system-aarch64
 
 # Compiler flags
-CFLAGS          :=  -g -Wall -nostdlib -nostdinc -Iinclude
+CFLAGS          :=  -g -Wall -fno-builtin -Iinclude
 ASFLAGS         :=  -g -Iinclude
 LDFLAGS         :=  -nostdlib
 
