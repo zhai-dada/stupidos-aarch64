@@ -25,6 +25,8 @@
         );                                          \
 })
 
+#define nop()       asm volatile ("nop":::"memory")
+
 uint64_t read_daif(void);
 void write_daif(uint64_t val);
 

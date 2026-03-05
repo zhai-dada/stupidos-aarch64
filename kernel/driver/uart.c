@@ -1,5 +1,6 @@
 #include "driver/uart.h"
 #include "lib/librw.h"
+#include "lib/libasm.h"
 #include "debug.h"
 
 void uart_send_string(int8_t *str)
@@ -15,21 +16,38 @@ void uart_putc(uint8_t ch)
     /* Wait until there is space in the FIFO or device is disabled */
     while (get32(PL011_UART0_BASE + UART_FR) & UART_FR_TXFF)
     {
-        ;
+        nop();
     }
     /* Send the character */
     put32((PL011_UART0_BASE + UART_DR), (uint32_t)ch);
 }
 
+int32_t uart_getc(void)
+{
+    while (get32(PL011_UART0_BASE + UART_FR) & UART_FR_RXFE)
+    {
+        return -1;
+    }
+    return get32(PL011_UART0_BASE + UART_DR);
+}
+
+
 void uart_init(void)
 {
     // Init the uart
+
     /* Clear all errors */
     *(uint32_t *)(PL011_UART0_BASE + UART_RSR_ECR) = 0;
+
     /* Disable everything */
     *(uint32_t *)(PL011_UART0_BASE + UART_CR) = 0;
+
     /* Configure TX to 8 bits, 1 stop bit, no parity, fifo disabled. */
     *(uint32_t *)(PL011_UART0_BASE + UART_LCR_H) = UART_LCRH_WLEN_8;
+
+    /* Enable Interrupts*/
+    *(uint32_t *)(PL011_UART0_BASE + UART_IMSC) = UART_IMSC_RTIM | UART_IMSC_RXIM;
+
     /* Enable UART and RX/TX */
     *(uint32_t *)(PL011_UART0_BASE + UART_LCR_H) = UART_CR_UARTEN | UART_CR_TXE | UART_CR_RXE;
     

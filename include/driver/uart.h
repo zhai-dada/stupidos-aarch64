@@ -96,6 +96,8 @@
 
 void uart_init(void);
 void uart_putc(uint8_t ch);
+int32_t uart_getc(void);
+
 void uart_send_string(int8_t *str);
 int32_t uart_printf(int8_t* front, int8_t* back, const int8_t* fmt, ...);
 
