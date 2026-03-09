@@ -7,7 +7,7 @@ void uart_send_string(int8_t *str)
 {
     for (int i = 0; str[i] != '\0'; i++)
     {
-        uart_putc((char)str[i]);
+        uart_putc((int8_t)str[i]);
     }
 }
 
@@ -26,7 +26,7 @@ int32_t uart_getc(void)
 {
     while (get32(PL011_UART0_BASE + UART_FR) & UART_FR_RXFE)
     {
-        return -1;
+        nop();
     }
     return get32(PL011_UART0_BASE + UART_DR);
 }

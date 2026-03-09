@@ -23,6 +23,6 @@ int kernel_main(void)
 
     while(1)
     {
-        ;
+        uart_putc(uart_getc());
     }
 }
