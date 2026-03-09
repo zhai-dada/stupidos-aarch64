@@ -70,6 +70,5 @@
 
 void gic_init(void);
 void gicv2_handle_irq(void);
-void gic_init(void);
 
 #endif
