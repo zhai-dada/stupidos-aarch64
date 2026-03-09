@@ -71,7 +71,7 @@ static void plat_handle_timer_irq()
     );
 }
 
-static volatile uint64_t jiffies;
+volatile uint64_t jiffies;
 
 void handle_timer_irq()
 {

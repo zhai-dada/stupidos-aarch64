@@ -96,6 +96,21 @@
 	kernel_exit
 .endm
 
+.macro irq_entry
+	kernel_entry
+	mov x0, sp
+	bl do_irq
+	kernel_exit
+.endm
+
+.macro sync_entry
+	kernel_entry
+	mov x0, sp
+	mrs x1, esr_el1
+	bl do_sync
+	kernel_exit
+.endm
+
 /*
    每个表项是128字节
    align 7表示128字节对齐
@@ -146,20 +161,12 @@ vectors:
 	kernel_ventry el0_fiq_invalid
 	kernel_ventry el0_error_invalid
 
-el1_sync_invalid:
-	inv_entry 1, BAD_SYNC
-el1_irq_invalid:
-	inv_entry 1, BAD_IRQ
-el1_fiq_invalid:
-	inv_entry 1, BAD_FIQ
-el1_error_invalid:
-	inv_entry 1, BAD_ERROR
+el1_sync_invalid: 	sync_entry
+el1_irq_invalid: 	irq_entry
+el1_fiq_invalid: 	inv_entry 1, BAD_FIQ
+el1_error_invalid: 	inv_entry 1, BAD_ERROR
 
-el0_sync_invalid:
-	inv_entry 0, BAD_SYNC
-el0_irq_invalid:
-	inv_entry 0, BAD_IRQ
-el0_fiq_invalid:
-	inv_entry 0, BAD_FIQ
-el0_error_invalid:
-	inv_entry 0, BAD_ERROR
+el0_sync_invalid:	sync_entry
+el0_irq_invalid: 	irq_entry
+el0_fiq_invalid: 	inv_entry 0, BAD_FIQ
+el0_error_invalid: 	inv_entry 0, BAD_ERROR
