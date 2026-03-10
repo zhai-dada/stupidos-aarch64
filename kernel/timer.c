@@ -1,6 +1,7 @@
 #include "debug.h"
 #include "timer.h"
 #include "lib/librw.h"
+#include "gicv2.h"
 
 #define TICK_RATE_HZ 1
 
@@ -73,7 +74,7 @@ static void plat_handle_timer_irq()
 
 volatile uint64_t jiffies;
 
-void handle_timer_irq()
+void handle_timer_irq(void)
 {
 	printk("jiffies %x\n", ++jiffies);
 	plat_handle_timer_irq();
@@ -83,6 +84,9 @@ void timer_init(void)
 {
 	jiffies = 0;
 	plat_timer_init();
+    
+    gic_enable_irq(GIC_INTID_VIRT_TIMER);
+
     printk("[timer\tinit]: init ok\n");
     return;
 }

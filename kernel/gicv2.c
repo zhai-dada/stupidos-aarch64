@@ -2,10 +2,13 @@
 #include "lib/librw.h"
 #include "debug.h"
 #include "irq.h"
+#include "timer.h"
+
+_gic_info global_gic_info;
 
 static uint8_t gicv2_get_cpumask(void)
 {
-    uint8_t i, mask;
+    uint8_t i = 0, mask = 0;
     for (i = mask = 0; i < 32; i += 4)
     {
         mask = get32(GICD_ITARGETSR);
@@ -34,7 +37,10 @@ static void gicv2_dist_init()
     nr_lines = get32(GICD_TYPER) & 0x1f;
     nr_lines = (nr_lines + 1) * 32;
 
-    printk("[GICv2\tinit]: %d irq(s), %d cpu(s)\n", nr_lines, 1 + ((type & 0x0e0) >> 5));
+    global_gic_info.irq_num = nr_lines;
+    global_gic_info.cpu_num = ((type & 0x0e0) >> 5) + 1;
+
+    printk("[GICv2\tinit]: %d irq(s), %d cpu(s)\n", global_gic_info.irq_num, global_gic_info.cpu_num);
 
     /* Set all global interrupts to this CPU only */
     cpumask = gicv2_get_cpumask();
@@ -85,8 +91,8 @@ static void gicv2_cpu_init()
 		put32(GICD_IPRIORITYR + i * 4 / 4, GICD_INT_DEF_PRI_X4);
 	}
 
-	/* Ensure all SGI interrupts are now enabled */
-	put32(GICD_ISENABLER, GICD_INT_EN_SET_SGI);
+	// /* Ensure all SGI interrupts are now enabled */
+	// put32(GICD_ISENABLER, GICD_INT_EN_SET_SGI);
 
     /* Don't mask by priority */
     put32(GICC_PMR, GICC_INT_PRI_THRESHOLD);
@@ -147,8 +153,24 @@ void gic_init(void)
 	gicv2_cpu_init();
 
 	/* enable the ppi's irq */
-	put32(GICD_ISENABLER, GICD_INT_EN_CLR_PPI);
+	// put32(GICD_ISENABLER, GICD_INT_EN_CLR_PPI);
     printk("[GICv2\tinit]: init ok\n");
     return;
+}
+
+uint32_t gic_enable_irq(uint32_t irq)
+{
+    uint32_t reg = irq / 32;
+    uint32_t bit = irq % 32;
+
+    if(irq >= global_gic_info.irq_num)
+    {
+        printk("[gic_enable_irq\terror]: irq > irq_num\n");
+        return 0;
+    }
+    uint32_t reg_val = get32(GICD_ISENABLER + (reg * 4));
+    reg_val |= (1UL << bit);
+    put32(GICD_ISENABLER + (reg * 4), reg_val);
+    return (get32(GICD_ISENABLER + (reg * 4)) | (1UL << bit));
 }
 

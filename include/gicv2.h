@@ -2,6 +2,7 @@
 #define __GICV2_H__
 
 #include "asm/types.h"
+#include "irq.h"
 /*
     [VIRT_GIC_DIST] =           { 0x08000000, 0x00010000 },
     [VIRT_GIC_CPU] =            { 0x08010000, 0x00010000 },
@@ -68,7 +69,17 @@
 #define GICC_CTRL_EOImodeNS         (1 << GICC_CTRL_EOImodeNS_SHIFT)
 #define GICC_DIS_BYPASS_MASK        0x1e0
 
+typedef struct
+{
+    uint32_t irq_num;
+    uint32_t cpu_num;
+} _gic_info;
+
+extern _gic_info global_gic_info;
+
 void gic_init(void);
 void gicv2_handle_irq(void);
+
+uint32_t gic_enable_irq(uint32_t irq);
 
 #endif
