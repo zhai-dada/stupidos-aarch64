@@ -1,5 +1,7 @@
 #include "irq.h"
 
+void (*irq_handlers[MAX_IRQS])(void);
+
 static const char * const bad_mode_handler[] =
 {
 	"Sync Abort",
@@ -15,7 +17,7 @@ void do_irq(void *stack)
 	disable_irq();
 	// show_ptregs(regs);
 	
-	gicv2_handle_irq();
+	handle_irq();
 	enable_irq();
 	return;
 }
@@ -50,3 +52,19 @@ void bad_mode(void *stack, uint32_t reason, uint32_t esr)
 	}
 }
 
+void handle_irq(void)
+{
+	uint32_t irqnr = 0;
+	uint32_t irqstat = 0;
+
+	irqstat = get32(GICC_IAR);
+	irqnr = irqstat & 0x3ff;
+
+	if(irq_handlers[irqnr])
+	{
+		irq_handlers[irqnr]();
+	}
+
+	put32(GICC_EOIR, irqstat);
+	put32(GICC_DIR, irqstat);
+}

@@ -85,6 +85,8 @@ void timer_init(void)
 	jiffies = 0;
 	plat_timer_init();
     
+    irq_handlers[GIC_INTID_VIRT_TIMER] = handle_timer_irq;
+    
     gic_enable_irq(GIC_INTID_VIRT_TIMER);
 
     printk("[timer\tinit]: init ok\n");

@@ -113,33 +113,6 @@ static void gicv2_cpu_init()
     return;
 }
 
-void gicv2_handle_irq(void)
-{
-	uint32_t irqnr = 0;
-	uint32_t irqstat = 0;
-
-	irqstat = get32(GICC_IAR);
-	irqnr = irqstat & 0x3ff;
-
-	// printk("irq %d\n", irqnr);
-	switch (irqnr)
-    {
-        case GIC_INTID_EL1_PHYS_TIMER:
-        case GIC_INTID_VIRT_TIMER:
-        {
-            handle_timer_irq();
-            break;
-        }
-        default:
-        {
-            break;
-        }
-    }
-	put32(GICC_EOIR, irqstat);
-	put32(GICC_DIR, irqstat);
-}
-
-
 void gic_init(void)
 {
 	uint32_t cpuid = 0;

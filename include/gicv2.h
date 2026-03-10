@@ -78,7 +78,6 @@ typedef struct
 extern _gic_info global_gic_info;
 
 void gic_init(void);
-void gicv2_handle_irq(void);
 
 uint32_t gic_enable_irq(uint32_t irq);
 

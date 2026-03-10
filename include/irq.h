@@ -20,8 +20,15 @@
 #define BAD_FIQ         2
 #define BAD_ERROR       3
 
+#define MAX_IRQS    1024
+
+extern void (*irq_handlers[MAX_IRQS])(void);
+
+
 void do_irq(void *stack);
 void do_sync(void *stack, uint32_t esr);
 void bad_mode(void *stack, uint32_t reason, uint32_t esr);
+
+void handle_irq(void);
 
 #endif
