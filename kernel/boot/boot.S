@@ -23,6 +23,7 @@ master:
 	msr	vbar_el1, x0
 
 	ldr	x0, =stack
+	add x0, x0, #40960
 	mov	sp, x0
 
 	bl	kernel_main
