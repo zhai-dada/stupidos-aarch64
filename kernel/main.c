@@ -6,6 +6,7 @@
 #include "timer.h"
 #include "gicv2.h"
 #include "pt_regs.h"
+#include "mmu.h"
 
 int8_t stack[40960];
 
@@ -15,6 +16,8 @@ int kernel_main(void)
     
     disable_irq();
 
+    mmu_init();
+    
     gic_init();
 
     timer_init();
