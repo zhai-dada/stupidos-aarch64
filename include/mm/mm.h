@@ -16,12 +16,12 @@
 /*
  * Memory types available.
  */
-#define MT_DEVICE_nGnRnE	    0
-#define MT_DEVICE_nGnRE		    1
-#define MT_DEVICE_GRE		    2
-#define MT_NORMAL_NC		    3
-#define MT_NORMAL		        4
-#define MT_NORMAL_WT		    5
+#define MT_DEVICE_nGnRnE_IDX	    0
+#define MT_DEVICE_nGnRE_IDX		    1
+#define MT_DEVICE_GRE_IDX		    2
+#define MT_NORMAL_NC_IDX		    3
+#define MT_NORMAL_IDX		        4
+#define MT_NORMAL_WT_IDX		    5
 
 #define MAIR(attr, mt)	        ((attr) << ((mt) * 8))
 

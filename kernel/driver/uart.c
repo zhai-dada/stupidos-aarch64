@@ -97,5 +97,5 @@ int32_t uart_printf(int8_t* front, int8_t* back, const int8_t* fmt, ...)
 
 void uart_irq_handle(void)
 {
-    printk("uart %c\n", uart_getc());
+    printk("%c", uart_getc());
 }
