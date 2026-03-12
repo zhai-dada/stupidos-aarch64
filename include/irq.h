@@ -13,6 +13,8 @@
 #define GIC_INTID_EL3_PHYS_TIMER 29
 #define GIC_INTID_EL1_PHYS_TIMER 30
 
+#define UART_IRQ                 33
+
 #define IRQ_FRAME_SIZE  272
 
 #define BAD_SYNC        0

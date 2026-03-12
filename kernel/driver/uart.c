@@ -31,6 +31,25 @@ int32_t uart_getc(void)
     return get32(PL011_UART0_BASE + UART_DR);
 }
 
+void early_uart_init(void)
+{
+    // Init the uart
+
+    /* Clear all errors */
+    *(uint32_t *)(PL011_UART0_BASE + UART_RSR_ECR) = 0;
+
+    /* Disable everything */
+    *(uint32_t *)(PL011_UART0_BASE + UART_CR) = 0;
+
+    /* Configure TX to 8 bits, 1 stop bit, no parity, fifo disabled. */
+    *(uint32_t *)(PL011_UART0_BASE + UART_LCR_H) = UART_LCRH_WLEN_8;
+
+    /* Enable UART and RX/TX */
+    *(uint32_t *)(PL011_UART0_BASE + UART_LCR_H) = UART_CR_UARTEN | UART_CR_TXE | UART_CR_RXE;
+    
+    printk("[early_uart\tinit]: init ok\n");
+    return;
+}
 
 void uart_init(void)
 {
@@ -50,6 +69,9 @@ void uart_init(void)
 
     /* Enable UART and RX/TX */
     *(uint32_t *)(PL011_UART0_BASE + UART_LCR_H) = UART_CR_UARTEN | UART_CR_TXE | UART_CR_RXE;
+    
+    irq_handlers[UART_IRQ] = uart_irq_handle;
+    gic_enable_irq(UART_IRQ);
     
     printk("[uart\tinit]: init ok\n");
     return;
@@ -73,3 +95,7 @@ int32_t uart_printf(int8_t* front, int8_t* back, const int8_t* fmt, ...)
     return i;
 }
 
+void uart_irq_handle(void)
+{
+    printk("uart %c\n", uart_getc());
+}

@@ -12,7 +12,7 @@ int8_t stack[40960];
 
 int kernel_main(void)
 {
-    uart_init();
+    early_uart_init();
     
     disable_irq();
 
@@ -20,12 +20,14 @@ int kernel_main(void)
     
     gic_init();
 
+    uart_init();
+    
     timer_init();
     
     enable_irq();
 
     while(1)
     {
-        uart_putc(uart_getc());
+        // uart_putc(uart_getc());
     }
 }

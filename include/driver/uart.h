@@ -4,6 +4,7 @@
 #include "asm/types.h"
 #include "stdarg.h"
 #include "printk.h"
+#include "irq.h"
 
 #define CONSOLE_BAUDRATE       115200
 #define CONSOLE_UART_CLK_IN_HZ 24000000
@@ -94,11 +95,14 @@
 #define UART_ATTR_BACK_CYAN       "\x1b[46m"
 #define UART_ATTR_BACK_WHITE      "\x1b[47m"
 
+void early_uart_init(void);
 void uart_init(void);
 void uart_putc(uint8_t ch);
 int32_t uart_getc(void);
 
 void uart_send_string(int8_t *str);
 int32_t uart_printf(int8_t* front, int8_t* back, const int8_t* fmt, ...);
+
+void uart_irq_handle(void);
 
 #endif
