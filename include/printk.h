@@ -1,6 +1,8 @@
 #ifndef __PRINTK_H__
 #define __PRINTK_H__
 
+#define CONFIG_PRINTK_ENABLE
+
 #include "asm/types.h"
 #include "stdarg.h"
 #include "lib/libstr.h"
@@ -19,5 +21,13 @@
 
 int32_t vsprintf(int8_t *buf, const int8_t *fmt, va_list args);
 int32_t sprintf(int8_t *buffer, const int8_t *fmt, ...);
+
+#ifdef CONFIG_PRINTK_ENABLE
+#define printk(fmt, arg...)     \
+    uart_printf(UART_ATTR_BACK_BLACK, UART_ATTR_FRONT_GREEN, fmt, ##arg)
+#else
+#define printk(fmt, arg...)
+#endif
+
 
 #endif

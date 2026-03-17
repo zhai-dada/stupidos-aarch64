@@ -1,15 +1,15 @@
 #ifndef __DEBUG_H__
 #define __DEBUG_H__
 
-#define DEBUG_ENABLE 1
+#define CONFIG_DEBUG_ENABLE
 
 #include "driver/uart.h"
 
-#if DEBUG_ENABLE
-#define printk(fmt, arg...)     \
+#ifdef CONFIG_DEBUG_ENABLE
+#define debug(fmt, arg...)     \
     uart_printf(UART_ATTR_BACK_BLACK, UART_ATTR_FRONT_GREEN, fmt, ##arg)
 #else
-#define printk(fmt, arg...)
+#define debug(fmt, arg...)
 #endif
 
 #endif
