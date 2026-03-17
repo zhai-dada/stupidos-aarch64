@@ -107,18 +107,18 @@
  * MAIR ATTRIBUTE
  * 
  */
-#define MAIR_DEVICE_nGnRnE_ATTR     0x00
-#define MAIR_DEVICE_nGnRE_ATTR      0x04
-#define MAIR_DEVICE_nGRE_ATTR       0x08
-#define MAIR_DEVICE_GRE_ATTR        0x0c
+#define MAIR_DEVICE_nGnRnE_ATTR     0x00UL
+#define MAIR_DEVICE_nGnRE_ATTR      0x04UL
+#define MAIR_DEVICE_nGRE_ATTR       0x08UL
+#define MAIR_DEVICE_GRE_ATTR        0x0cUL
 // undefined
-#define MAIR_UNDEFINED              0x03
+#define MAIR_UNDEFINED_ATTR         0x03UL
 // 关闭高速缓存
-#define MAIR_NORMAL_NC_ATTR         0x44
+#define MAIR_NORMAL_NC_ATTR         0x44UL
 // 写直通策略
-#define MAIR_NORMAL_WT_ATTR         0xbb
+#define MAIR_NORMAL_WT_ATTR         0xbbUL
 // 回写策略
-#define MAIR_NORMAL_ATTR            0xff
+#define MAIR_NORMAL_ATTR            0xffUL
 
 /*
  * TCR flags.
