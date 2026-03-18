@@ -1,8 +1,7 @@
 ARCH            :=  arm64
 CROSS_COMPILE   :=  aarch64-none-linux-gnu-
 BUILD_DIR       :=  build
-BOOT_DIR        :=  boot
-BIOS            :=  $(BOOT_DIR)/u-boot.bin
+BOOT_DIR		:= 	boot
 DISK_IMG        :=  $(BOOT_DIR)/disk.img
 MOUNT_DIR       :=  mnt
 
@@ -11,10 +10,13 @@ CC              :=  $(CROSS_COMPILE)gcc
 AS              :=  $(CROSS_COMPILE)as
 LD              :=  $(CROSS_COMPILE)ld
 OBJCOPY         :=  $(CROSS_COMPILE)objcopy
+OBJDUMP         :=  $(CROSS_COMPILE)objdump
+DEBUGFILE		:= debug.s
+
 QEMU           :=  qemu-system-aarch64
 
 # Compiler flags
-CFLAGS          :=  -g -Wall -fno-builtin -Iinclude -O0
+CFLAGS          :=  -g -Wall -fno-builtin -Iinclude -O0 -march=armv8-a+nofp
 ASFLAGS         :=  -g -Iinclude
 LDFLAGS         :=  -nostdlib
 
@@ -118,7 +120,7 @@ run: $(KERNEL_BIN) install
 		-display gtk \
 		-device virtio-net-device,netdev=net0 -netdev user,id=net0\
 		-device virtio-sound-device,audiodev=audio0 -audiodev sdl,id=audio0\
-		-bios $(BIOS) \
+		-kernel ./build/stupidos.elf \
 		-drive file=$(DISK_IMG),if=virtio,format=raw,id=hd0 \
 		-serial mon:stdio
 
@@ -127,6 +129,7 @@ run: $(KERNEL_BIN) install
 debug: $(KERNEL_BIN) install
 	@echo "Starting QEMU for debugging..."
 	@echo "Start GDB with: 'target remote localhost:1234' $(KERNEL_ELF)"
+	$(OBJDUMP) -D ./build/stupidos.elf > $(DEBUGFILE)
 	$(QEMU) -M virt \
 		-cpu cortex-a72 \
 		-smp 4 \
@@ -138,7 +141,7 @@ debug: $(KERNEL_BIN) install
 		-display gtk \
 		-device virtio-net-device,netdev=net0 -netdev user,id=net0\
 		-device virtio-sound-device,audiodev=audio0 -audiodev sdl,id=audio0\
-		-bios $(BIOS) \
+		-kernel ./build/stupidos.elf \
 		-drive file=$(DISK_IMG),if=virtio,format=raw,id=hd0 \
 		-serial mon:stdio \
 		-S -s
