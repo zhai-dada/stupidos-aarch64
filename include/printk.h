@@ -6,6 +6,7 @@
 #include "asm/types.h"
 #include "stdarg.h"
 #include "lib/libstr.h"
+#include "driver/uart.h"
 
 /**
  * 格式化显示，格式符
