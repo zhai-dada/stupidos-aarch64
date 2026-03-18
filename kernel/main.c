@@ -11,8 +11,12 @@
 
 int8_t stack[40960];
 
+extern uint64_t __bss_start, __bss_end;
+
 int kernel_main(void)
 {
+    memset((int8_t*)&__bss_start, 0, (&__bss_end - &__bss_start));
+    
     early_uart_init();
     
     disable_irq();
@@ -26,7 +30,7 @@ int kernel_main(void)
     timer_init();
     
     enable_irq();
-    
+
     debug("Hello debug\n");
     assert(5 > 6);
     

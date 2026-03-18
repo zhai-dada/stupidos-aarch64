@@ -12,14 +12,7 @@ proc_hang:
 	b 	proc_hang
 
 master:
-	adr	x0, __bss_start
-	adr	x1, __bss_end
-
-	sub x2, x1, x0
-	mov x1, #0
-	bl memset
-
-	adr	x0, vectors
+	ldr	x0, =vectors
 	msr	vbar_el1, x0
 
 	ldr	x0, =stack
