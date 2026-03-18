@@ -1,5 +1,8 @@
 #include "lib/libmem.h"
 
+extern void *__memset_16bytes(void *s, uint64_t val, size_t count);
+extern void *__memset_1bytes(void *s, uint32_t c, size_t count);
+
 static void *__memset(int8_t *s, int32_t c, size_t count)
 {
     int8_t *p = s;
