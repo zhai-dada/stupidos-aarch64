@@ -154,6 +154,7 @@ debug: $(KERNEL_BIN) install
 clean:
 	@echo "Cleaning up..."
 	@rm -rf $(BUILD_DIR) $(MOUNT_DIR)
+	@rm -rf $(DEBUGFILE)
 	@sudo rm -rf /tmp/loopdev
 
 
