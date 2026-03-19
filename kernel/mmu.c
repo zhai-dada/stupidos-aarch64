@@ -1,6 +1,4 @@
 #include "mmu.h"
-#include "asm/types.h"
-#include "debug.h"
 
 void mmu_init(void)
 {
@@ -55,4 +53,30 @@ void mmu_init(void)
     
     printk("sctlr_el1 : %#x\n", sctlr_el1);
     return;
+}
+
+int enable_mmu(void)
+{
+	unsigned long tmp;
+	int tgran4;
+
+	tmp = read_sysreg(ID_AA64MMFR0_EL1);
+	tgran4 = (tmp >> ID_AA64MMFR0_TGRAN4_SHIFT) & 0xf;
+	if (tgran4 != ID_AA64MMFR0_TGRAN4_SUPPORTED)
+	{
+		return -1;
+	}
+
+	write_sysreg(init_pgdir, ttbr0_el1);
+	isb();
+
+	write_sysreg(SCTLR_ELx_M, sctlr_el1);
+	isb();
+	
+	asm("ic iallu");
+	
+	dsb(nsh);
+	isb();
+
+	return 0;
 }

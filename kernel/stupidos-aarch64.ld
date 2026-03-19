@@ -22,6 +22,11 @@ SECTIONS
         *(.data)
         *(.data.*)
     }
+
+    . = ALIGN(4K);
+    init_pgdir = .;
+    . += 4096;
+
     . = ALIGN(4K);
     __data_end = .;
 

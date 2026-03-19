@@ -33,7 +33,7 @@ void ramfb_init(uint8_t *fb_addr, uint32_t width, uint32_t height)
 
         if (strcmp((int8_t*)ramfb.name, "etc/ramfb") == 0)
         {
-            printk("[ramfb init] : %s select -> %x\n", ramfb.name, to_be16(ramfb.select));
+            printk("[ramfb\tinit]: %s select -> %x\n", ramfb.name, to_be16(ramfb.select));
             break;
         }
     }
@@ -64,6 +64,7 @@ void ramfb_init(uint8_t *fb_addr, uint32_t width, uint32_t height)
 
     // 填充成为纯白色背景
     __memset_4bytes((void *)ramfb_info.ramfb_base, COLOR_WHITE, ramfb_info.width * ramfb_info.height);
+    printk("[ramfb\tinit]: init ok\n");
 
     return;
 }

@@ -13,12 +13,10 @@
 
 int8_t stack[40960];
 
-#define FB_WIDTH 1280
-#define FB_HEIGHT 800
-#define FB_BPP 4 // RGB888
 extern uint8_t framebuffer[FB_WIDTH * FB_HEIGHT * FB_BPP];
 
 extern uint64_t __bss_start, __bss_end;
+extern uint64_t __kernel_start, __kernel_end;
 
 int32_t kernel_main(void)
 {
@@ -29,7 +27,7 @@ int32_t kernel_main(void)
     disable_irq();
 
     mmu_init();
-
+    
     gic_init();
 
     uart_init();
@@ -42,7 +40,7 @@ int32_t kernel_main(void)
 
     ramfb_putstring(COLOR_BLACK, COLOR_WHITE, (uint8_t*)"Hello World\n\btest");
 
-    assert(5 > 6);
+    assert(6 > 5);
 
     while (1)
     {
