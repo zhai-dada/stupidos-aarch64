@@ -5,10 +5,19 @@
 
 typedef struct
 {
-    uint32_t *base;     // Pointer to pixel memory
+    uint32_t *ramfb_base;     // Pointer to pixel memory
+    uint64_t ramfb_length;
+
     uint32_t width;     // Width in pixels
     uint32_t height;    // Height in pixels
-    uint32_t pitch;     // Bytes per row (may include padding)
+
+    uint32_t x_position;
+    uint32_t y_position;
+
+    uint32_t x_charsize;
+    uint32_t y_charsize;
+
+    uint32_t pps;
 } ramfb_info_t;
 
 typedef struct
@@ -30,6 +39,13 @@ typedef struct
 #define COLOR_BLUE    0x000000FF
 #define COLOR_CYAN    0x0000FFFF
 
-void setup_ramfb(uint8_t *fb_addr, uint32_t width, uint32_t height);
+#define FB_WIDTH    1280
+#define FB_HEIGHT   800
+#define FB_BPP      4 // RGB888
+
+extern ramfb_info_t ramfb_info;
+
+void ramfb_init(uint8_t *fb_addr, uint32_t width, uint32_t height);
+void ramfb_putstring(uint32_t fg, uint32_t bg, const uint8_t *s);
 
 #endif
