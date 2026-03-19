@@ -5,7 +5,7 @@
 
 void uart_send_string(int8_t *str)
 {
-    for (int i = 0; str[i] != '\0'; i++)
+    for (int32_t i = 0; str[i] != '\0'; i++)
     {
         uart_putc((int8_t)str[i]);
     }

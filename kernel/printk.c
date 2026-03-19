@@ -328,7 +328,7 @@ int32_t vsprintf(int8_t *buf, const int8_t *fmt, va_list args)
             uint8_t *ptr = va_arg(args, uint8_t *);
             for (uint32_t t = 0; t < 6; t++, ptr++)
             {
-                int num = *ptr;
+                int64_t num = *ptr;
                 str = number(str, num, 16, 2, precision, flags);
                 *str = ':';
                 str++;
