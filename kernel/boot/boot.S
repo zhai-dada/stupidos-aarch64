@@ -12,11 +12,12 @@ proc_hang:
 	b 	proc_hang
 
 master:
-	ldr	x0, =vectors
+	adrp x0, vectors
+	add x0, x0, #:lo12:vectors
 	msr	vbar_el1, x0
 
-	ldr	x0, =stack
-	add x0, x0, #40960
+	adrp x0, init_stack_end
+	add x0, x0, #:lo12:init_stack_end
 	mov	sp, x0
 
 	bl	kernel_main

@@ -11,8 +11,6 @@
 #include "driver/ramfb.h"
 #include "driver/fwcfg.h"
 
-int8_t stack[40960];
-
 extern uint8_t framebuffer[FB_WIDTH * FB_HEIGHT * FB_BPP];
 
 extern uint64_t __bss_start, __bss_end;
