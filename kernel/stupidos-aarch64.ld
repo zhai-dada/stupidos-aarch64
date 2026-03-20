@@ -22,12 +22,24 @@ SECTIONS
         *(.data)
         *(.data.*)
     }
+    . = ALIGN(4K);
 
-    . = ALIGN(4K);
-    init_pgdir = .;
+    init_pgd = .;
     . += 4096;
-    
     . = ALIGN(4K);
+
+    init_pud = .;
+    . += 4096;
+    . = ALIGN(4K);
+
+    init_pmd = .;
+    . += 4096;
+    . = ALIGN(4K);
+
+    init_pt = .;
+    . += 4096;
+    . = ALIGN(4K);
+
     init_stack_start = .;
     . += 4096;
     . = ALIGN(4K);

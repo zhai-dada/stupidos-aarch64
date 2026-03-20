@@ -7,7 +7,10 @@
 #include "debug.h"
 #include "asm/sysreg.h"
 
-extern uint64_t init_pgdir;
+extern uint64_t init_pgd;
+extern uint64_t init_pud;
+extern uint64_t init_pmd;
+extern uint64_t init_pt;
 
 void mmu_init(void);
 int enable_mmu(void);

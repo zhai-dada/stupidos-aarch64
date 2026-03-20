@@ -9,6 +9,7 @@ void mmu_init(void)
 	uint64_t tmp;
 	uint64_t parang;
 
+	// 
 	asm volatile
     (
         "tlbi vmalle1"
@@ -30,9 +31,13 @@ void mmu_init(void)
            
 	write_sysreg(mair, mair_el1);
 
+	// TG0 TG1 设置页面颗粒度
+	// TxSZ 设置输入地址最大值
 	tcr = TCR_TxSZ(VA_BITS) | TCR_TG_FLAGS;
 
 	tmp = read_sysreg(ID_AA64MMFR0_EL1);
+
+	// 系统支持最大的物理地址范围
 	parang = tmp & 0xf;
 	if (parang > ID_AA64MMFR0_PARANGE_48)
 	{
@@ -67,16 +72,26 @@ int enable_mmu(void)
 		return -1;
 	}
 
-	write_sysreg(init_pgdir, ttbr0_el1);
+	// PGD 页表基地址写入 ttbr0_el1
+	write_sysreg(init_pgd, ttbr0_el1);
 	isb();
 
+	// SCTLR M位,开启MMU
 	write_sysreg(SCTLR_ELx_M, sctlr_el1);
 	isb();
-	
+
+	// 清空所有 CPU 的指令缓存（当前 EL 可见范围）保证后续执行的指令一定从内存重新取
 	asm("ic iallu");
-	
 	dsb(nsh);
+
+	// 重新取指令
 	isb();
 
 	return 0;
+}
+
+void page_map_init(void)
+{
+
+	return;
 }
