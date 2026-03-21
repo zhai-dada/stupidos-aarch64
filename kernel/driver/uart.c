@@ -1,7 +1,11 @@
 #include "driver/uart.h"
 #include "lib/librw.h"
 #include "lib/libasm.h"
+#include "lib/libirq.h"
+#include "spinlock.h"
 #include "debug.h"
+
+static spinlock_t uart_log_lock = SPINLOCK_INIT;
 
 void uart_send_string(int8_t *str)
 {
@@ -81,16 +85,30 @@ int32_t uart_printf(int8_t* front, int8_t* back, const int8_t* fmt, ...)
 {
     int8_t buffer[2048];
     int32_t i = 0;
+    uint64_t daif;
 
 	va_list args;
 	va_start(args, fmt);
 	i = vsprintf(buffer, fmt, args);
 	va_end(args);
 
+    /*
+     * 多核环境下串口是全局共享资源。
+     * 这里同时关本地中断并持有全局日志锁，避免：
+     * 1. 不同 CPU 的 printk 互相打断
+     * 2. 同一 CPU 在持锁期间被中断后再次 printk 造成自锁
+     */
+    daif = read_daif();
+    disable_irq();
+    spin_lock(&uart_log_lock);
+
     uart_send_string((int8_t*)front);
     uart_send_string((int8_t*)back);
     uart_send_string((int8_t*)buffer);
     uart_send_string((int8_t*)UART_ATTR_RESET);
+
+    spin_unlock(&uart_log_lock);
+    write_daif(daif);
 
     return i;
 }

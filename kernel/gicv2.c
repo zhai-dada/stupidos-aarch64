@@ -1,5 +1,6 @@
 #include "gicv2.h"
 #include "lib/librw.h"
+#include "lib/libasm.h"
 #include "debug.h"
 #include "irq.h"
 #include "timer.h"
@@ -115,7 +116,7 @@ static void gicv2_cpu_init()
 
 void gic_init(void)
 {
-	uint32_t cpuid = 0;
+	uint32_t cpuid = arch_curr_cpu_id();
 
 	if (cpuid == 0)
 	{
@@ -146,4 +147,3 @@ uint32_t gic_enable_irq(uint32_t irq)
     put32(GICD_ISENABLER + (reg * 4), reg_val);
     return (get32(GICD_ISENABLER + (reg * 4)) | (1UL << bit));
 }
-

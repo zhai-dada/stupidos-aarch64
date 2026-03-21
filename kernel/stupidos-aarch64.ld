@@ -24,20 +24,36 @@ SECTIONS
     }
     . = ALIGN(4K);
 
-    init_pgd = .;
+    idmap_pgd = .;
     . += 4096;
     . = ALIGN(4K);
 
-    init_pud = .;
+    idmap_pud = .;
+    . += 2 * 4096;
+    . = ALIGN(4K);
+
+    idmap_pmd = .;
+    . += 4 * 4096;
+    . = ALIGN(4K);
+
+    idmap_pt = .;
+    . += 16 * 4096;
+    . = ALIGN(4K);
+
+    swapper_pgd = .;
     . += 4096;
     . = ALIGN(4K);
 
-    init_pmd = .;
-    . += 4096;
+    swapper_pud = .;
+    . += 4 * 4096;
     . = ALIGN(4K);
 
-    init_pt = .;
-    . += 4096;
+    swapper_pmd = .;
+    . += 8 * 4096;
+    . = ALIGN(4K);
+
+    swapper_pt = .;
+    . += 32 * 4096;
     . = ALIGN(4K);
 
     init_stack_start = .;

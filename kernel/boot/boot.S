@@ -5,7 +5,7 @@
 FUNC_GLOBAL(_start)
 	mrs	x0, mpidr_el1
 	and	x0, x0, #0xFF		// 检查处理器核心ID
-	cbz	x0, master		    // 除了CPU0，其他CPU都会在这里死循环等待
+	cbz	x0, master		    // 除了CPU0，其他CPU先在这里等待，后续由 PSCI 单独拉起
 	b	proc_hang
 
 proc_hang: 

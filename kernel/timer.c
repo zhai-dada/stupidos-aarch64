@@ -1,9 +1,11 @@
 #include "debug.h"
+#include "lib/libasm.h"
+#include "sched.h"
 #include "timer.h"
 #include "lib/librw.h"
 #include "gicv2.h"
 
-#define TICK_RATE_HZ 1
+#define TICK_RATE_HZ 10
 
 uint32_t cnt_tval = 0x00;
 uint32_t cnt_ctl = 0x00;
@@ -76,7 +78,8 @@ volatile uint64_t jiffies;
 
 void handle_timer_irq(void)
 {
-	printk("jiffies %x\n", ++jiffies);
+	++jiffies;
+    scheduler_tick();
 	plat_handle_timer_irq();
 }
 
@@ -93,3 +96,9 @@ void timer_init(void)
     return;
 }
 
+void timer_init_secondary(void)
+{
+    plat_timer_init();
+    gic_enable_irq(GIC_INTID_VIRT_TIMER);
+    printk("[timer\tinit]: cpu %d local timer ready\n", arch_curr_cpu_id());
+}

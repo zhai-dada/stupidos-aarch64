@@ -3,6 +3,9 @@
 
 // SCTLR register
 #define SCTLR_ELx_M	                    (1 << 0)
+#define SCTLR_ELx_C                     (1 << 2)
+#define SCTLR_ELx_I                     (1 << 12)
+
 #define SCTLR_EE_LITTLE_ENDIAN          (0 << 25)
 #define SCTLR_EOE_LITTLE_ENDIAN         (0 << 24)
 #define SCTLR_MMU_DISABLED              (0 << 0)

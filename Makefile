@@ -12,6 +12,7 @@ LD              :=  $(CROSS_COMPILE)ld
 OBJCOPY         :=  $(CROSS_COMPILE)objcopy
 OBJDUMP         :=  $(CROSS_COMPILE)objdump
 DEBUGFILE		:= debug.s
+GDB_SCRIPT      := $(BUILD_DIR)/stupidos-debug.gdb
 
 QEMU           :=  qemu-system-aarch64
 
@@ -35,10 +36,13 @@ OBJS           :=  $(C_OBJS) $(S_OBJS)
 
 # Targets
 KERNEL_ELF     :=  $(BUILD_DIR)/stupidos.elf
+KERNEL_KIMAGE_ELF := $(BUILD_DIR)/stupidos-kimage.elf
 KERNEL_BIN     :=  $(BOOT_DIR)/Image
+KIMAGE_OFFSET  :=  0xffff7fffd0000000
 
 # Default target
 .PHONY: all
+.SECONDARY: $(KERNEL_KIMAGE_ELF) $(GDB_SCRIPT)
 all: $(KERNEL_BIN)
 
 # ============================================
@@ -59,9 +63,37 @@ $(BUILD_DIR)/%.o: %.S
 $(KERNEL_ELF): $(OBJS) $(LD_SCRIPT)
 	$(LD) $(LDFLAGS) $(OBJS) -o $@ -T $(LD_SCRIPT)
 
+$(KERNEL_KIMAGE_ELF): $(KERNEL_ELF)
+	$(OBJCOPY) --change-addresses=$(KIMAGE_OFFSET) $< $@
+
 # Create binary image
 $(KERNEL_BIN): $(KERNEL_ELF)
 	$(OBJCOPY) -O binary $< $@
+
+$(GDB_SCRIPT): $(KERNEL_ELF) $(KERNEL_KIMAGE_ELF)
+	@printf "set pagination off\n" > $@
+	@printf "set confirm off\n" >> $@
+	@printf "set architecture aarch64\n" >> $@
+	@printf 'set $$kimage_offset = %#x\n' $(KIMAGE_OFFSET) >> $@
+	@printf "define low-symbols\n" >> $@
+	@printf "  symbol-file %s\n" "$(abspath $(KERNEL_ELF))" >> $@
+	@printf "end\n" >> $@
+	@printf "define kimage-symbols\n" >> $@
+	@printf "  symbol-file %s\n" "$(abspath $(KERNEL_KIMAGE_ELF))" >> $@
+	@printf "end\n" >> $@
+	@printf "define kbreak\n" >> $@
+	@printf '  hbreak *($$arg0 + $$kimage_offset)\n' >> $@
+	@printf "end\n" >> $@
+	@printf "document low-symbols\n" >> $@
+	@printf "Load the low-address ELF symbols used before the MMU jumps to KIMAGE_VADDR.\n" >> $@
+	@printf "end\n" >> $@
+	@printf "document kimage-symbols\n" >> $@
+	@printf "Load the high-address ELF symbols used after the kernel starts running at KIMAGE_VADDR.\n" >> $@
+	@printf "end\n" >> $@
+	@printf "document kbreak\n" >> $@
+	@printf "Set a breakpoint at the KIMAGE_VADDR alias of a low-linked symbol. Example: kbreak kernel_main_high\n" >> $@
+	@printf "end\n" >> $@
+	@printf "low-symbols\n" >> $@
 
 # ============================================
 # Disk image management
@@ -107,7 +139,10 @@ install: $(KERNEL_BIN) mount-disk
 # ============================================
 
 .PHONY: run
-run: $(KERNEL_BIN) install
+run: $(KERNEL_BIN)
+	@if [ ! -f $(DISK_IMG) ]; then \
+		$(MAKE) disk; \
+	fi
 	@echo "Starting QEMU..."
 	$(QEMU) -M virt \
 		-cpu cortex-a72 \
@@ -115,20 +150,30 @@ run: $(KERNEL_BIN) install
 		-m 4G \
 		-rtc base=utc,clock=host \
 		-global virtio-mmio.force-legacy=false \
+		-drive file=$(DISK_IMG),if=none,format=raw,id=hd0 \
+		-device virtio-blk-device,drive=hd0 \
 		-device virtio-keyboard-device -device virtio-tablet-device \
 		-device ramfb \
 		-display gtk \
 		-device virtio-net-device,netdev=net0 -netdev user,id=net0\
+		-device virtio-net-pci,netdev=pcinet0,mac=52:54:00:12:34:56 -netdev user,id=pcinet0 \
 		-device virtio-sound-device,audiodev=audio0 -audiodev sdl,id=audio0\
 		-kernel ./build/stupidos.elf \
-		-drive file=$(DISK_IMG),if=virtio,format=raw,id=hd0 \
 		-serial mon:stdio
 
 .PHONY: debug
 
-debug: $(KERNEL_BIN) install
+debug: $(KERNEL_BIN) $(KERNEL_KIMAGE_ELF) $(GDB_SCRIPT)
+	@if [ ! -f $(DISK_IMG) ]; then \
+		$(MAKE) disk; \
+	fi
 	@echo "Starting QEMU for debugging..."
-	@echo "Start GDB with: 'target remote localhost:1234' $(KERNEL_ELF)"
+	@echo "Start GDB and run:"
+	@echo "  source $(GDB_SCRIPT)"
+	@echo "  target remote localhost:1234"
+	@echo "Before MMU switch, use low-symbols"
+	@echo "After jumping to KIMAGE_VADDR, use kimage-symbols"
+	@echo "To break on a high-address alias before switching symbols, use: kbreak kernel_main_high"
 	$(OBJDUMP) -D ./build/stupidos.elf > $(DEBUGFILE)
 	$(QEMU) -M virt \
 		-cpu cortex-a72 \
@@ -136,13 +181,15 @@ debug: $(KERNEL_BIN) install
 		-m 4G \
 		-rtc base=utc,clock=host \
 		-global virtio-mmio.force-legacy=false \
+		-drive file=$(DISK_IMG),if=none,format=raw,id=hd0 \
+		-device virtio-blk-device,drive=hd0 \
 		-device virtio-keyboard-device -device virtio-tablet-device \
 		-device ramfb \
 		-display gtk \
 		-device virtio-net-device,netdev=net0 -netdev user,id=net0\
+		-device virtio-net-pci,netdev=pcinet0,mac=52:54:00:12:34:56 -netdev user,id=pcinet0 \
 		-device virtio-sound-device,audiodev=audio0 -audiodev sdl,id=audio0\
 		-kernel ./build/stupidos.elf \
-		-drive file=$(DISK_IMG),if=virtio,format=raw,id=hd0 \
 		-serial mon:stdio \
 		-S -s
 

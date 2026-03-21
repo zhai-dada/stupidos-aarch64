@@ -29,5 +29,7 @@
 
 uint64_t read_daif(void);
 void write_daif(uint64_t val);
+uint64_t read_mpidr(void);
+uint32_t arch_curr_cpu_id(void);
 
 #endif
