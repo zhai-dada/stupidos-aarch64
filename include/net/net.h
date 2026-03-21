@@ -32,6 +32,8 @@ void net_init(void);
 int net_register_device(struct net_device *dev);
 struct net_device *net_default_device(void);
 int net_show_status(void);
+int net_selftest(void);
+int net_arp_resolve(struct net_device *dev, uint32_t target_ip, uint8_t out_mac[6]);
 void net_receive(struct net_device *dev, const void *frame, size_t len);
 ssize_t net_send_frame(struct net_device *dev, const uint8_t dst_mac[6], uint16_t ethertype,
                        const void *payload, size_t len);

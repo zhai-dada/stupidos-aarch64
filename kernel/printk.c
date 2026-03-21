@@ -2,11 +2,12 @@
 
 #define is_digit(c) ((c) >= '0' && (c) <= '9')
 
-static int8_t *number(int8_t *str, int64_t num, int32_t base, int32_t size, int32_t precision, int32_t type)
+static int8_t *number(int8_t *str, uint64_t num, int32_t base, int32_t size, int32_t precision, int32_t type)
 {
     int8_t c, sign, tmp[50];
     const int8_t *digits = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
     int32_t i;
+    int64_t s_num;
 
     if (type & SMALL)
     {
@@ -22,10 +23,11 @@ static int8_t *number(int8_t *str, int64_t num, int32_t base, int32_t size, int3
     }
     c = (type & ZEROPAD) ? '0' : ' ';
     sign = 0;
-    if (type & SIGN && num < 0)
+    s_num = (int64_t)num;
+    if (type & SIGN && s_num < 0)
     {
         sign = '-';
-        num = -num;
+        num = (uint64_t)(-s_num);
     }
     else
     {
@@ -55,7 +57,7 @@ static int8_t *number(int8_t *str, int64_t num, int32_t base, int32_t size, int3
     {
         while (num != 0)
         {
-            tmp[i++] = digits[num % base];
+            tmp[i++] = digits[num % (uint64_t)base];
             num /= base;
         }
     }
@@ -129,7 +131,7 @@ int32_t vsprintf(int8_t *buf, const int8_t *fmt, va_list args)
     int32_t precision;
     int32_t len, i;
 
-    int32_t qualifier; /* 'h', 'l', 'L' or 'Z' for integer fields */
+    int32_t qualifier; /* 'h', 'l', 'L', 'Z' or double-'l' for integer fields */
 
     for (str = buf; *fmt; fmt++)
     {
@@ -201,6 +203,15 @@ int32_t vsprintf(int8_t *buf, const int8_t *fmt, va_list args)
         {
             qualifier = *fmt;
             fmt++;
+            /*
+             * 支持常见的 ll / llu / llx / lld。
+             * 这对打印容量、地址、计数器特别重要，避免高 32 位被截断。
+             */
+            if (qualifier == 'l' && *fmt == 'l')
+            {
+                qualifier = 'L';
+                fmt++;
+            }
         }
 
         switch (*fmt)
@@ -256,7 +267,7 @@ int32_t vsprintf(int8_t *buf, const int8_t *fmt, va_list args)
             break;
 
         case 'o':
-            if (qualifier == 'l')
+            if (qualifier == 'L' || qualifier == 'l')
             {
                 str = number(str, va_arg(args, uint64_t), 8, field_width, precision, flags);
             }
@@ -283,7 +294,7 @@ int32_t vsprintf(int8_t *buf, const int8_t *fmt, va_list args)
 
         case 'X':
 
-            if (qualifier == 'l')
+            if (qualifier == 'L' || qualifier == 'l')
             {
                 str = number(str, va_arg(args, uint64_t), 16, field_width, precision, flags);
             }
@@ -297,13 +308,27 @@ int32_t vsprintf(int8_t *buf, const int8_t *fmt, va_list args)
         case 'i':
             flags |= SIGN;
         case 'u':
-            if (qualifier == 'l')
+            if (qualifier == 'L' || qualifier == 'l')
             {
-                str = number(str, va_arg(args, uint64_t), 10, field_width, precision, flags);
+                if (flags & SIGN)
+                {
+                    str = number(str, (uint64_t)va_arg(args, int64_t), 10, field_width, precision, flags);
+                }
+                else
+                {
+                    str = number(str, va_arg(args, uint64_t), 10, field_width, precision, flags);
+                }
             }
             else
             {
-                str = number(str, va_arg(args, uint32_t), 10, field_width, precision, flags);
+                if (flags & SIGN)
+                {
+                    str = number(str, (uint64_t)(int64_t)va_arg(args, int32_t), 10, field_width, precision, flags);
+                }
+                else
+                {
+                    str = number(str, (uint64_t)va_arg(args, uint32_t), 10, field_width, precision, flags);
+                }
             }
             break;
 

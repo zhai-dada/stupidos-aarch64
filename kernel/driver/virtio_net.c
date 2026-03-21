@@ -280,6 +280,7 @@ static ssize_t virtio_net_tx(struct net_device *dev, const void *buf, size_t len
     }
 
     spin_lock(&st->tx_lock);
+    printk("[virtio-net\ttx ]: submit len=%lu\n", (uint64_t)len);
 
     memset((int8_t *)&st->tx_buf, 0, sizeof(st->tx_buf));
     st->tx_buf.hdr.flags = 0;
@@ -311,14 +312,17 @@ static ssize_t virtio_net_tx(struct net_device *dev, const void *buf, size_t len
     {
         dma_sync_invalidate_range((uint64_t)&st->tx_used, sizeof(st->tx_used));
         dsb(sy);
-        if (++spins == 100000000)
+        if (++spins == 1000000)
         {
+            printk("[virtio-net\ttx ]: timeout used=%u last=%u\n",
+                   st->tx_used.idx, used_idx);
             spin_unlock(&st->tx_lock);
             return -ETIMEDOUT;
         }
     }
 
     st->tx_last_used = st->tx_used.idx;
+    printk("[virtio-net\ttx ]: complete used=%u\n", st->tx_used.idx);
     virtio_mmio_write32(st->mmio_base, VIRTIO_MMIO_INTERRUPT_ACK, 0x3);
     spin_unlock(&st->tx_lock);
 
@@ -346,6 +350,7 @@ static void virtio_net_poll_rx(struct virtio_net_state *st)
 
         if (packet_len > sizeof(st->rx_buf[slot].hdr))
         {
+            printk("[virtio-net\trx ]: slot=%u len=%u\n", slot, packet_len);
             net_receive(&st->dev, st->rx_buf[slot].payload, packet_len - sizeof(st->rx_buf[slot].hdr));
         }
 
@@ -367,6 +372,14 @@ static void virtio_net_worker(void *arg)
             virtio_net_poll_rx(st);
         }
         sched_yield();
+    }
+}
+
+void virtio_net_poll(void)
+{
+    if (virtio_net_state.ready)
+    {
+        virtio_net_poll_rx(&virtio_net_state);
     }
 }
 

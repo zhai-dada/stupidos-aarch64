@@ -248,6 +248,17 @@ static __attribute__((noreturn)) void kernel_main_high(void)
     {
         printk("[net\tinit]: virtio-net init failed\n");
     }
+    else
+    {
+        /*
+         * 先在启动阶段主动做一次 ARP + ICMP 探测。
+         * 这样不用等到人工进 shell，串口日志就能直接告诉我们链路是否通了。
+         */
+        if (net_selftest())
+        {
+            printk("[net\tinit]: selftest failed\n");
+        }
+    }
     syscall_init();
     shell_init();
     ui_boot_screen();

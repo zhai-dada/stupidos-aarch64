@@ -98,6 +98,7 @@ static void shell_help(void)
     shell_puts((const int8_t *)"  info            - show kernel status\r\n");
     shell_puts((const int8_t *)"  ps              - show task table\r\n");
     shell_puts((const int8_t *)"  net             - show network devices\r\n");
+    shell_puts((const int8_t *)"  ping/nettest    - run network self-test\r\n");
     shell_puts((const int8_t *)"  mem             - show buddy allocator state\r\n");
 }
 
@@ -213,6 +214,20 @@ static void shell_mem(void)
            (uint64_t)(TOTAL_MEMORY / 0x100000));
 }
 
+static void shell_ping(void)
+{
+    int ret;
+
+    ret = net_selftest();
+    if (ret)
+    {
+        printk("[shell\t]: network selftest failed %d\n", ret);
+        return;
+    }
+
+    printk("[shell\t]: network selftest passed\n");
+}
+
 static void shell_execute(const int8_t *line)
 {
     const char *cursor;
@@ -314,6 +329,12 @@ static void shell_execute(const int8_t *line)
     if (strcmp(cmd, (const int8_t *)"net") == 0)
     {
         net_show_status();
+        return;
+    }
+
+    if (strcmp(cmd, (const int8_t *)"ping") == 0 || strcmp(cmd, (const int8_t *)"nettest") == 0)
+    {
+        shell_ping();
         return;
     }
 

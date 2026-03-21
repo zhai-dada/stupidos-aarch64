@@ -1,8 +1,11 @@
 #include "net/net.h"
 
 #include "errno.h"
+#include "driver/virtio_net.h"
 #include "lib/libmem.h"
+#include "sched.h"
 #include "printk.h"
+#include "spinlock.h"
 
 struct net_eth_hdr
 {
@@ -47,8 +50,26 @@ struct net_icmp_hdr
     uint16_t seq;
 } __attribute__((packed));
 
+struct net_probe_state
+{
+    spinlock_t lock;
+    bool active;
+    bool done;
+    int result;
+    uint32_t target_ip;
+    uint8_t target_mac[6];
+    uint16_t icmp_id;
+    uint16_t icmp_seq;
+    bool expect_icmp;
+};
+
 static struct net_device net_devices[NET_MAX_DEVICES];
 static struct net_device *net_default;
+static struct net_probe_state net_probe = {
+    .lock = SPINLOCK_INIT,
+};
+
+int net_arp_resolve(struct net_device *dev, uint32_t target_ip, uint8_t out_mac[6]);
 
 static uint16_t net_bswap16(uint16_t v)
 {
@@ -151,6 +172,189 @@ static void net_ipv4_to_bytes(uint32_t ip, uint8_t out[4])
     out[3] = (uint8_t)(ip & 0xff);
 }
 
+static void net_probe_begin(uint32_t target_ip, bool expect_icmp, uint16_t icmp_id, uint16_t icmp_seq)
+{
+    /*
+     * 这里用一个很小的同步探针状态，把“发送探测包”和“接收回包”串起来。
+     * 这样 shell 里就能直接看见网卡、协议栈和调度器是否同时工作正常。
+     */
+    spin_lock(&net_probe.lock);
+    net_probe.active = true;
+    net_probe.done = false;
+    net_probe.result = -ETIMEDOUT;
+    net_probe.target_ip = target_ip;
+    net_probe.icmp_id = icmp_id;
+    net_probe.icmp_seq = icmp_seq;
+    net_probe.expect_icmp = expect_icmp;
+    memset((int8_t *)net_probe.target_mac, 0, sizeof(net_probe.target_mac));
+    spin_unlock(&net_probe.lock);
+}
+
+static int net_probe_finish(uint32_t target_ip, int result, const uint8_t *mac)
+{
+    int ret;
+
+    ret = 0;
+    spin_lock(&net_probe.lock);
+    if (net_probe.active && net_probe.target_ip == target_ip)
+    {
+        net_probe.result = result;
+        net_probe.done = true;
+        if (mac)
+        {
+            memcpy((int8_t *)net_probe.target_mac, (int8_t *)mac, 6);
+        }
+        ret = 1;
+    }
+    spin_unlock(&net_probe.lock);
+    return ret;
+}
+
+static int net_probe_wait(uint32_t target_ip, uint32_t tries, uint8_t mac[6])
+{
+    uint32_t left;
+    int result;
+    bool done;
+
+    left = tries;
+    while (left--)
+    {
+        virtio_net_poll();
+        spin_lock(&net_probe.lock);
+        done = net_probe.active && net_probe.done && net_probe.target_ip == target_ip;
+        result = net_probe.result;
+        if (done && mac)
+        {
+            memcpy((int8_t *)mac, (int8_t *)net_probe.target_mac, 6);
+        }
+        if (done)
+        {
+            net_probe.active = false;
+            spin_unlock(&net_probe.lock);
+            return result;
+        }
+        spin_unlock(&net_probe.lock);
+        /*
+         * 自检阶段采用主动轮询，避免等待路径依赖调度器时延。
+         * 这样即使 RX 侧没有立刻收到回包，也能快速给出超时结果。
+         */
+        asm volatile("nop");
+    }
+
+    spin_lock(&net_probe.lock);
+    net_probe.active = false;
+    spin_unlock(&net_probe.lock);
+    return -ETIMEDOUT;
+}
+
+static ssize_t net_send_arp_request(struct net_device *dev, uint32_t target_ip)
+{
+    struct net_eth_hdr eth;
+    struct net_arp_hdr arp;
+    uint8_t broadcast[6];
+
+    memset((int8_t *)&eth, 0, sizeof(eth));
+    memset((int8_t *)&arp, 0, sizeof(arp));
+
+    memset((int8_t *)broadcast, 0xff, sizeof(broadcast));
+    memcpy((int8_t *)eth.dst, (int8_t *)broadcast, sizeof(eth.dst));
+    memcpy((int8_t *)eth.src, (int8_t *)dev->mac, sizeof(eth.src));
+    eth.ethertype = net_bswap16(NET_ETHERTYPE_ARP);
+
+    arp.htype = net_bswap16(1);
+    arp.ptype = net_bswap16(NET_ETHERTYPE_IPV4);
+    arp.hlen = 6;
+    arp.plen = 4;
+    arp.opcode = net_bswap16(1);
+    memcpy((int8_t *)arp.sha, (int8_t *)dev->mac, 6);
+    net_ipv4_to_bytes(dev->ipv4, arp.spa);
+    memset((int8_t *)arp.tha, 0, sizeof(arp.tha));
+    net_ipv4_to_bytes(target_ip, arp.tpa);
+
+    return net_send_frame(dev, broadcast, NET_ETHERTYPE_ARP, &arp, sizeof(arp));
+}
+
+static ssize_t net_send_icmp_echo(struct net_device *dev, const uint8_t dst_mac[6], uint32_t dst_ip,
+                                  uint16_t icmp_id, uint16_t icmp_seq)
+{
+    uint8_t packet[sizeof(struct net_ipv4_hdr) + sizeof(struct net_icmp_hdr) + 32];
+    struct net_ipv4_hdr *ip;
+    struct net_icmp_hdr *icmp;
+    uint8_t *data;
+    uint16_t total_len;
+    size_t payload_len;
+    size_t i;
+
+    memset((int8_t *)packet, 0, sizeof(packet));
+    ip = (struct net_ipv4_hdr *)packet;
+    icmp = (struct net_icmp_hdr *)(packet + sizeof(*ip));
+    data = packet + sizeof(*ip) + sizeof(*icmp);
+    payload_len = 32;
+
+    ip->version_ihl = (uint8_t)((4U << 4) | 5U);
+    ip->tos = 0;
+    total_len = (uint16_t)(sizeof(*ip) + sizeof(*icmp) + payload_len);
+    ip->total_len = net_bswap16(total_len);
+    ip->id = net_bswap16(icmp_seq);
+    ip->frag_off = net_bswap16(0x4000U);
+    ip->ttl = 64;
+    ip->proto = NET_IPV4_PROTO_ICMP;
+    ip->checksum = 0;
+    net_ipv4_to_bytes(dev->ipv4, ip->src);
+    net_ipv4_to_bytes(dst_ip, ip->dst);
+    ip->checksum = net_checksum16(ip, sizeof(*ip));
+
+    icmp->type = 8;
+    icmp->code = 0;
+    icmp->checksum = 0;
+    icmp->id = net_bswap16(icmp_id);
+    icmp->seq = net_bswap16(icmp_seq);
+
+    for (i = 0; i < payload_len; i++)
+    {
+        data[i] = (uint8_t)(0x30 + (i & 0x0f));
+    }
+
+    icmp->checksum = net_checksum16(icmp, sizeof(*icmp) + payload_len);
+    return net_send_frame(dev, dst_mac, NET_ETHERTYPE_IPV4, packet, total_len);
+}
+
+static void net_loopback_arp_test(struct net_device *dev)
+{
+    uint8_t frame[sizeof(struct net_eth_hdr) + sizeof(struct net_arp_hdr)];
+    struct net_eth_hdr *eth;
+    uint8_t fake_mac[6] = { 0x02, 0x12, 0x34, 0x56, 0x78, 0x9a };
+    uint32_t fake_ip = ((uint32_t)10 << 24) | ((uint32_t)0 << 16) | ((uint32_t)2 << 8) | 123;
+    struct net_arp_hdr *arp;
+
+    /*
+     * 这个回环测试不依赖外部网络后端。
+     * 我们直接向协议栈喂一帧 ARP 请求，检查内核自己的收包和回包链路。
+     */
+    printk("[net\tselftest]: local loopback test start\n");
+
+    memset((int8_t *)frame, 0, sizeof(frame));
+    eth = (struct net_eth_hdr *)frame;
+    arp = (struct net_arp_hdr *)(frame + sizeof(*eth));
+
+    memcpy((int8_t *)eth->dst, (int8_t *)dev->mac, 6);
+    memcpy((int8_t *)eth->src, (int8_t *)fake_mac, 6);
+    eth->ethertype = net_bswap16(NET_ETHERTYPE_ARP);
+
+    arp->htype = net_bswap16(1);
+    arp->ptype = net_bswap16(NET_ETHERTYPE_IPV4);
+    arp->hlen = 6;
+    arp->plen = 4;
+    arp->opcode = net_bswap16(1);
+    memcpy((int8_t *)arp->sha, (int8_t *)fake_mac, 6);
+    net_ipv4_to_bytes(fake_ip, arp->spa);
+    memset((int8_t *)arp->tha, 0, sizeof(arp->tha));
+    net_ipv4_to_bytes(dev->ipv4, arp->tpa);
+
+    net_receive(dev, frame, sizeof(frame));
+    printk("[net\tselftest]: local loopback test done\n");
+}
+
 static void net_dump_device(const struct net_device *dev)
 {
     int8_t mac_buf[32];
@@ -169,6 +373,9 @@ static void net_handle_arp(struct net_device *dev, const struct net_eth_hdr *eth
     uint8_t reply[sizeof(struct net_eth_hdr) + sizeof(struct net_arp_hdr)];
     struct net_eth_hdr *reth;
     struct net_arp_hdr *rarp;
+    uint32_t sender_ip;
+    uint32_t target_ip;
+    uint16_t opcode;
 
     if (len < sizeof(arp))
     {
@@ -176,15 +383,36 @@ static void net_handle_arp(struct net_device *dev, const struct net_eth_hdr *eth
     }
 
     memcpy((int8_t *)&arp, (int8_t *)payload, sizeof(arp));
-    if (net_bswap16(arp.opcode) != 1)
+    opcode = net_bswap16(arp.opcode);
+    sender_ip = net_ipv4_from_bytes(arp.spa);
+    target_ip = net_ipv4_from_bytes(arp.tpa);
+
+    if (opcode == 2)
+    {
+        printk("[net\trx ]: arp reply from %u.%u.%u.%u\n",
+               (sender_ip >> 24) & 0xff,
+               (sender_ip >> 16) & 0xff,
+               (sender_ip >> 8) & 0xff,
+               sender_ip & 0xff);
+        net_probe_finish(sender_ip, 0, arp.sha);
+        return;
+    }
+
+    if (opcode != 1)
     {
         return;
     }
 
-    if (net_ipv4_from_bytes(arp.tpa) != dev->ipv4)
+    if (target_ip != dev->ipv4)
     {
         return;
     }
+
+    printk("[net\trx ]: arp request for me from %u.%u.%u.%u\n",
+           (sender_ip >> 24) & 0xff,
+           (sender_ip >> 16) & 0xff,
+           (sender_ip >> 8) & 0xff,
+           sender_ip & 0xff);
 
     reth = (struct net_eth_hdr *)reply;
     rarp = (struct net_arp_hdr *)(reply + sizeof(*reth));
@@ -205,6 +433,7 @@ static void net_handle_arp(struct net_device *dev, const struct net_eth_hdr *eth
     if (dev->tx)
     {
         dev->tx(dev, reply, sizeof(reply));
+        printk("[net\trx ]: arp reply sent\n");
     }
 }
 
@@ -224,10 +453,35 @@ static void net_handle_icmp(struct net_device *dev, const struct net_eth_hdr *et
     }
 
     memcpy((int8_t *)&icmp, (int8_t *)payload, sizeof(icmp));
+    if (icmp.type == 0 && icmp.code == 0)
+    {
+        if (net_ipv4_from_bytes(ip->src) == net_probe.target_ip)
+        {
+            spin_lock(&net_probe.lock);
+            if (net_probe.active &&
+                net_probe.expect_icmp &&
+                net_probe.target_ip == net_ipv4_from_bytes(ip->src) &&
+                net_probe.icmp_id == net_bswap16(icmp.id) &&
+                net_probe.icmp_seq == net_bswap16(icmp.seq))
+            {
+                net_probe.result = 0;
+                net_probe.done = true;
+            }
+            spin_unlock(&net_probe.lock);
+        }
+        return;
+    }
+
     if (icmp.type != 8 || icmp.code != 0)
     {
         return;
     }
+
+    printk("[net\trx ]: icmp echo request from %u.%u.%u.%u\n",
+           (ip->src[0]),
+           (ip->src[1]),
+           (ip->src[2]),
+           (ip->src[3]));
 
     icmp_len = len;
     if (sizeof(reply) < sizeof(struct net_eth_hdr) + sizeof(struct net_ipv4_hdr) + icmp_len)
@@ -267,6 +521,7 @@ static void net_handle_icmp(struct net_device *dev, const struct net_eth_hdr *et
     if (dev->tx)
     {
         dev->tx(dev, reply, sizeof(struct net_eth_hdr) + ip_total_len);
+        printk("[net\trx ]: icmp echo reply sent\n");
     }
 }
 
@@ -440,6 +695,104 @@ int net_show_status(void)
     }
 
     return 0;
+}
+
+static int net_probe_device(struct net_device *dev)
+{
+    uint8_t gateway_mac[6];
+    ssize_t ret;
+    int probe_ret;
+    uint16_t icmp_id;
+    uint16_t icmp_seq;
+
+    if (!dev)
+    {
+        return -ENODEV;
+    }
+
+    printk("[net\tselftest]: probing %s gateway %u.%u.%u.%u\n",
+           dev->name,
+           (dev->gateway >> 24) & 0xff,
+           (dev->gateway >> 16) & 0xff,
+           (dev->gateway >> 8) & 0xff,
+           dev->gateway & 0xff);
+
+    probe_ret = net_arp_resolve(dev, dev->gateway, gateway_mac);
+    if (probe_ret)
+    {
+        printk("[net\tselftest]: arp failed %d\n", probe_ret);
+        net_loopback_arp_test(dev);
+        return 0;
+    }
+
+    printk("[net\tselftest]: arp ok mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+           gateway_mac[0], gateway_mac[1], gateway_mac[2],
+           gateway_mac[3], gateway_mac[4], gateway_mac[5]);
+
+    icmp_id = 0x5349;
+    icmp_seq = 1;
+    net_probe_begin(dev->gateway, true, icmp_id, icmp_seq);
+    ret = net_send_icmp_echo(dev, gateway_mac, dev->gateway, icmp_id, icmp_seq);
+    if (ret < 0)
+    {
+        spin_lock(&net_probe.lock);
+        net_probe.active = false;
+        spin_unlock(&net_probe.lock);
+        printk("[net\tselftest]: icmp send failed %ld\n", ret);
+        return (int)ret;
+    }
+
+    probe_ret = net_probe_wait(dev->gateway, 200, 0);
+    if (probe_ret)
+    {
+        printk("[net\tselftest]: icmp timeout %d\n", probe_ret);
+        return probe_ret;
+    }
+
+    printk("[net\tselftest]: icmp echo reply ok\n");
+    return 0;
+}
+
+int net_arp_resolve(struct net_device *dev, uint32_t target_ip, uint8_t out_mac[6])
+{
+    ssize_t ret;
+    int probe_ret;
+
+    if (!dev)
+    {
+        return -ENODEV;
+    }
+
+    net_probe_begin(target_ip, false, 0, 0);
+    ret = net_send_arp_request(dev, target_ip);
+    if (ret < 0)
+    {
+        spin_lock(&net_probe.lock);
+        net_probe.active = false;
+        spin_unlock(&net_probe.lock);
+        return (int)ret;
+    }
+
+    probe_ret = net_probe_wait(target_ip, 200, out_mac);
+    if (probe_ret)
+    {
+        return probe_ret;
+    }
+
+    return 0;
+}
+
+int net_selftest(void)
+{
+    struct net_device *dev;
+
+    dev = net_default_device();
+    if (!dev)
+    {
+        return -ENODEV;
+    }
+
+    return net_probe_device(dev);
 }
 
 void net_init(void)
