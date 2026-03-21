@@ -10,6 +10,13 @@ struct pci_state
 
 static struct pci_state pci_state;
 
+/*
+ * 当前 QEMU virt 平台基本都落在 bus 0 上。
+ * 先把扫描范围收紧到少量 bus，避免 256 个 bus 全扫在 TCG 下拖慢启动。
+ * 以后补 bridge / 热插拔时再把这里升级成递归拓扑枚举。
+ */
+#define PCI_SCAN_BUS_LIMIT 8
+
 static inline uint64_t pci_cfg_addr(uint8_t bus, uint8_t dev, uint8_t fn, uint16_t reg)
 {
     return PCIE_ECAM_HIGH_BASE +
@@ -167,7 +174,7 @@ void pci_init(void)
      * ECAM 地址计算是纯规则化的，所以即使还没有 bridge 拓扑管理，
      * 也能先把当前系统里的设备完整扫出来。
      */
-    for (bus = 0; bus < PCI_MAX_BUSES; bus++)
+    for (bus = 0; bus < PCI_SCAN_BUS_LIMIT; bus++)
     {
         for (dev = 0; dev < PCI_MAX_DEVICES; dev++)
         {

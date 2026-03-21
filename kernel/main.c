@@ -11,8 +11,10 @@
 #include "mm/page_alloc.h"
 #include "assert.h"
 #include "driver/ramfb.h"
+#include "driver/virtio_input.h"
 #include "driver/virtio_net.h"
 #include "driver/fwcfg.h"
+#include "fdt.h"
 #include "fs/ext4.h"
 #include "fs/fat32.h"
 #include "fs/vfs.h"
@@ -21,6 +23,7 @@
 #include "syscall.h"
 #include "shell.h"
 #include "ui.h"
+#include "tty.h"
 #include "sched.h"
 #include "smp.h"
 
@@ -28,6 +31,8 @@ extern uint8_t framebuffer[FB_WIDTH * FB_HEIGHT * FB_BPP];
 
 extern uint64_t __bss_start, __bss_end;
 extern uint64_t __kernel_start, __kernel_end;
+
+uint64_t boot_dtb_phys;
 
 static void demo_worker_a(void *arg)
 {
@@ -77,13 +82,11 @@ static __attribute__((noreturn)) void kernel_main_high(void)
     int fd;
     ssize_t nread;
     int8_t file_buf[128];
-    static const char rw_demo[] = "kernel wrote here via vfs\n";
-    static const char fat_rw_demo[] = "kernel wrote here via fat32\n";
-
     write_sysreg(kimage_phys_to_virt((uint64_t)&vectors), vbar_el1);
     isb();
 
     printk("[mmu\tinit]: now running at KIMAGE_VADDR\n");
+    fdt_log_summary();
 
     ramfb_putstring(COLOR_BLACK, COLOR_WHITE, (uint8_t*)"Hello World\n\btest");
     assert(6 > 5);
@@ -114,52 +117,6 @@ static __attribute__((noreturn)) void kernel_main_high(void)
             printk("[fs\topen]: /hello.txt failed %d\n", fd);
         }
 
-        fd = vfs_open((int8_t *)"/etc/info.txt", VFS_O_RDONLY);
-        if (fd >= 0)
-        {
-            nread = vfs_read(fd, file_buf, sizeof(file_buf) - 1);
-            if (nread > 0)
-            {
-                file_buf[nread] = '\0';
-                printk("[fs\tread]: /etc/info.txt => %s\n", file_buf);
-            }
-            else
-            {
-                printk("[fs\tread]: /etc/info.txt read failed %ld\n", nread);
-            }
-            vfs_close(fd);
-        }
-        else
-        {
-            printk("[fs\topen]: /etc/info.txt failed %d\n", fd);
-        }
-
-        fd = vfs_open((int8_t *)"/rw-demo.txt", VFS_O_RDWR);
-        if (fd >= 0)
-        {
-            nread = vfs_write(fd, rw_demo, sizeof(rw_demo) - 1);
-            if (nread < 0)
-            {
-                printk("[fs\twrite]: /rw-demo.txt write failed %ld\n", nread);
-            }
-            vfs_lseek(fd, 0, VFS_SEEK_SET);
-            nread = vfs_read(fd, file_buf, sizeof(file_buf) - 1);
-            if (nread > 0)
-            {
-                file_buf[nread] = '\0';
-                printk("[fs\twrite]: /rw-demo.txt => %s\n", file_buf);
-            }
-            else
-            {
-                printk("[fs\tread]: /rw-demo.txt read failed %ld\n", nread);
-            }
-            vfs_close(fd);
-        }
-        else
-        {
-            printk("[fs\topen]: /rw-demo.txt failed %d\n", fd);
-        }
-
         if (fat32_mount((const int8_t *)"/boot"))
         {
             printk("[fat32\tinit]: mount /boot failed\n");
@@ -185,52 +142,6 @@ static __attribute__((noreturn)) void kernel_main_high(void)
             {
                 printk("[fat32\topen]: /boot/readme.txt failed %d\n", fd);
             }
-
-            fd = vfs_open((int8_t *)"/boot/efi/boot/info.txt", VFS_O_RDONLY);
-            if (fd >= 0)
-            {
-                nread = vfs_read(fd, file_buf, sizeof(file_buf) - 1);
-                if (nread > 0)
-                {
-                    file_buf[nread] = '\0';
-                    printk("[fat32\tread]: /boot/efi/boot/info.txt => %s\n", file_buf);
-                }
-                else
-                {
-                    printk("[fat32\tread]: /boot/efi/boot/info.txt read failed %ld\n", nread);
-                }
-                vfs_close(fd);
-            }
-            else
-            {
-                printk("[fat32\topen]: /boot/efi/boot/info.txt failed %d\n", fd);
-            }
-
-            fd = vfs_open((int8_t *)"/boot/rwdemo.txt", VFS_O_RDWR);
-            if (fd >= 0)
-            {
-                nread = vfs_write(fd, fat_rw_demo, sizeof(fat_rw_demo) - 1);
-                if (nread < 0)
-                {
-                    printk("[fat32\twrite]: /boot/rwdemo.txt write failed %ld\n", nread);
-                }
-                vfs_lseek(fd, 0, VFS_SEEK_SET);
-                nread = vfs_read(fd, file_buf, sizeof(file_buf) - 1);
-                if (nread > 0)
-                {
-                    file_buf[nread] = '\0';
-                    printk("[fat32\twrite]: /boot/rwdemo.txt => %s\n", file_buf);
-                }
-                else
-                {
-                    printk("[fat32\tread]: /boot/rwdemo.txt read failed %ld\n", nread);
-                }
-                vfs_close(fd);
-            }
-            else
-            {
-                printk("[fat32\topen]: /boot/rwdemo.txt failed %d\n", fd);
-            }
         }
     }
 
@@ -242,7 +153,15 @@ static __attribute__((noreturn)) void kernel_main_high(void)
     sched_init();
     smp_init();
     page_alloc_init();
+    syscall_init();
+
+    shell_init();
+
     pci_init();
+    if (virtio_input_init())
+    {
+        printk("[input\tinit]: virtio-input init failed\n");
+    }
     net_init();
     if (virtio_net_init())
     {
@@ -259,8 +178,7 @@ static __attribute__((noreturn)) void kernel_main_high(void)
             printk("[net\tinit]: selftest failed\n");
         }
     }
-    syscall_init();
-    shell_init();
+
     ui_boot_screen();
 
     /*
@@ -281,12 +199,19 @@ static __attribute__((noreturn)) void kernel_main_high(void)
     }
 }
 
-int32_t kernel_main(void)
+int32_t kernel_main(uint64_t dtb_phys)
 {
     /* 这里按字节清零 .bss，不能按 uint64_t 个数来减。 */
     memset((int8_t *)&__bss_start, 0, (uint64_t)&__bss_end - (uint64_t)&__bss_start);
 
     early_uart_init();
+    if (!dtb_phys)
+    {
+        dtb_phys = boot_dtb_phys;
+    }
+    boot_dtb_phys = dtb_phys;
+    printk("[fdt\tinit]: dtb_phys=%#lx\n", dtb_phys);
+    fdt_boot_init((const void *)boot_dtb_phys);
 
     disable_irq();
 
@@ -295,6 +220,7 @@ int32_t kernel_main(void)
     gic_init();
 
     uart_init();
+    tty_init();
 
     timer_init();
 

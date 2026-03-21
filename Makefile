@@ -1,9 +1,14 @@
 ARCH            :=  arm64
 CROSS_COMPILE   :=  aarch64-none-linux-gnu-
 BUILD_DIR       :=  build
+GEN_DIR         :=  $(BUILD_DIR)/generated
 BOOT_DIR		:= 	boot
 DISK_IMG        :=  $(BOOT_DIR)/disk.img
 MOUNT_DIR       :=  mnt
+FONT_TTF        :=  Monaco.ttf
+FONT_GEN_SRC    :=  $(GEN_DIR)/font.c
+QEMU_DTS        :=  doc/qemu-virt.dts
+QEMU_DTB        :=  $(BUILD_DIR)/qemu-virt.dtb
 
 # Toolchain
 CC              :=  $(CROSS_COMPILE)gcc
@@ -26,13 +31,14 @@ LD_SCRIPT      :=  kernel/stupidos-aarch64.ld
 
 # Source files
 SRC_DIRS       :=  kernel
-C_SRCS         :=  $(shell find $(SRC_DIRS) -name "*.c")
+C_SRCS         :=  $(filter-out kernel/font.c,$(shell find $(SRC_DIRS) -name "*.c"))
 S_SRCS         :=  $(shell find $(SRC_DIRS) -name "*.S")
 
 # Object files
 C_OBJS         :=  $(patsubst %.c, $(BUILD_DIR)/%.o, $(C_SRCS))
 S_OBJS         :=  $(patsubst %.S, $(BUILD_DIR)/%.o, $(S_SRCS))
-OBJS           :=  $(C_OBJS) $(S_OBJS)
+FONT_OBJS      :=  $(FONT_GEN_SRC:.c=.o)
+OBJS           :=  $(C_OBJS) $(FONT_OBJS) $(S_OBJS)
 
 # Targets
 KERNEL_ELF     :=  $(BUILD_DIR)/stupidos.elf
@@ -58,6 +64,18 @@ $(BUILD_DIR)/%.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -E -P $< -o $(@:.o=.i)
 	$(AS) $(ASFLAGS) $(@:.o=.i) -o $@
+
+$(FONT_GEN_SRC): $(FONT_TTF) tools/gen_font.py
+	@mkdir -p $(dir $@)
+	python3 tools/gen_font.py --ttf $(FONT_TTF) --out $@
+
+$(FONT_GEN_SRC:.c=.o): $(FONT_GEN_SRC)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(QEMU_DTB): $(QEMU_DTS)
+	@mkdir -p $(dir $@)
+	dtc -I dts -O dtb $< -o $@
 
 # Link kernel
 $(KERNEL_ELF): $(OBJS) $(LD_SCRIPT)
@@ -139,7 +157,7 @@ install: $(KERNEL_BIN) mount-disk
 # ============================================
 
 .PHONY: run
-run: $(KERNEL_BIN)
+run: $(KERNEL_BIN) $(QEMU_DTB)
 	@if [ ! -f $(DISK_IMG) ]; then \
 		$(MAKE) disk; \
 	fi
@@ -147,7 +165,7 @@ run: $(KERNEL_BIN)
 	$(QEMU) -M virt \
 		-cpu cortex-a72 \
 		-smp 4 \
-		-m 4G \
+		-m 1G \
 		-rtc base=utc,clock=host \
 		-global virtio-mmio.force-legacy=false \
 		-drive file=$(DISK_IMG),if=none,format=raw,id=hd0 \
@@ -158,8 +176,30 @@ run: $(KERNEL_BIN)
 		-device virtio-net-device,netdev=net0 -netdev user,id=net0\
 		-device virtio-net-pci,netdev=pcinet0,mac=52:54:00:12:34:56 -netdev user,id=pcinet0 \
 		-device virtio-sound-device,audiodev=audio0 -audiodev sdl,id=audio0\
-		-kernel ./build/stupidos.elf \
+		-kernel $(KERNEL_BIN) \
+		-dtb $(QEMU_DTB) \
 		-serial mon:stdio
+
+.PHONY: run-headless
+run-headless: $(KERNEL_BIN) $(QEMU_DTB)
+	@if [ ! -f $(DISK_IMG) ]; then \
+		$(MAKE) disk; \
+	fi
+	@echo "Starting QEMU (headless)..."
+	$(QEMU) -M virt \
+		-cpu cortex-a72 \
+		-smp 1 \
+		-m 1G \
+		-rtc base=utc,clock=host \
+		-global virtio-mmio.force-legacy=false \
+		-drive file=$(DISK_IMG),if=none,format=raw,id=hd0 \
+		-device virtio-blk-device,drive=hd0 \
+		-device virtio-keyboard-device -device virtio-tablet-device \
+		-device virtio-net-device,netdev=net0 -netdev user,id=net0\
+		-kernel $(KERNEL_BIN) \
+		-dtb $(QEMU_DTB) \
+		-nographic \
+		-monitor none
 
 .PHONY: debug
 

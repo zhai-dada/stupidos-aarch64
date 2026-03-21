@@ -8,6 +8,7 @@
 #include "sched.h"
 #include "smp.h"
 #include "syscall.h"
+#include "tty.h"
 
 static void ui_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color)
 {
@@ -39,7 +40,9 @@ void ui_boot_screen(void)
     char net_text[80];
     char syscall_text[64];
     char shell_text[64];
+    char mouse_text[80];
     struct net_device *dev;
+    struct tty_mouse_state mouse;
 
     ui_fill_rect(0, 0, ramfb_info.width, ramfb_info.height, 0x00101820);
     ui_fill_rect(0, 0, ramfb_info.width, 56, 0x00FFBF00);
@@ -74,10 +77,14 @@ void ui_boot_screen(void)
     }
     sprintf((int8_t *)syscall_text, "syscall: abi ready");
     sprintf((int8_t *)shell_text, "shell: pid %d", task_current() ? task_current()->pid : -1);
+    tty_mouse_get_state(&mouse);
+    sprintf((int8_t *)mouse_text, "input: mouse x=%d y=%d buttons=%#x",
+            mouse.x, mouse.y, mouse.buttons);
 
     ui_write_line(40, 308, COLOR_WHITE, 0x0018222D, (const uint8_t *)mem_text);
     ui_write_line(40, 332, COLOR_WHITE, 0x0018222D, (const uint8_t *)cpu_text);
     ui_write_line(40, 356, COLOR_WHITE, 0x0018222D, (const uint8_t *)net_text);
+    ui_write_line(40, 380, COLOR_WHITE, 0x0012161C, (const uint8_t *)mouse_text);
     ui_write_line(40, 450, COLOR_WHITE, 0x0012161C, (const uint8_t *)syscall_text);
     ui_write_line(40, 474, COLOR_WHITE, 0x0012161C, (const uint8_t *)shell_text);
 

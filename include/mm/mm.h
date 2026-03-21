@@ -11,7 +11,7 @@
 #define PAGE_SIZE   			(1 << PAGE_SHIFT)	
 #define PAGE_MASK               (~(PAGE_SIZE - 1))
 
-#define TOTAL_MEMORY            (512 * 0x100000) // 512mb
+#define TOTAL_MEMORY            (1024 * 0x100000) // 1GB，和 make run 默认内存一致
 
 /*
  * Memory types available.

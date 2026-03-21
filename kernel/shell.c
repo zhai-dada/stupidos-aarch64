@@ -1,7 +1,7 @@
 #include "shell.h"
 
-#include "driver/uart.h"
 #include "errno.h"
+#include "tty.h"
 #include "fs/vfs.h"
 #include "lib/libmem.h"
 #include "lib/libstr.h"
@@ -18,12 +18,12 @@
 
 static void shell_putc(char ch)
 {
-    uart_putc((uint8_t)ch);
+    tty_putc((uint8_t)ch);
 }
 
 static void shell_puts(const int8_t *str)
 {
-    uart_send_string((int8_t *)str);
+    tty_write(str);
 }
 
 static void shell_write_bytes(const int8_t *buf, size_t len)
@@ -356,9 +356,9 @@ static void shell_main(void *arg)
         len = 0;
         shell_puts((const int8_t *)"stupidos> ");
 
-        while (1)
-        {
-            ch = uart_getc();
+	        while (1)
+	        {
+	            ch = tty_getc();
             if (ch == '\r' || ch == '\n')
             {
                 shell_puts((const int8_t *)"\r\n");

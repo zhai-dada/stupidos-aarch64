@@ -1,4 +1,5 @@
 #include "mmu.h"
+#include "fdt.h"
 #include "driver/fwcfg.h"
 #include "driver/uart.h"
 #include "driver/virtio_blk.h"
@@ -61,6 +62,19 @@ static inline pmd_t pfn_pmd_block(uint64_t pa, uint64_t prot)
 static inline int pmd_table(pmd_t pmd)
 {
     return (pmd_val(pmd) & PMD_TYPE_MASK) == PMD_TYPE_TABLE;
+}
+
+static uint64_t mmu_boot_memory_size(void)
+{
+    uint64_t size;
+
+    size = fdt_memory_size();
+    if (!size || size > TOTAL_MEMORY)
+    {
+        size = TOTAL_MEMORY;
+    }
+
+    return size;
 }
 
 static void dump_mapping(const char *name, pgd_t *root, uint64_t va)
@@ -412,7 +426,7 @@ static int build_swapper_map(void)
                          (uint64_t)&swapper_pt, SWAPPER_PTE_TABLES);
 
     if (map_range_pmd_block((pgd_t *)&swapper_pgd, &swapper_pool,
-                            PAGE_OFFSET, PHYS_OFFSET, TOTAL_MEMORY, PMD_KERNEL))
+                            PAGE_OFFSET, PHYS_OFFSET, mmu_boot_memory_size(), PMD_KERNEL))
     {
         return -1;
     }
@@ -537,7 +551,7 @@ int page_map_init(void)
 
     printk("[mmu\tinit]: idmap ready [%#lx, %#lx)\n", kernel_start, kernel_end);
     printk("[mmu\tinit]: linear map ready [%#018lx, %#018lx)\n",
-           PAGE_OFFSET, PAGE_OFFSET + TOTAL_MEMORY);
+           PAGE_OFFSET, PAGE_OFFSET + mmu_boot_memory_size());
     printk("[mmu\tinit]: kimage map ready at KIMAGE_VADDR\n");
     dump_mapping("kimage", (pgd_t *)&swapper_pgd, KIMAGE_VADDR);
     dump_mapping("virtio-hi", (pgd_t *)&swapper_pgd, VIRTIO_MMIO_HIGH_BASE);

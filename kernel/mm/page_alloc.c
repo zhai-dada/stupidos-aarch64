@@ -1,5 +1,6 @@
 #include "mm/page_alloc.h"
 
+#include "fdt.h"
 #include "mmu.h"
 #include "mm/mm.h"
 #include "printk.h"
@@ -171,7 +172,11 @@ void page_alloc_init(void)
     uint64_t phys;
     uint32_t i;
 
-    alloc_base_phys = PHYS_OFFSET;
+    alloc_base_phys = fdt_memory_base();
+    if (!alloc_base_phys)
+    {
+        alloc_base_phys = PHYS_OFFSET;
+    }
     memset((int8_t *)page_map, 0, sizeof(page_map));
     for (i = 0; i <= PAGE_ALLOC_MAX_ORDER; i++)
     {
@@ -182,7 +187,11 @@ void page_alloc_init(void)
 
     kernel_end_phys = kernel_virt_to_phys((uint64_t)&__kernel_end);
     free_start = PAGE_ALIGN_UP(kernel_end_phys);
-    free_end = alloc_base_phys + TOTAL_MEMORY;
+    free_end = alloc_base_phys + fdt_memory_size();
+    if (free_end <= alloc_base_phys || free_end > alloc_base_phys + TOTAL_MEMORY)
+    {
+        free_end = alloc_base_phys + TOTAL_MEMORY;
+    }
 
     if (free_start < alloc_base_phys)
     {
