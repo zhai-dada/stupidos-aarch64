@@ -78,6 +78,7 @@ int kthread_create(const int8_t *name, task_entry_t entry, void *arg);
 void sched_yield(void);
 void scheduler_tick(void);
 void sched_maybe_resched(void);
+void sched_show_tasks(void);
 void task_exit(void) __attribute__((noreturn));
 struct task_struct *task_current(void);
 

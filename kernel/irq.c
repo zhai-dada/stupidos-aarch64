@@ -1,4 +1,5 @@
 #include "irq.h"
+#include "syscall.h"
 
 void (*irq_handlers[MAX_IRQS])(void);
 
@@ -25,11 +26,20 @@ void do_irq(void *stack)
 void do_sync(void *stack, uint32_t esr)
 {
 	pt_regs_t* regs = (pt_regs_t*)stack;
+	uint32_t ec;
 	
 	disable_irq();
-	
+
+	ec = (esr >> ESR_EC_SHIFT) & ESR_EC_MASK;
+	if (ec == ESR_EC_SVC64)
+	{
+		regs->s_reg[0] = (uint64_t)syscall_dispatch(regs);
+		regs->s_pc += 4;
+		return;
+	}
+
 	show_ptregs(regs);
-	printk("Unhandled sync exception: esr = 0x%x\n", esr);
+	printk("Unhandled sync exception: esr = 0x%x ec=0x%x\n", esr, ec);
 	
 	while (1)
 	{
@@ -44,7 +54,7 @@ void bad_mode(void *stack, uint32_t reason, uint32_t esr)
     disable_irq();
 
 	show_ptregs(regs);
-    printk("[%s]: reason=0x%x, esr=0x%x, far_el1=0x%x\n", bad_mode_handler[reason], reason, esr, read_sysreg(far_el1));
+    printk("[%s]: reason=0x%x, esr=0x%x, far_el1=0x%lx\n", bad_mode_handler[reason], reason, esr, read_sysreg(far_el1));
 	
 	while(1)
 	{

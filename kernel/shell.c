@@ -5,6 +5,9 @@
 #include "fs/vfs.h"
 #include "lib/libmem.h"
 #include "lib/libstr.h"
+#include "mm/mm.h"
+#include "mm/page_alloc.h"
+#include "net/net.h"
 #include "printk.h"
 #include "sched.h"
 #include "smp.h"
@@ -93,6 +96,9 @@ static void shell_help(void)
     shell_puts((const int8_t *)"  cat <path>      - dump a file\r\n");
     shell_puts((const int8_t *)"  write <path> <text> - overwrite a file from offset 0\r\n");
     shell_puts((const int8_t *)"  info            - show kernel status\r\n");
+    shell_puts((const int8_t *)"  ps              - show task table\r\n");
+    shell_puts((const int8_t *)"  net             - show network devices\r\n");
+    shell_puts((const int8_t *)"  mem             - show buddy allocator state\r\n");
 }
 
 static void shell_ls(const int8_t *path)
@@ -200,6 +206,13 @@ static void shell_info(void)
            task_current() ? task_current()->pid : -1);
 }
 
+static void shell_mem(void)
+{
+    printk("[mem\t]: free=%u pages total=%u pages (%lu MB total)\n",
+           page_alloc_free_pages(), page_alloc_total_pages(),
+           (uint64_t)(TOTAL_MEMORY / 0x100000));
+}
+
 static void shell_execute(const int8_t *line)
 {
     const char *cursor;
@@ -283,6 +296,24 @@ static void shell_execute(const int8_t *line)
     if (strcmp(cmd, (const int8_t *)"info") == 0)
     {
         shell_info();
+        return;
+    }
+
+    if (strcmp(cmd, (const int8_t *)"ps") == 0)
+    {
+        sched_show_tasks();
+        return;
+    }
+
+    if (strcmp(cmd, (const int8_t *)"mem") == 0)
+    {
+        shell_mem();
+        return;
+    }
+
+    if (strcmp(cmd, (const int8_t *)"net") == 0)
+    {
+        net_show_status();
         return;
     }
 

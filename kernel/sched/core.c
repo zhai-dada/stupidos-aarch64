@@ -10,11 +10,25 @@ struct sched_state
 {
     spinlock_t lock;
     struct task_struct tasks[CONFIG_MAX_TASKS];
+    struct task_struct idle[CONFIG_MAX_CPUS];
     struct rq rq[CONFIG_MAX_CPUS];
     int32_t next_pid;
 };
 
 static struct sched_state sched_state;
+
+static void copy_task_name(int8_t *dst, const int8_t *src);
+static void init_idle_task(struct task_struct *idle, uint32_t cpu)
+{
+    memset((int8_t *)idle, 0, sizeof(*idle));
+    idle->pid = -1;
+    idle->cpu = cpu;
+    idle->is_idle = true;
+    idle->state = TASK_RUNNING;
+    idle->weight = 1024;
+    copy_task_name(idle->comm, (const int8_t *)"idle");
+}
+
 static void copy_task_name(int8_t *dst, const int8_t *src)
 {
     uint32_t i;
@@ -90,6 +104,46 @@ static uint32_t rq_nr_schedulable_tasks(uint32_t cpu)
     }
 
     return nr;
+}
+
+static uint32_t sched_pick_target_cpu(void)
+{
+    uint32_t cpu;
+    uint32_t best_cpu;
+    uint32_t best_load;
+
+    best_cpu = smp_cpu_id();
+    best_load = sched_state.rq[best_cpu].nr_running;
+
+    for (cpu = 0; cpu < smp_cpu_count(); cpu++)
+    {
+        uint32_t load = sched_state.rq[cpu].nr_running;
+
+        if (load < best_load)
+        {
+            best_cpu = cpu;
+            best_load = load;
+        }
+    }
+
+    return best_cpu;
+}
+
+static const int8_t *task_state_name(enum task_state state)
+{
+    switch (state)
+    {
+    case TASK_UNUSED:
+        return (const int8_t *)"unused";
+    case TASK_RUNNING:
+        return (const int8_t *)"running";
+    case TASK_RUNNABLE:
+        return (const int8_t *)"runnable";
+    case TASK_DEAD:
+        return (const int8_t *)"dead";
+    default:
+        return (const int8_t *)"?";
+    }
 }
 
 static struct task_struct *pick_next_task(struct rq *rq, struct task_struct *prev)
@@ -217,7 +271,6 @@ struct task_struct *task_current(void)
 
 void sched_init(void)
 {
-    struct task_struct *boot;
     struct rq *rq;
     uint32_t cpu;
 
@@ -230,30 +283,26 @@ void sched_init(void)
         sched_state.rq[cpu].min_vruntime = 0;
         sched_state.rq[cpu].nr_running = 0;
         sched_state.rq[cpu].need_resched = false;
+        init_idle_task(&sched_state.idle[cpu], cpu);
+        sched_state.rq[cpu].curr = &sched_state.idle[cpu];
+        sched_state.rq[cpu].nr_running = 1;
     }
 
-    boot = &sched_state.tasks[0];
-    boot->pid = 0;
-    boot->cpu = smp_cpu_id();
-    boot->is_idle = true;
-    boot->state = TASK_RUNNING;
-    boot->weight = 1024;
-    copy_task_name(boot->comm, (const int8_t *)"boot");
-
     rq = this_rq();
-    rq->curr = boot;
+    rq->curr = &sched_state.idle[smp_cpu_id()];
     rq->nr_running = 1;
     rq->min_vruntime = 0;
     sched_state.next_pid = 1;
 
-    printk("[sched\tinit]: scheduler ready, boot task pid=0\n");
+    printk("[sched\tinit]: scheduler ready, boot cpu=%u\n", smp_cpu_id());
 }
 
 void sched_init_secondary(uint32_t cpu_id)
 {
-    sched_state.rq[cpu_id].curr = 0;
+    init_idle_task(&sched_state.idle[cpu_id], cpu_id);
+    sched_state.rq[cpu_id].curr = &sched_state.idle[cpu_id];
     sched_state.rq[cpu_id].min_vruntime = 0;
-    sched_state.rq[cpu_id].nr_running = 0;
+    sched_state.rq[cpu_id].nr_running = 1;
     sched_state.rq[cpu_id].need_resched = false;
 }
 
@@ -272,7 +321,7 @@ int kthread_create(const int8_t *name, task_entry_t entry, void *arg)
     disable_irq();
     spin_lock(&sched_state.lock);
 
-    for (slot = 1; slot < CONFIG_MAX_TASKS; slot++)
+    for (slot = 0; slot < CONFIG_MAX_TASKS; slot++)
     {
         if (sched_state.tasks[slot].state == TASK_UNUSED ||
             sched_state.tasks[slot].state == TASK_DEAD)
@@ -293,7 +342,7 @@ int kthread_create(const int8_t *name, task_entry_t entry, void *arg)
 
     pid = sched_state.next_pid++;
     task->pid = pid;
-    task->cpu = 0;
+    task->cpu = sched_pick_target_cpu();
     task->state = TASK_RUNNABLE;
     task->weight = 1024;
     task->entry = entry;
@@ -356,6 +405,38 @@ void scheduler_tick(void)
         task->vruntime >= rq->min_vruntime + SCHED_LATENCY_TICKS)
     {
         rq->need_resched = true;
+    }
+}
+
+void sched_show_tasks(void)
+{
+    uint32_t i;
+    uint32_t cpu;
+
+    printk("[sched\tps  ]: tasks:\n");
+    for (i = 0; i < CONFIG_MAX_TASKS; i++)
+    {
+        struct task_struct *task = &sched_state.tasks[i];
+
+        if (task->state == TASK_UNUSED)
+        {
+            continue;
+        }
+
+        printk("  pid=%d cpu=%u state=%s idle=%u switches=%lu vruntime=%lu comm=%s\n",
+               task->pid, task->cpu, task_state_name(task->state), task->is_idle,
+               task->switches, task->vruntime, task->comm);
+    }
+
+    printk("[sched\tps  ]: runqueues:\n");
+    for (cpu = 0; cpu < smp_cpu_count(); cpu++)
+    {
+        printk("  cpu=%u curr=%d nr_running=%u min_vruntime=%lu need_resched=%u\n",
+               cpu,
+               sched_state.rq[cpu].curr ? sched_state.rq[cpu].curr->pid : -1,
+               sched_state.rq[cpu].nr_running,
+               sched_state.rq[cpu].min_vruntime,
+               sched_state.rq[cpu].need_resched);
     }
 }
 

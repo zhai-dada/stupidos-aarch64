@@ -8,14 +8,19 @@
 #include "gicv2.h"
 #include "pt_regs.h"
 #include "mmu.h"
+#include "mm/page_alloc.h"
 #include "assert.h"
 #include "driver/ramfb.h"
+#include "driver/virtio_net.h"
 #include "driver/fwcfg.h"
 #include "fs/ext4.h"
 #include "fs/fat32.h"
 #include "fs/vfs.h"
+#include "net/net.h"
 #include "pci.h"
+#include "syscall.h"
 #include "shell.h"
+#include "ui.h"
 #include "sched.h"
 #include "smp.h"
 
@@ -236,8 +241,16 @@ static __attribute__((noreturn)) void kernel_main_high(void)
      */
     sched_init();
     smp_init();
+    page_alloc_init();
     pci_init();
+    net_init();
+    if (virtio_net_init())
+    {
+        printk("[net\tinit]: virtio-net init failed\n");
+    }
+    syscall_init();
     shell_init();
+    ui_boot_screen();
 
     /*
      * 这一轮先保留最小内核线程框架：
