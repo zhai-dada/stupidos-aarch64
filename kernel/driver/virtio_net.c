@@ -2,7 +2,10 @@
 
 #include "asm/barrier.h"
 #include "driver/virtio_blk.h"
+#include "fdt.h"
 #include "errno.h"
+#include "gicv2.h"
+#include "irq.h"
 #include "lib/libasm.h"
 #include "lib/librw.h"
 #include "lib/libmem.h"
@@ -10,6 +13,7 @@
 #include "net/net.h"
 #include "printk.h"
 #include "sched.h"
+#include "softirq.h"
 #include "spinlock.h"
 
 #define VIRTIO_MMIO_MAGIC_VALUE         0x000
@@ -25,6 +29,7 @@
 #define VIRTIO_MMIO_QUEUE_NUM           0x038
 #define VIRTIO_MMIO_QUEUE_READY         0x044
 #define VIRTIO_MMIO_QUEUE_NOTIFY        0x050
+#define VIRTIO_MMIO_INTERRUPT_STATUS    0x060
 #define VIRTIO_MMIO_INTERRUPT_ACK       0x064
 #define VIRTIO_MMIO_STATUS              0x070
 #define VIRTIO_MMIO_QUEUE_DESC_LOW      0x080
@@ -109,7 +114,11 @@ struct virtio_net_state
 {
     uint64_t mmio_base;
     bool ready;
+    bool irq_ready;
+    uint32_t irq;
+    uint32_t irq_count;
     struct net_device dev;
+    struct tasklet_struct rx_tasklet;
     struct virtq_desc rx_desc[VIRTIO_NET_QUEUE_SIZE] __attribute__((aligned(4096)));
     struct virtq_avail rx_avail __attribute__((aligned(4096)));
     struct virtq_used rx_used __attribute__((aligned(4096)));
@@ -124,6 +133,9 @@ struct virtio_net_state
 };
 
 static struct virtio_net_state virtio_net_state;
+static bool virtio_net_irq_stable;
+
+static void virtio_net_irq_handle(void);
 
 static uint32_t virtio_dcache_line_size(void)
 {
@@ -360,6 +372,40 @@ static void virtio_net_poll_rx(struct virtio_net_state *st)
     }
 }
 
+static void virtio_net_rx_tasklet(unsigned long data)
+{
+    struct virtio_net_state *st;
+
+    st = (struct virtio_net_state *)data;
+    if (!st || !st->ready)
+    {
+        return;
+    }
+
+    virtio_net_poll_rx(st);
+}
+
+static void virtio_net_irq_handle(void)
+{
+    uint32_t status;
+
+    status = virtio_mmio_read32(virtio_net_state.mmio_base, VIRTIO_MMIO_INTERRUPT_STATUS);
+    if (!status)
+    {
+        return;
+    }
+
+    /*
+     * virtio-mmio 的硬中断里只做最小动作：
+     * 1. 记账，方便 shell/日志观察 IRQ 是否真的进来了
+     * 2. 立刻 ACK，避免设备线一直保持拉高
+     * 3. 把真正的 used ring 处理下沉到 tasklet
+     */
+    virtio_net_state.irq_count++;
+    virtio_mmio_write32(virtio_net_state.mmio_base, VIRTIO_MMIO_INTERRUPT_ACK, status);
+    tasklet_schedule(&virtio_net_state.rx_tasklet);
+}
+
 static void virtio_net_worker(void *arg)
 {
     struct virtio_net_state *st;
@@ -369,7 +415,10 @@ static void virtio_net_worker(void *arg)
     {
         if (st->ready)
         {
-            virtio_net_poll_rx(st);
+            if (!st->irq_ready)
+            {
+                virtio_net_poll_rx(st);
+            }
         }
         sched_yield();
     }
@@ -385,6 +434,7 @@ void virtio_net_poll(void)
 
 int virtio_net_init(void)
 {
+    const struct fdt_device_desc *dev_desc;
     uint64_t base;
     uint32_t queue_max;
     uint32_t status;
@@ -393,6 +443,7 @@ int virtio_net_init(void)
     int ret;
 
     memset((int8_t *)&virtio_net_state, 0, sizeof(virtio_net_state));
+    virtio_net_irq_stable = false;
     spin_lock_init(&virtio_net_state.tx_lock);
 
     base = 0;
@@ -413,6 +464,10 @@ int virtio_net_init(void)
     }
 
     virtio_net_state.mmio_base = base;
+    virtio_net_state.irq = 0;
+    virtio_net_state.irq_count = 0;
+    virtio_net_state.irq_ready = false;
+    tasklet_init(&virtio_net_state.rx_tasklet, virtio_net_rx_tasklet, (unsigned long)&virtio_net_state);
     virtio_mmio_write32(base, VIRTIO_MMIO_STATUS, 0);
     status = VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER;
     virtio_mmio_write32(base, VIRTIO_MMIO_STATUS, status);
@@ -498,7 +553,43 @@ int virtio_net_init(void)
         return ret;
     }
 
+    dev_desc = fdt_find_device_by_reg(FDT_DEVICE_VIRTIO_MMIO, kernel_virt_to_phys(base));
+    if (dev_desc && dev_desc->has_irq)
+    {
+        virtio_net_state.irq = dev_desc->irq;
+        if (virtio_net_irq_stable)
+        {
+            irq_handlers[virtio_net_state.irq] = virtio_net_irq_handle;
+            gic_enable_irq(virtio_net_state.irq);
+            virtio_net_state.irq_ready = true;
+        }
+    }
+
     printk("[virtio-net\tinit]: base=%#lx mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
            base, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    if (virtio_net_state.irq_ready)
+    {
+        printk("[virtio-net\tinit]: irq=%u gic=%u tasklet=on\n",
+               virtio_net_state.irq, gic_irq_is_enabled(virtio_net_state.irq));
+    }
+    else if (virtio_net_state.irq)
+    {
+        /*
+         * 先和 virtio-input 保持同样策略：IRQ 能探测到，但在早期内核
+         * 尚未把整条中断/软中断路径验证稳定前，默认继续走 worker 轮询。
+         * 这样能保证 make run 先以“可持续启动、可交互”为优先目标。
+         */
+        printk("[virtio-net\tinit]: irq=%u discovered, polling fallback enabled\n",
+               virtio_net_state.irq);
+    }
+    else
+    {
+        printk("[virtio-net\tinit]: irq unavailable, fallback worker polling\n");
+    }
     return 0;
+}
+
+uint32_t virtio_net_irq_count(void)
+{
+    return virtio_net_state.irq_count;
 }

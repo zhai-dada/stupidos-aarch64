@@ -2,11 +2,33 @@
 #include "lib/librw.h"
 #include "lib/libasm.h"
 #include "lib/libirq.h"
+#include "fdt.h"
+#include "gicv2.h"
 #include "spinlock.h"
 #include "tty.h"
 #include "debug.h"
 
 static spinlock_t uart_log_lock = SPINLOCK_INIT;
+static uint32_t uart_irq_line = UART_IRQ;
+static bool uart_irq_seen;
+
+static uint32_t uart_detect_irq_line(void)
+{
+    const struct fdt_device_desc *uart_dev;
+
+    uart_dev = fdt_find_device_by_kind(FDT_DEVICE_UART);
+    if (!uart_dev)
+    {
+        return UART_IRQ;
+    }
+
+    if (uart_dev->has_irq)
+    {
+        return uart_dev->irq;
+    }
+
+    return UART_IRQ;
+}
 
 static void uart_send_string_raw(int8_t *str)
 {
@@ -49,6 +71,16 @@ int32_t uart_getc(void)
     return tty_getc();
 }
 
+int32_t uart_try_getc(void)
+{
+    if (get32(PL011_UART0_BASE + UART_FR) & UART_FR_RXFE)
+    {
+        return -1;
+    }
+
+    return (int32_t)(get32(PL011_UART0_BASE + UART_DR) & 0xffU);
+}
+
 void early_uart_init(void)
 {
     // Init the uart
@@ -71,6 +103,8 @@ void early_uart_init(void)
 
 void uart_init(void)
 {
+    uint32_t imsc;
+
     // Init the uart
 
     /* Clear all errors */
@@ -90,11 +124,18 @@ void uart_init(void)
 
     /* 真正的使能位在 CR 里，不是在 LCR_H 里。 */
     *(uint32_t *)(PL011_UART0_BASE + UART_CR) = UART_CR_UARTEN | UART_CR_TXE | UART_CR_RXE;
-    
-    irq_handlers[UART_IRQ] = uart_irq_handle;
-    gic_enable_irq(UART_IRQ);
-    
-    printk("[uart\tinit]: init ok\n");
+
+    uart_irq_line = uart_detect_irq_line();
+    uart_irq_seen = false;
+    irq_handlers[uart_irq_line] = uart_irq_handle;
+    gic_enable_irq(uart_irq_line);
+
+    imsc = get32(PL011_UART0_BASE + UART_IMSC);
+    printk("[uart\tinit]: irq=%u gic=%u imsc=%#x cr=%#x init ok\n",
+           uart_irq_line,
+           gic_irq_is_enabled(uart_irq_line),
+           imsc,
+           get32(PL011_UART0_BASE + UART_CR));
     return;
 }
 
@@ -134,7 +175,13 @@ void uart_irq_handle(void)
 {
     uint32_t fr;
     uint8_t ch;
-printk("====\n");
+
+    if (!uart_irq_seen)
+    {
+        uart_irq_seen = true;
+        printk("[uart\tirq ]: first rx irq on line %u\n", uart_irq_line);
+    }
+
     while (1)
     {
         fr = get32(PL011_UART0_BASE + UART_FR);

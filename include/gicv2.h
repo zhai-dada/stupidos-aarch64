@@ -48,11 +48,17 @@
 #define GICC_EOIR           (GICC_BASE + 0x0010)
 #define GICC_RPR            (GICC_BASE + 0x0014)
 #define GICC_HPPIR          (GICC_BASE + 0x0018)
+#define GICC_ABPR           (GICC_BASE + 0x001C)
+#define GICC_AIAR           (GICC_BASE + 0x0020)
+#define GICC_AEOIR          (GICC_BASE + 0x0024)
+#define GICC_AHPPIR         (GICC_BASE + 0x0028)
 #define GICC_APR            (GICC_BASE + 0x00D0)
 #define GICC_IIDR           (GICC_BASE + 0x00FC)
 #define GICC_DIR            (GICC_BASE + 0x1000)
 
-#define GICD_ENABLE             0x01
+#define GICD_ENABLE_GRP0        0x01
+#define GICD_ENABLE_GRP1        0x02
+#define GICD_ENABLE             (GICD_ENABLE_GRP0 | GICD_ENABLE_GRP1)
 #define GICD_DISABLE            0x00
 #define GICD_INT_EN_SET_SGI     0x0000ffff
 #define GICD_INT_EN_CLR_X32     0xffffffff
@@ -63,8 +69,11 @@
 #define GICD_INT_ACTLOW_LVLTRIG		0x0
 
 #define GICC_DISABLE                0x00
-#define GICC_ENABLE                 0x01
-#define GICC_INT_PRI_THRESHOLD      0xf0
+#define GICC_ENABLE_GRP0            0x01
+#define GICC_ENABLE_GRP1            0x02
+#define GICC_ENABLE                 (GICC_ENABLE_GRP0 | GICC_ENABLE_GRP1)
+#define GICC_INT_PRI_THRESHOLD      0xff
+#define GICC_CTRL_ACKCTL            (1 << 2)
 #define GICC_CTRL_EOImodeNS_SHIFT   9
 #define GICC_CTRL_EOImodeNS         (1 << GICC_CTRL_EOImodeNS_SHIFT)
 #define GICC_DIS_BYPASS_MASK        0x1e0
@@ -80,5 +89,6 @@ extern _gic_info global_gic_info;
 void gic_init(void);
 
 uint32_t gic_enable_irq(uint32_t irq);
+uint32_t gic_irq_is_enabled(uint32_t irq);
 
 #endif

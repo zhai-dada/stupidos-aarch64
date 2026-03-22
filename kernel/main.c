@@ -1,4 +1,5 @@
 #include "driver/uart.h"
+#include "asm/sysreg.h"
 #include "lib/libmem.h"
 #include "lib/libasm.h"
 #include "lib/libirq.h"
@@ -26,6 +27,7 @@
 #include "tty.h"
 #include "sched.h"
 #include "smp.h"
+#include "softirq.h"
 
 extern uint8_t framebuffer[FB_WIDTH * FB_HEIGHT * FB_BPP];
 
@@ -33,6 +35,37 @@ extern uint64_t __bss_start, __bss_end;
 extern uint64_t __kernel_start, __kernel_end;
 
 uint64_t boot_dtb_phys;
+
+static void debug_irq_snapshot(void)
+{
+    uint32_t spin;
+    uint64_t cntp_ctl;
+    uint64_t cntp_tval;
+    uint32_t ppi_pending;
+    uint32_t spi_pending;
+    uint32_t hppir;
+    uint32_t ahppir;
+    uint32_t gicc_ctlr;
+    uint32_t gicd_ctlr;
+
+    for (spin = 0; spin < 25000000U; spin++)
+    {
+        nop();
+    }
+
+    asm volatile("mrs %0, cntp_ctl_el0" : "=r"(cntp_ctl) : : "memory");
+    asm volatile("mrs %0, cntp_tval_el0" : "=r"(cntp_tval) : : "memory");
+    ppi_pending = get32(GICD_ISPENDR + 0);
+    spi_pending = get32(GICD_ISPENDR + 4);
+    hppir = get32(GICC_HPPIR) & 0x3ffU;
+    ahppir = get32(GICC_AHPPIR) & 0x3ffU;
+    gicc_ctlr = get32(GICC_CTLR);
+    gicd_ctlr = get32(GICD_CTLR);
+
+    printk("[irq\tdebug]: daif=%#lx jiffies=%lu cntp_ctl=%#lx cntp_tval=%ld ppi_pend=%#x spi_pend=%#x gicd_ctlr=%#x gicc_ctlr=%#x hppir=%u ahppir=%u\n",
+           read_daif(), jiffies, cntp_ctl, (int64_t)(int32_t)cntp_tval,
+           ppi_pending, spi_pending, gicd_ctlr, gicc_ctlr, hppir, ahppir);
+}
 
 static void demo_worker_a(void *arg)
 {
@@ -82,11 +115,34 @@ static __attribute__((noreturn)) void kernel_main_high(void)
     int fd;
     ssize_t nread;
     int8_t file_buf[128];
-    write_sysreg(kimage_phys_to_virt((uint64_t)&vectors), vbar_el1);
-    isb();
+    enable_irq();
 
-    printk("[mmu\tinit]: now running at KIMAGE_VADDR\n");
+    /*
+     * 当前启动路径下仍然永久保留 TTBR0 的低地址 idmap，
+     * 所以异常向量先继续留在低地址 vectors。
+     *
+     * 实测把 VBAR_EL1 切到 KIMAGE_VADDR 别名后，IRQ 会停止进入。
+     * 在彻底查清高地址向量页的问题前，先维持低地址向量，
+     * 保证 timer/UART 中断和 shell 交互稳定可用。
+     */
+    printk("[mmu\tinit]: now running at KIMAGE_VADDR vbar=%#lx daif=%#lx jiffies=%lu\n",
+           read_sysreg(vbar_el1), read_daif(), jiffies);
     fdt_log_summary();
+
+    /*
+     * 先把调度器和 shell 拉起来。
+     * shell 等待输入时会主动 yield，不会再像之前那样把 boot 线程卡死，
+     * 这样后面的文件系统、PCI、输入和网络初始化可以继续在后台推进。
+     */
+    sched_init();
+    smp_init();
+    printk("[boot\tinit]: shell start\n");
+    shell_init();
+    if (virtio_input_init())
+    {
+        printk("[input\tinit]: virtio-input init failed\n");
+    }
+    sched_yield();
 
     ramfb_putstring(COLOR_BLACK, COLOR_WHITE, (uint8_t*)"Hello World\n\btest");
     assert(6 > 5);
@@ -145,23 +201,10 @@ static __attribute__((noreturn)) void kernel_main_high(void)
         }
     }
 
-    /*
-     * 调度器必须先于 SMP 次级核上线完成初始化。
-     * 否则次级核本地 timer 打开后，可能在 scheduler 状态尚未准备好时
-     * 就进入 tick 路径，造成多核并发访问未初始化的 runqueue。
-     */
-    sched_init();
-    smp_init();
     page_alloc_init();
     syscall_init();
 
-    shell_init();
-
     pci_init();
-    if (virtio_input_init())
-    {
-        printk("[input\tinit]: virtio-input init failed\n");
-    }
     net_init();
     if (virtio_net_init())
     {
@@ -179,7 +222,9 @@ static __attribute__((noreturn)) void kernel_main_high(void)
         }
     }
 
+    printk("[boot\tinit]: ui dashboard start\n");
     ui_boot_screen();
+    printk("[boot\tinit]: ui dashboard done\n");
 
     /*
      * 这一轮先保留最小内核线程框架：
@@ -191,7 +236,6 @@ static __attribute__((noreturn)) void kernel_main_high(void)
     kthread_create((const int8_t *)"worker-a", demo_worker_a, 0);
     kthread_create((const int8_t *)"worker-b", demo_worker_b, 0);
     printk("[sched\tinit]: entering boot idle loop\n");
-    sched_yield();
 
     while (1)
     {
@@ -201,10 +245,14 @@ static __attribute__((noreturn)) void kernel_main_high(void)
 
 int32_t kernel_main(uint64_t dtb_phys)
 {
+    uint64_t current_el;
+
     /* 这里按字节清零 .bss，不能按 uint64_t 个数来减。 */
     memset((int8_t *)&__bss_start, 0, (uint64_t)&__bss_end - (uint64_t)&__bss_start);
 
     early_uart_init();
+    current_el = read_sysreg(CurrentEL);
+    printk("[boot\tinit]: CurrentEL=%lu\n", current_el >> 2);
     if (!dtb_phys)
     {
         dtb_phys = boot_dtb_phys;
@@ -221,10 +269,13 @@ int32_t kernel_main(uint64_t dtb_phys)
 
     uart_init();
     tty_init();
+    softirq_init();
 
     timer_init();
 
     enable_irq();
+    printk("[boot\tinit]: DAIF=%#lx after enable_irq\n", read_daif());
+    debug_irq_snapshot();
 
     /*
      * 先初始化 framebuffer，再建立页表。
@@ -247,6 +298,13 @@ int32_t kernel_main(uint64_t dtb_phys)
         {
         }
     }
+
+    /*
+     * 从这里开始要同时迁移执行地址、栈和异常向量基址。
+     * 如果这个窗口里放开 IRQ，定时器可能打在“PC 已经切高地址、
+     * 但 VBAR 还没切过去”的过渡期，调试上会非常混乱。
+     */
+    disable_irq();
 
     /*
      * 此时：

@@ -6,6 +6,7 @@
 #include "asm/pagetable_hwdef.h"
 #include "asm/barrier.h"
 #include "asm/types.h"
+#include "driver/virtio_blk.h"
 #include "debug.h"
 #include "asm/sysreg.h"
 #include "pci.h"
@@ -74,8 +75,35 @@ static inline uint64_t kimage_virt_to_phys(uint64_t virt)
     return PHYS_OFFSET + (virt - KIMAGE_VADDR);
 }
 
+static inline uint64_t virtio_mmio_virt_to_phys(uint64_t virt)
+{
+    return VIRTIO_MMIO0_BASE + (virt - VIRTIO_MMIO_HIGH_BASE);
+}
+
+static inline uint64_t pcie_ecam_virt_to_phys(uint64_t virt)
+{
+    return PCIE_ECAM_BASE + (virt - PCIE_ECAM_HIGH_BASE);
+}
+
 static inline uint64_t kernel_virt_to_phys(uint64_t virt)
 {
+    /*
+     * 先匹配高地址 MMIO 窗口，再判断内核镜像别名。
+     * 否则像 0xffff9000... 这样的 virtio 高地址别名会被误判成
+     * KIMAGE_VADDR 区域，反推出完全错误的“物理地址”。
+     */
+    if (virt >= VIRTIO_MMIO_HIGH_BASE &&
+        virt < (VIRTIO_MMIO_HIGH_BASE + VIRTIO_MMIO_SIZE))
+    {
+        return virtio_mmio_virt_to_phys(virt);
+    }
+
+    if (virt >= PCIE_ECAM_HIGH_BASE &&
+        virt < (PCIE_ECAM_HIGH_BASE + PCIE_ECAM_SIZE))
+    {
+        return pcie_ecam_virt_to_phys(virt);
+    }
+
     if (virt >= KIMAGE_VADDR)
     {
         return kimage_virt_to_phys(virt);

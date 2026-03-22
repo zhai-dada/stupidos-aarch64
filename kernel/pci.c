@@ -15,7 +15,12 @@ static struct pci_state pci_state;
  * 先把扫描范围收紧到少量 bus，避免 256 个 bus 全扫在 TCG 下拖慢启动。
  * 以后补 bridge / 热插拔时再把这里升级成递归拓扑枚举。
  */
-#define PCI_SCAN_BUS_LIMIT 8
+/*
+ * QEMU virt 平台上的可用 PCIe 设备非常少，当前阶段又主要依赖 virtio-mmio。
+ * PCI 枚举先收缩到根总线的前几个设备，避免把启动时间浪费在无关扫描上。
+ */
+#define PCI_SCAN_BUS_LIMIT 1
+#define PCI_SCAN_DEVICE_LIMIT 8
 
 static inline uint64_t pci_cfg_addr(uint8_t bus, uint8_t dev, uint8_t fn, uint16_t reg)
 {
@@ -176,7 +181,7 @@ void pci_init(void)
      */
     for (bus = 0; bus < PCI_SCAN_BUS_LIMIT; bus++)
     {
-        for (dev = 0; dev < PCI_MAX_DEVICES; dev++)
+        for (dev = 0; dev < PCI_SCAN_DEVICE_LIMIT; dev++)
         {
             pci_probe_device((uint8_t)bus, dev);
         }

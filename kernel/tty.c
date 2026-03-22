@@ -3,6 +3,7 @@
 #include "driver/uart.h"
 #include "lib/libasm.h"
 #include "lib/libirq.h"
+#include "sched.h"
 #include "spinlock.h"
 
 /*
@@ -101,18 +102,32 @@ int32_t tty_getc(void)
         spin_lock(&tty_lock);
         ch = tty_rx_pop();
         spin_unlock(&tty_lock);
-        write_daif(daif);
-
         if (ch >= 0)
         {
+            write_daif(daif);
             return ch;
         }
 
         /*
-         * 没有输入时进入事件等待。
-         * tty_feed_char() 里的 spin_unlock() 会发出 sev，把这里唤醒。
+         * 串口输入优先走中断队列，但如果中断暂时没到，这里再直接轮询
+         * 一次 PL011 RX FIFO，避免用户在 QEMU 里按键后 shell 一直无响应。
+         * 这样既保留中断路径，也给早期调试留一条可靠兜底通道。
          */
-        asm volatile("wfe" : : : "memory");
+        ch = uart_try_getc();
+        if (ch >= 0)
+        {
+            write_daif(daif);
+            return ch;
+        }
+
+        write_daif(daif);
+
+        /*
+         * 当前还没有做完整的等待队列和阻塞唤醒。
+         * shell 线程在没有输入时主动让出 CPU，既不会空转卡死，
+         * 也能让 boot 线程继续推进后面的驱动初始化。
+         */
+        sched_yield();
     }
 }
 

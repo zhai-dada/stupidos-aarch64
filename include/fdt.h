@@ -39,5 +39,7 @@ uint64_t fdt_memory_size(void);
 
 uint32_t fdt_device_count(void);
 const struct fdt_device_desc *fdt_device(uint32_t index);
+const struct fdt_device_desc *fdt_find_device_by_kind(enum fdt_device_kind kind);
+const struct fdt_device_desc *fdt_find_device_by_reg(enum fdt_device_kind kind, uint64_t reg_base);
 
 #endif

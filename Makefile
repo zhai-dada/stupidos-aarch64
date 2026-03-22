@@ -25,6 +25,7 @@ QEMU           :=  qemu-system-aarch64
 CFLAGS          :=  -g -Wall -fno-builtin -Iinclude -O0 -march=armv8-a+nofp
 ASFLAGS         :=  -g -Iinclude
 LDFLAGS         :=  -nostdlib
+DEPFLAGS        :=  -MMD -MP
 
 # Linker script
 LD_SCRIPT      :=  kernel/stupidos-aarch64.ld
@@ -39,6 +40,9 @@ C_OBJS         :=  $(patsubst %.c, $(BUILD_DIR)/%.o, $(C_SRCS))
 S_OBJS         :=  $(patsubst %.S, $(BUILD_DIR)/%.o, $(S_SRCS))
 FONT_OBJS      :=  $(FONT_GEN_SRC:.c=.o)
 OBJS           :=  $(C_OBJS) $(FONT_OBJS) $(S_OBJS)
+DEPS           :=  $(C_OBJS:.o=.d) $(FONT_OBJS:.o=.d)
+
+-include $(DEPS)
 
 # Targets
 KERNEL_ELF     :=  $(BUILD_DIR)/stupidos.elf
@@ -58,7 +62,7 @@ all: $(KERNEL_BIN)
 # Create build directories
 $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/%.o: %.S
 	@mkdir -p $(dir $@)
@@ -71,7 +75,7 @@ $(FONT_GEN_SRC): $(FONT_TTF) tools/gen_font.py
 
 $(FONT_GEN_SRC:.c=.o): $(FONT_GEN_SRC)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(QEMU_DTB): $(QEMU_DTS)
 	@mkdir -p $(dir $@)
@@ -162,9 +166,10 @@ run: $(KERNEL_BIN) $(QEMU_DTB)
 		$(MAKE) disk; \
 	fi
 	@echo "Starting QEMU..."
+	@echo "Serial shell is on this terminal; RAMFB/UI is shown in the GTK window."
 	$(QEMU) -M virt \
 		-cpu cortex-a72 \
-		-smp 4 \
+		-smp 1 \
 		-m 1G \
 		-rtc base=utc,clock=host \
 		-global virtio-mmio.force-legacy=false \
@@ -174,11 +179,10 @@ run: $(KERNEL_BIN) $(QEMU_DTB)
 		-device ramfb \
 		-display gtk \
 		-device virtio-net-device,netdev=net0 -netdev user,id=net0\
-		-device virtio-net-pci,netdev=pcinet0,mac=52:54:00:12:34:56 -netdev user,id=pcinet0 \
-		-device virtio-sound-device,audiodev=audio0 -audiodev sdl,id=audio0\
 		-kernel $(KERNEL_BIN) \
 		-dtb $(QEMU_DTB) \
-		-serial mon:stdio
+		-serial stdio \
+		-monitor none
 
 .PHONY: run-headless
 run-headless: $(KERNEL_BIN) $(QEMU_DTB)
@@ -186,6 +190,7 @@ run-headless: $(KERNEL_BIN) $(QEMU_DTB)
 		$(MAKE) disk; \
 	fi
 	@echo "Starting QEMU (headless)..."
+	@echo "Headless mode uses this terminal for the serial shell."
 	$(QEMU) -M virt \
 		-cpu cortex-a72 \
 		-smp 1 \

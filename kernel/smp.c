@@ -7,6 +7,7 @@
 #include "mmu.h"
 #include "printk.h"
 #include "sched.h"
+#include "softirq.h"
 #include "timer.h"
 
 #define PSCI_0_2_FN64_CPU_ON   0xC4000003UL
@@ -52,6 +53,7 @@ static void secondary_main_high(uint64_t cpu_id)
     isb();
 
     gic_init();
+    softirq_init_secondary((uint32_t)cpu_id);
     /*
      * 次级核一旦开始接收本地 timer IRQ，就可能进入调度代码。
      * 所以必须先把本 CPU 的 runqueue 状态初始化好，再打开本地 timer。

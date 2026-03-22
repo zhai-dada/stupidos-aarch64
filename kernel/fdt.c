@@ -73,6 +73,25 @@ static uint32_t fdt_align4(uint32_t value)
     return (value + 3U) & ~3U;
 }
 
+static uint32_t fdt_gic_irq_to_intid(uint32_t irq_type, uint32_t irq_num)
+{
+    /*
+     * 设备树里的 GIC interrupt specifier 不是直接的 intid：
+     * - type=0: SPI，实际 intid 从 32 开始
+     * - type=1: PPI，实际 intid 从 16 开始
+     * 这里把它转换成真正的 GIC intid，后续日志和驱动注册都更直观。
+     */
+    switch (irq_type)
+    {
+    case 0:
+        return 32U + irq_num;
+    case 1:
+        return 16U + irq_num;
+    default:
+        return irq_num;
+    }
+}
+
 static void fdt_copy_string(int8_t *dst, size_t dst_len, const int8_t *src, size_t src_len)
 {
     size_t copy_len;
@@ -178,7 +197,8 @@ static enum fdt_device_kind fdt_classify_device(const struct fdt_device_desc *de
     }
 
     if (desc->compatible[0] &&
-        fdt_string_list_contains(desc->compatible, (uint32_t)strlen((int8_t *)desc->compatible), (const int8_t *)"pl011"))
+        (strcmp(desc->compatible, (const int8_t *)"arm,pl011") == 0 ||
+         strcmp(desc->compatible, (const int8_t *)"arm,sbsa-uart") == 0))
     {
         return FDT_DEVICE_UART;
     }
@@ -274,7 +294,12 @@ static void fdt_handle_property(struct fdt_scan_node *node, const int8_t *name, 
 
     if (strcmp(name, (const int8_t *)"interrupts") == 0 && len >= 12)
     {
-        node->desc.irq = fdt_read_be32((const uint8_t *)data + 4);
+        uint32_t irq_type;
+        uint32_t irq_num;
+
+        irq_type = fdt_read_be32(data);
+        irq_num = fdt_read_be32((const uint8_t *)data + 4);
+        node->desc.irq = fdt_gic_irq_to_intid(irq_type, irq_num);
         node->desc.has_irq = true;
         return;
     }
@@ -505,4 +530,43 @@ const struct fdt_device_desc *fdt_device(uint32_t index)
     }
 
     return &fdt_state.devices[index];
+}
+
+const struct fdt_device_desc *fdt_find_device_by_kind(enum fdt_device_kind kind)
+{
+    uint32_t index;
+
+    for (index = 0; index < fdt_state.device_count; index++)
+    {
+        if (fdt_state.devices[index].kind == kind)
+        {
+            return &fdt_state.devices[index];
+        }
+    }
+
+    return NULL;
+}
+
+const struct fdt_device_desc *fdt_find_device_by_reg(enum fdt_device_kind kind, uint64_t reg_base)
+{
+    uint32_t index;
+
+    for (index = 0; index < fdt_state.device_count; index++)
+    {
+        const struct fdt_device_desc *dev = &fdt_state.devices[index];
+
+        if (dev->kind != kind)
+        {
+            continue;
+        }
+
+        if (!dev->has_reg || dev->reg_base != reg_base)
+        {
+            continue;
+        }
+
+        return dev;
+    }
+
+    return NULL;
 }

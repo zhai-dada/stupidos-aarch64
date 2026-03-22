@@ -2,7 +2,10 @@
 
 #include "asm/barrier.h"
 #include "driver/virtio_blk.h"
+#include "fdt.h"
 #include "errno.h"
+#include "gicv2.h"
+#include "irq.h"
 #include "lib/libasm.h"
 #include "lib/librw.h"
 #include "lib/libmem.h"
@@ -10,6 +13,7 @@
 #include "mmu.h"
 #include "printk.h"
 #include "sched.h"
+#include "softirq.h"
 #include "spinlock.h"
 #include "tty.h"
 
@@ -22,6 +26,7 @@
 #define VIRTIO_MMIO_QUEUE_NUM           0x038
 #define VIRTIO_MMIO_QUEUE_READY         0x044
 #define VIRTIO_MMIO_QUEUE_NOTIFY        0x050
+#define VIRTIO_MMIO_INTERRUPT_STATUS    0x060
 #define VIRTIO_MMIO_INTERRUPT_ACK       0x064
 #define VIRTIO_MMIO_STATUS              0x070
 #define VIRTIO_MMIO_QUEUE_DESC_LOW      0x080
@@ -188,8 +193,12 @@ struct virtio_input_state
 {
     uint64_t mmio_base;
     bool ready;
+    bool irq_ready;
     enum virtio_input_kind kind;
+    uint32_t irq;
+    uint32_t irq_count;
     int8_t name[64];
+    struct tasklet_struct event_tasklet;
     struct virtq_desc event_desc[VIRTIO_INPUT_QUEUE_SIZE] __attribute__((aligned(4096)));
     struct virtq_avail event_avail __attribute__((aligned(4096)));
     struct virtq_used event_used __attribute__((aligned(4096)));
@@ -205,6 +214,7 @@ struct virtio_input_state
 };
 
 static struct virtio_input_state virtio_input_state[4];
+static bool virtio_input_irq_stable;
 
 static uint32_t virtio_dcache_line_size(void)
 {
@@ -283,6 +293,46 @@ static inline void virtio_mmio_write64(uint64_t base, uint64_t reg, uint64_t val
     virtio_mmio_write32(base, reg, (uint32_t)value);
     virtio_mmio_write32(base, reg + 4, (uint32_t)(value >> 32));
 }
+
+static void virtio_input_irq_handle_slot(uint32_t slot)
+{
+    struct virtio_input_state *st;
+    uint32_t status;
+
+    if (slot >= (sizeof(virtio_input_state) / sizeof(virtio_input_state[0])))
+    {
+        return;
+    }
+
+    st = &virtio_input_state[slot];
+    if (!st->ready || !st->irq_ready)
+    {
+        return;
+    }
+
+    status = virtio_mmio_read32(st->mmio_base, VIRTIO_MMIO_INTERRUPT_STATUS);
+    if (!status)
+    {
+        return;
+    }
+
+    st->irq_count++;
+    virtio_mmio_write32(st->mmio_base, VIRTIO_MMIO_INTERRUPT_ACK, status);
+    tasklet_schedule(&st->event_tasklet);
+}
+
+static void virtio_input_irq_handle0(void) { virtio_input_irq_handle_slot(0); }
+static void virtio_input_irq_handle1(void) { virtio_input_irq_handle_slot(1); }
+static void virtio_input_irq_handle2(void) { virtio_input_irq_handle_slot(2); }
+static void virtio_input_irq_handle3(void) { virtio_input_irq_handle_slot(3); }
+
+static void (* const virtio_input_irq_handlers[])(void) =
+{
+    virtio_input_irq_handle0,
+    virtio_input_irq_handle1,
+    virtio_input_irq_handle2,
+    virtio_input_irq_handle3,
+};
 
 static int virtio_input_detect(uint64_t base)
 {
@@ -565,6 +615,19 @@ static void virtio_input_poll_state(struct virtio_input_state *st)
     }
 }
 
+static void virtio_input_event_tasklet(unsigned long data)
+{
+    struct virtio_input_state *st;
+
+    st = (struct virtio_input_state *)data;
+    if (!st || !st->ready)
+    {
+        return;
+    }
+
+    virtio_input_poll_state(st);
+}
+
 static void virtio_input_worker(void *arg)
 {
     struct virtio_input_state *st;
@@ -574,7 +637,10 @@ static void virtio_input_worker(void *arg)
     {
         if (st->ready)
         {
-            virtio_input_poll_state(st);
+            if (!st->irq_ready)
+            {
+                virtio_input_poll_state(st);
+            }
         }
         sched_yield();
     }
@@ -582,6 +648,7 @@ static void virtio_input_worker(void *arg)
 
 static int virtio_input_configure(uint64_t base, struct virtio_input_state *st)
 {
+    const struct fdt_device_desc *dev_desc;
     uint32_t queue_max;
     uint32_t status;
     uint32_t slot;
@@ -627,6 +694,10 @@ static int virtio_input_configure(uint64_t base, struct virtio_input_state *st)
                virtio_input_name_contains(st->name, (const int8_t *)"Pointer")
                ? VIRTIO_INPUT_KIND_POINTER
                : VIRTIO_INPUT_KIND_KEYBOARD;
+    st->irq = 0;
+    st->irq_count = 0;
+    st->irq_ready = false;
+    tasklet_init(&st->event_tasklet, virtio_input_event_tasklet, (unsigned long)st);
 
     for (slot = 0; slot < VIRTIO_INPUT_QUEUE_SIZE; slot++)
     {
@@ -645,10 +716,44 @@ static int virtio_input_configure(uint64_t base, struct virtio_input_state *st)
     }
 
     st->ready = true;
+    dev_desc = fdt_find_device_by_reg(FDT_DEVICE_VIRTIO_MMIO, kernel_virt_to_phys(base));
+    if (dev_desc && dev_desc->has_irq)
+    {
+        uint32_t idx = (uint32_t)(st - virtio_input_state);
+
+        st->irq = dev_desc->irq;
+        if (virtio_input_irq_stable &&
+            idx < (sizeof(virtio_input_irq_handlers) / sizeof(virtio_input_irq_handlers[0])))
+        {
+            irq_handlers[st->irq] = virtio_input_irq_handlers[idx];
+            gic_enable_irq(st->irq);
+            st->irq_ready = true;
+        }
+    }
+
     printk("[input\tinit]: %s kind=%s base=%#lx\n",
            st->name,
            st->kind == VIRTIO_INPUT_KIND_KEYBOARD ? "keyboard" : "pointer",
            base);
+    if (st->irq_ready)
+    {
+        printk("[input\tinit]: %s irq=%u gic=%u tasklet=on\n",
+               st->name, st->irq, gic_irq_is_enabled(st->irq));
+    }
+    else if (st->irq)
+    {
+        /*
+         * 当前 virtio-input 的 IRQ 路径第一次进中断后仍会触发同步异常。
+         * 在把异常现场完全定位前，默认先走 worker 轮询，优先保证
+         * make run 下 shell / TTY / UI 能持续工作，不被鼠标或键盘事件打崩。
+         */
+        printk("[input\tinit]: %s irq=%u discovered, polling fallback enabled\n",
+               st->name, st->irq);
+    }
+    else
+    {
+        printk("[input\tinit]: %s irq unavailable, fallback worker polling\n", st->name);
+    }
     return 0;
 }
 
@@ -659,6 +764,7 @@ int virtio_input_init(void)
     int ret;
 
     memset((int8_t *)virtio_input_state, 0, sizeof(virtio_input_state));
+    virtio_input_irq_stable = false;
 
     used = 0;
     for (slot = 0; slot < VIRTIO_MMIO_COUNT; slot++)
@@ -708,4 +814,18 @@ void virtio_input_poll(void)
             virtio_input_poll_state(&virtio_input_state[i]);
         }
     }
+}
+
+uint32_t virtio_input_irq_count(void)
+{
+    uint32_t i;
+    uint32_t total;
+
+    total = 0;
+    for (i = 0; i < sizeof(virtio_input_state) / sizeof(virtio_input_state[0]); i++)
+    {
+        total += virtio_input_state[i].irq_count;
+    }
+
+    return total;
 }

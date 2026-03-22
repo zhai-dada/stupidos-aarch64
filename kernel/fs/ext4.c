@@ -4,6 +4,7 @@
 #include "errno.h"
 #include "lib/libmem.h"
 #include "lib/libstr.h"
+#include "mmu.h"
 #include "printk.h"
 
 /*
@@ -256,12 +257,26 @@ static int ext4_readdir(struct vfs_inode *dir, uint32_t index, struct vfs_dirent
 static ssize_t ext4_read(struct vfs_inode *inode, uint64_t offset, void *buf, size_t len);
 static ssize_t ext4_write(struct vfs_inode *inode, uint64_t offset, const void *buf, size_t len);
 
-static const struct vfs_inode_ops ext4_inode_ops = {
-    .lookup = ext4_lookup,
-    .readdir = ext4_readdir,
-    .read = ext4_read,
-    .write = ext4_write,
-};
+static struct vfs_inode_ops ext4_inode_ops;
+static bool ext4_inode_ops_ready;
+
+static void ext4_init_inode_ops(void)
+{
+    if (ext4_inode_ops_ready)
+    {
+        return;
+    }
+
+    /*
+     * 这里不能直接依赖静态初始化的函数指针。
+     * 内核切到 KIMAGE_VADDR 后，必须把回调修正到高地址映射。
+     */
+    ext4_inode_ops.lookup = ext4_lookup;
+    ext4_inode_ops.readdir = ext4_readdir;
+    ext4_inode_ops.read = ext4_read;
+    ext4_inode_ops.write = ext4_write;
+    ext4_inode_ops_ready = true;
+}
 
 static uint64_t ext4_inode_size(const struct ext4_inode_disk *inode)
 {
@@ -498,6 +513,7 @@ static int ext4_fill_vfs_inode(struct ext4_fs *fs, uint32_t ino, struct vfs_inod
     struct ext4_inode_disk raw_inode;
     int ret;
 
+    ext4_init_inode_ops();
     ret = ext4_read_inode_raw(fs, ino, &raw_inode);
     if (ret)
     {
@@ -826,6 +842,7 @@ int ext4_mount_root(void)
     struct vfs_inode root_inode;
     int ret;
 
+    ext4_init_inode_ops();
     ret = virtio_blk_init();
     if (ret)
     {

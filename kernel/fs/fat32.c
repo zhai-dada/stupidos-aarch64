@@ -4,6 +4,7 @@
 #include "errno.h"
 #include "lib/libmem.h"
 #include "lib/libstr.h"
+#include "mmu.h"
 #include "printk.h"
 
 #define GPT_SIGNATURE               "EFI PART"
@@ -124,12 +125,26 @@ static int fat32_readdir(struct vfs_inode *dir, uint32_t index, struct vfs_diren
 static ssize_t fat32_read(struct vfs_inode *inode, uint64_t offset, void *buf, size_t len);
 static ssize_t fat32_write(struct vfs_inode *inode, uint64_t offset, const void *buf, size_t len);
 
-static const struct vfs_inode_ops fat32_inode_ops = {
-    .lookup = fat32_lookup,
-    .readdir = fat32_readdir,
-    .read = fat32_read,
-    .write = fat32_write,
-};
+static struct vfs_inode_ops fat32_inode_ops;
+static bool fat32_inode_ops_ready;
+
+static void fat32_init_inode_ops(void)
+{
+    if (fat32_inode_ops_ready)
+    {
+        return;
+    }
+
+    /*
+     * 文件系统回调在切到高地址内核后必须重绑定。
+     * 否则静态初始化里留下的低地址函数指针会跳到未映射区域。
+     */
+    fat32_inode_ops.lookup = fat32_lookup;
+    fat32_inode_ops.readdir = fat32_readdir;
+    fat32_inode_ops.read = fat32_read;
+    fat32_inode_ops.write = fat32_write;
+    fat32_inode_ops_ready = true;
+}
 
 static inline int fat32_ascii_tolower(int ch)
 {
@@ -310,6 +325,7 @@ static bool fat32_short_name_match(const uint8_t raw_name[11], const int8_t *nam
 
 static void fat32_fill_root_inode(struct fat32_fs *fs, struct vfs_inode *out)
 {
+    fat32_init_inode_ops();
     memset((int8_t *)out, 0, sizeof(*out));
     out->sb = &fs->sb;
     out->ops = &fat32_inode_ops;
@@ -329,6 +345,7 @@ static void fat32_fill_inode(struct fat32_fs *fs, const struct fat32_dirent *de,
 {
     uint32_t first_cluster;
 
+    fat32_init_inode_ops();
     memset((int8_t *)out, 0, sizeof(*out));
     first_cluster = fat32_dirent_first_cluster(de);
 

@@ -1,6 +1,8 @@
 #include "shell.h"
 
 #include "errno.h"
+#include "driver/virtio_input.h"
+#include "driver/virtio_net.h"
 #include "tty.h"
 #include "fs/vfs.h"
 #include "lib/libmem.h"
@@ -11,6 +13,7 @@
 #include "printk.h"
 #include "sched.h"
 #include "smp.h"
+#include "softirq.h"
 #include "timer.h"
 
 #define SHELL_LINE_MAX 256
@@ -202,9 +205,12 @@ static void shell_write(const int8_t *path, const char *text)
 
 static void shell_info(void)
 {
-    printk("[shell\t]: jiffies=%lx cpus=%u online=%u current=%d\n",
+    printk("[shell\t]: jiffies=%lx cpus=%u online=%u current=%d softirq=%#x netirq=%u inputirq=%u\n",
            jiffies, smp_cpu_count(), smp_online_count(),
-           task_current() ? task_current()->pid : -1);
+           task_current() ? task_current()->pid : -1,
+           softirq_pending_mask(smp_cpu_id()),
+           virtio_net_irq_count(),
+           virtio_input_irq_count());
 }
 
 static void shell_mem(void)

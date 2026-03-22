@@ -18,6 +18,7 @@ struct sched_state
 static struct sched_state sched_state;
 
 static void copy_task_name(int8_t *dst, const int8_t *src);
+static void init_boot_task(struct task_struct *task, uint32_t cpu);
 static void init_idle_task(struct task_struct *idle, uint32_t cpu)
 {
     memset((int8_t *)idle, 0, sizeof(*idle));
@@ -27,6 +28,17 @@ static void init_idle_task(struct task_struct *idle, uint32_t cpu)
     idle->state = TASK_RUNNING;
     idle->weight = 1024;
     copy_task_name(idle->comm, (const int8_t *)"idle");
+}
+
+static void init_boot_task(struct task_struct *task, uint32_t cpu)
+{
+    memset((int8_t *)task, 0, sizeof(*task));
+    task->pid = 0;
+    task->cpu = cpu;
+    task->is_idle = false;
+    task->state = TASK_RUNNING;
+    task->weight = 1024;
+    copy_task_name(task->comm, (const int8_t *)"boot");
 }
 
 static void copy_task_name(int8_t *dst, const int8_t *src)
@@ -149,13 +161,11 @@ static const int8_t *task_state_name(enum task_state state)
 static struct task_struct *pick_next_task(struct rq *rq, struct task_struct *prev)
 {
     struct task_struct *best;
-    struct task_struct *idle;
     uint32_t cpu;
     int32_t i;
 
     cpu = smp_cpu_id();
     best = 0;
-    idle = 0;
 
     for (i = 0; i < CONFIG_MAX_TASKS; i++)
     {
@@ -163,12 +173,6 @@ static struct task_struct *pick_next_task(struct rq *rq, struct task_struct *pre
 
         if (!task_is_runnable_on_cpu(task, cpu))
         {
-            continue;
-        }
-
-        if (task->is_idle)
-        {
-            idle = task;
             continue;
         }
 
@@ -184,12 +188,12 @@ static struct task_struct *pick_next_task(struct rq *rq, struct task_struct *pre
         return best;
     }
 
-    if (idle)
-    {
-        return idle;
-    }
-
-    return prev;
+    /*
+     * tasks[] 里只放普通任务，per-cpu idle 任务单独存放。
+     * 如果当前 CPU 上暂时没有任何 runnable 普通任务，就明确回退到
+     * 本 CPU 的 idle task，而不是把“上一个任务”硬留在 rq->curr。
+     */
+    return &sched_state.idle[cpu];
 }
 
 static void sched_prepare_yield(struct rq *rq)
@@ -271,11 +275,14 @@ struct task_struct *task_current(void)
 
 void sched_init(void)
 {
+    struct task_struct *boot_task;
     struct rq *rq;
     uint32_t cpu;
+    uint32_t boot_cpu;
 
     memset((int8_t *)&sched_state, 0, sizeof(sched_state));
     spin_lock_init(&sched_state.lock);
+    boot_cpu = smp_cpu_id();
 
     for (cpu = 0; cpu < CONFIG_MAX_CPUS; cpu++)
     {
@@ -285,16 +292,27 @@ void sched_init(void)
         sched_state.rq[cpu].need_resched = false;
         init_idle_task(&sched_state.idle[cpu], cpu);
         sched_state.rq[cpu].curr = &sched_state.idle[cpu];
-        sched_state.rq[cpu].nr_running = 1;
     }
 
+    /*
+     * 这里必须把当前正在执行 kernel_main_high() 的启动线程显式接管成
+     * 一个真实 task_struct。
+     *
+     * 否则第一次 sched_yield() 会把当前 CPU 上下文保存进 idle task，
+     * 而 idle task 又不在普通可调度任务集合里，boot 线程就再也回不来了，
+     * 后续文件系统 / PCI / 网络 / UI 初始化会永远停在 yield 之前。
+     */
+    boot_task = &sched_state.tasks[0];
+    init_boot_task(boot_task, boot_cpu);
+
     rq = this_rq();
-    rq->curr = &sched_state.idle[smp_cpu_id()];
+    rq->curr = boot_task;
     rq->nr_running = 1;
     rq->min_vruntime = 0;
     sched_state.next_pid = 1;
 
-    printk("[sched\tinit]: scheduler ready, boot cpu=%u\n", smp_cpu_id());
+    printk("[sched\tinit]: scheduler ready, boot cpu=%u boot-task=pid%d\n",
+           boot_cpu, boot_task->pid);
 }
 
 void sched_init_secondary(uint32_t cpu_id)
@@ -302,7 +320,7 @@ void sched_init_secondary(uint32_t cpu_id)
     init_idle_task(&sched_state.idle[cpu_id], cpu_id);
     sched_state.rq[cpu_id].curr = &sched_state.idle[cpu_id];
     sched_state.rq[cpu_id].min_vruntime = 0;
-    sched_state.rq[cpu_id].nr_running = 1;
+    sched_state.rq[cpu_id].nr_running = 0;
     sched_state.rq[cpu_id].need_resched = false;
 }
 
