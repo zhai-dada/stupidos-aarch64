@@ -1,7 +1,21 @@
 #ifndef __STUPIDOS_USER_H__
 #define __STUPIDOS_USER_H__
 
-#include "asm/types.h"
+#include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <sys/types.h>
+
+/*
+ * 用户态公共头：
+ * 这里尽量只保留“系统调用号、ABI 结构体、内核常量”。
+ * 标准整数类型、size_t、pid_t、ssize_t 等交给工具链/系统头提供，
+ * 这样 CPython 这类大型用户态工程才不会被我们自己的 typedef 污染。
+ */
+
+#ifndef NULL
+#define NULL                ((void *)0)
+#endif
 
 #define SYS_READ        0
 #define SYS_WRITE       1

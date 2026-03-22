@@ -44,7 +44,7 @@ CFLAGS          :=  -g -Wall -fno-builtin -Iinclude -O0 -march=armv8-a+nofp
 ASFLAGS         :=  -g -Iinclude
 LDFLAGS         :=  -nostdlib
 DEPFLAGS        :=  -MMD -MP
-USER_CFLAGS     :=  -g -Wall -fno-builtin -ffreestanding -fno-stack-protector -Iinclude -I$(USER_INC_DIR) -O0 -march=armv8-a+nofp
+USER_CFLAGS     :=  -g -Wall -fno-builtin -ffreestanding -fno-stack-protector -I$(USER_INC_DIR) -Iinclude -O0 -march=armv8-a+nofp
 USER_ASFLAGS    :=  -g -Iinclude -I$(USER_INC_DIR)
 
 # Linker script

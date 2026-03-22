@@ -1,0 +1,17 @@
+# CPython cross-build cache for stupidos-aarch64.
+# 这份配置文件的目标是让 CPython 的 configure 在交叉编译时
+# 直接跳过那些“必须在目标机上运行才能探测”的点。
+
+ac_cv_file__dev_ptmx=no
+ac_cv_file__dev_ptc=no
+ac_cv_header_stddef_h=yes
+ac_cv_header_fcntl_h=yes
+ac_cv_header_signal_h=yes
+ac_cv_header_sys_wait_h=yes
+ac_cv_header_wchar_h=yes
+ac_cv_header_pthread_h=yes
+ac_cv_pthread_is_default=no
+ac_cv_pthread=yes
+ac_cv_func_fork=yes
+ac_cv_func_clock_gettime=yes
+ac_cv_sizeof_wchar_t=4
