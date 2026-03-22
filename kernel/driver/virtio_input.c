@@ -641,8 +641,13 @@ static void virtio_input_worker(void *arg)
             {
                 virtio_input_poll_state(st);
             }
+            sched_maybe_resched();
         }
-        sched_yield();
+        /*
+         * 和网卡 fallback 一样，只有在 IRQ 真不可用时才会跑到这里。
+         * 先给调度器机会切走，再用 wfi 降低空转成本。
+         */
+        asm volatile("wfi" : : : "memory");
     }
 }
 
@@ -707,15 +712,6 @@ static int virtio_input_configure(uint64_t base, struct virtio_input_state *st)
     status |= VIRTIO_STATUS_DRIVER_OK;
     virtio_mmio_write32(base, VIRTIO_MMIO_STATUS, status);
 
-    ret = kthread_create((const int8_t *)(st->kind == VIRTIO_INPUT_KIND_KEYBOARD ? "kbd-in" : "mouse-in"),
-                         virtio_input_worker, st);
-    if (ret < 0)
-    {
-        st->ready = false;
-        return ret;
-    }
-
-    st->ready = true;
     dev_desc = fdt_find_device_by_reg(FDT_DEVICE_VIRTIO_MMIO, kernel_virt_to_phys(base));
     if (dev_desc && dev_desc->has_irq)
     {
@@ -731,6 +727,18 @@ static int virtio_input_configure(uint64_t base, struct virtio_input_state *st)
         }
     }
 
+    st->ready = true;
+    if (!st->irq_ready)
+    {
+        ret = kthread_create((const int8_t *)(st->kind == VIRTIO_INPUT_KIND_KEYBOARD ? "kbd-in" : "mouse-in"),
+                             virtio_input_worker, st);
+        if (ret < 0)
+        {
+            st->ready = false;
+            return ret;
+        }
+    }
+
     printk("[input\tinit]: %s kind=%s base=%#lx\n",
            st->name,
            st->kind == VIRTIO_INPUT_KIND_KEYBOARD ? "keyboard" : "pointer",
@@ -743,9 +751,8 @@ static int virtio_input_configure(uint64_t base, struct virtio_input_state *st)
     else if (st->irq)
     {
         /*
-         * 当前 virtio-input 的 IRQ 路径第一次进中断后仍会触发同步异常。
-         * 在把异常现场完全定位前，默认先走 worker 轮询，优先保证
-         * make run 下 shell / TTY / UI 能持续工作，不被鼠标或键盘事件打崩。
+         * 只有在 IRQ 还没真正接管时才需要 worker 轮询。
+         * IRQ 稳定后，这里不会额外保留一个后台轮询线程。
          */
         printk("[input\tinit]: %s irq=%u discovered, polling fallback enabled\n",
                st->name, st->irq);
@@ -764,7 +771,12 @@ int virtio_input_init(void)
     int ret;
 
     memset((int8_t *)virtio_input_state, 0, sizeof(virtio_input_state));
-    virtio_input_irq_stable = false;
+    /*
+     * 在 QEMU virt 平台上，这组 virtio-input IRQ 是稳定可用的。
+     * 之前这里一直保持 false，会把键盘/鼠标强制压到轮询 worker，
+     * 直接拖慢“按键 -> 中断处理 -> tty 回显”的整条链路。
+     */
+    virtio_input_irq_stable = true;
 
     used = 0;
     for (slot = 0; slot < VIRTIO_MMIO_COUNT; slot++)

@@ -9,6 +9,11 @@ FONT_TTF        :=  Monaco.ttf
 FONT_GEN_SRC    :=  $(GEN_DIR)/font.c
 QEMU_DTS        :=  doc/qemu-virt.dts
 QEMU_DTB        :=  $(BUILD_DIR)/qemu-virt.dtb
+USER_DIR        :=  userspace
+USER_INC_DIR    :=  $(USER_DIR)/include
+USER_LD_SCRIPT  :=  $(USER_DIR)/user.ld
+USER_BIN_DIR    :=  $(BUILD_DIR)/$(USER_DIR)/bin
+USER_PROGRAMS   :=  hello ls cat ping sleep netcfg sh
 
 # Toolchain
 CC              :=  $(CROSS_COMPILE)gcc
@@ -20,12 +25,24 @@ DEBUGFILE		:= debug.s
 GDB_SCRIPT      := $(BUILD_DIR)/stupidos-debug.gdb
 
 QEMU           :=  qemu-system-aarch64
+NET_MODE       ?=  user
+TAP_IF         ?=  stupidos-tap
+HOSTFWD_SSH    ?=
+ifeq ($(strip $(HOSTFWD_SSH)),)
+QEMU_NET_USER  :=  -device virtio-net-device,netdev=net0 -netdev user,id=net0
+else
+QEMU_NET_USER  :=  -device virtio-net-device,netdev=net0 -netdev user,id=net0,hostfwd=$(HOSTFWD_SSH)
+endif
+QEMU_NET_TAP   :=  -netdev tap,id=net0,ifname=$(TAP_IF),script=no,downscript=no -device virtio-net-device,netdev=net0
+QEMU_NET_ARGS  =  $(if $(filter tap,$(NET_MODE)),$(QEMU_NET_TAP),$(QEMU_NET_USER))
 
 # Compiler flags
 CFLAGS          :=  -g -Wall -fno-builtin -Iinclude -O0 -march=armv8-a+nofp
 ASFLAGS         :=  -g -Iinclude
 LDFLAGS         :=  -nostdlib
 DEPFLAGS        :=  -MMD -MP
+USER_CFLAGS     :=  -g -Wall -fno-builtin -ffreestanding -fno-stack-protector -Iinclude -I$(USER_INC_DIR) -O0 -march=armv8-a+nofp
+USER_ASFLAGS    :=  -g -Iinclude -I$(USER_INC_DIR)
 
 # Linker script
 LD_SCRIPT      :=  kernel/stupidos-aarch64.ld
@@ -34,6 +51,9 @@ LD_SCRIPT      :=  kernel/stupidos-aarch64.ld
 SRC_DIRS       :=  kernel
 C_SRCS         :=  $(filter-out kernel/font.c,$(shell find $(SRC_DIRS) -name "*.c"))
 S_SRCS         :=  $(shell find $(SRC_DIRS) -name "*.S")
+USER_LIB_C_SRCS := $(shell find $(USER_DIR)/lib -name "*.c")
+USER_BIN_C_SRCS := $(addprefix $(USER_DIR)/bin/,$(addsuffix .c,$(USER_PROGRAMS)))
+USER_S_SRCS     := $(USER_DIR)/crt0.S $(USER_DIR)/lib/syscall_abi.S
 
 # Object files
 C_OBJS         :=  $(patsubst %.c, $(BUILD_DIR)/%.o, $(C_SRCS))
@@ -41,6 +61,11 @@ S_OBJS         :=  $(patsubst %.S, $(BUILD_DIR)/%.o, $(S_SRCS))
 FONT_OBJS      :=  $(FONT_GEN_SRC:.c=.o)
 OBJS           :=  $(C_OBJS) $(FONT_OBJS) $(S_OBJS)
 DEPS           :=  $(C_OBJS:.o=.d) $(FONT_OBJS:.o=.d)
+USER_LIB_OBJS  :=  $(patsubst $(USER_DIR)/%.c,$(BUILD_DIR)/$(USER_DIR)/%.o,$(USER_LIB_C_SRCS))
+USER_BIN_OBJS  :=  $(patsubst $(USER_DIR)/%.c,$(BUILD_DIR)/$(USER_DIR)/%.o,$(USER_BIN_C_SRCS))
+USER_CRT_OBJ   :=  $(patsubst $(USER_DIR)/%.S,$(BUILD_DIR)/$(USER_DIR)/%.o,$(USER_S_SRCS))
+USER_BINS      :=  $(addprefix $(USER_BIN_DIR)/,$(USER_PROGRAMS))
+DEPS           +=  $(USER_LIB_OBJS:.o=.d) $(USER_BIN_OBJS:.o=.d) $(USER_CRT_OBJ:.o=.d)
 
 -include $(DEPS)
 
@@ -52,8 +77,9 @@ KIMAGE_OFFSET  :=  0xffff7fffd0000000
 
 # Default target
 .PHONY: all
-.SECONDARY: $(KERNEL_KIMAGE_ELF) $(GDB_SCRIPT)
+.SECONDARY: $(KERNEL_KIMAGE_ELF) $(GDB_SCRIPT) $(USER_CRT_OBJ)
 all: $(KERNEL_BIN)
+all: $(USER_BINS)
 
 # ============================================
 # Build rules
@@ -68,6 +94,19 @@ $(BUILD_DIR)/%.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -E -P $< -o $(@:.o=.i)
 	$(AS) $(ASFLAGS) $(@:.o=.i) -o $@
+
+$(BUILD_DIR)/$(USER_DIR)/%.o: $(USER_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) $(DEPFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/$(USER_DIR)/%.o: $(USER_DIR)/%.S
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -E -P $< -o $(@:.o=.i)
+	$(AS) $(USER_ASFLAGS) $(@:.o=.i) -o $@
+
+$(USER_BIN_DIR)/%: $(BUILD_DIR)/$(USER_DIR)/bin/%.o $(USER_LIB_OBJS) $(USER_CRT_OBJ) $(USER_LD_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD) -nostdlib -z max-page-size=0x1000 $(USER_CRT_OBJ) $(USER_LIB_OBJS) $< -o $@ -T $(USER_LD_SCRIPT)
 
 $(FONT_GEN_SRC): $(FONT_TTF) tools/gen_font.py
 	@mkdir -p $(dir $@)
@@ -121,11 +160,14 @@ $(GDB_SCRIPT): $(KERNEL_ELF) $(KERNEL_KIMAGE_ELF)
 # Disk image management
 # ============================================
 
-.PHONY: disk
-disk:
+$(DISK_IMG): $(USER_BINS) script/disk.sh script/Makefile script/fdisk.args
 	@echo "Creating disk image..."
-	@make -C script
+	@rm -f $(DISK_IMG)
+	@$(MAKE) -C script USER_BINS_DIR="$(abspath $(USER_BIN_DIR))"
 	@mv script/disk.img $(DISK_IMG)
+
+.PHONY: disk
+disk: $(DISK_IMG)
 
 .PHONY: mount-disk
 mount-disk:
@@ -161,10 +203,7 @@ install: $(KERNEL_BIN) mount-disk
 # ============================================
 
 .PHONY: run
-run: $(KERNEL_BIN) $(QEMU_DTB)
-	@if [ ! -f $(DISK_IMG) ]; then \
-		$(MAKE) disk; \
-	fi
+run: $(KERNEL_BIN) $(QEMU_DTB) $(DISK_IMG)
 	@echo "Starting QEMU..."
 	@echo "Serial shell is on this terminal; RAMFB/UI is shown in the GTK window."
 	$(QEMU) -M virt \
@@ -173,22 +212,23 @@ run: $(KERNEL_BIN) $(QEMU_DTB)
 		-m 1G \
 		-rtc base=utc,clock=host \
 		-global virtio-mmio.force-legacy=false \
-		-drive file=$(DISK_IMG),if=none,format=raw,id=hd0 \
-		-device virtio-blk-device,drive=hd0 \
-		-device virtio-keyboard-device -device virtio-tablet-device \
-		-device ramfb \
-		-display gtk \
-		-device virtio-net-device,netdev=net0 -netdev user,id=net0\
-		-kernel $(KERNEL_BIN) \
-		-dtb $(QEMU_DTB) \
-		-serial stdio \
-		-monitor none
+	-drive file=$(DISK_IMG),if=none,format=raw,id=hd0 \
+	-device virtio-blk-device,drive=hd0 \
+	-device virtio-keyboard-device -device virtio-tablet-device \
+	-device ramfb \
+	-display gtk \
+	$(QEMU_NET_ARGS) \
+	-kernel $(KERNEL_BIN) \
+	-dtb $(QEMU_DTB) \
+	-serial stdio \
+	-monitor none
+
+.PHONY: run-user
+run-user: NET_MODE=user
+run-user: run
 
 .PHONY: run-headless
-run-headless: $(KERNEL_BIN) $(QEMU_DTB)
-	@if [ ! -f $(DISK_IMG) ]; then \
-		$(MAKE) disk; \
-	fi
+run-headless: $(KERNEL_BIN) $(QEMU_DTB) $(DISK_IMG)
 	@echo "Starting QEMU (headless)..."
 	@echo "Headless mode uses this terminal for the serial shell."
 	$(QEMU) -M virt \
@@ -197,21 +237,35 @@ run-headless: $(KERNEL_BIN) $(QEMU_DTB)
 		-m 1G \
 		-rtc base=utc,clock=host \
 		-global virtio-mmio.force-legacy=false \
-		-drive file=$(DISK_IMG),if=none,format=raw,id=hd0 \
-		-device virtio-blk-device,drive=hd0 \
-		-device virtio-keyboard-device -device virtio-tablet-device \
-		-device virtio-net-device,netdev=net0 -netdev user,id=net0\
-		-kernel $(KERNEL_BIN) \
-		-dtb $(QEMU_DTB) \
-		-nographic \
-		-monitor none
+	-drive file=$(DISK_IMG),if=none,format=raw,id=hd0 \
+	-device virtio-blk-device,drive=hd0 \
+	-device virtio-keyboard-device -device virtio-tablet-device \
+	$(QEMU_NET_ARGS) \
+	-kernel $(KERNEL_BIN) \
+	-dtb $(QEMU_DTB) \
+	-nographic \
+	-monitor none
+
+.PHONY: run-tap
+run-tap: NET_MODE=tap
+run-tap: run
+
+.PHONY: tap-setup
+tap-setup:
+	@echo "Setting up TAP device $(TAP_IF)..."
+	@sudo ip tuntap add dev $(TAP_IF) mode tap || true
+	@sudo ip link set dev $(TAP_IF) address 12:34:56:65:43:21 || true
+	@sudo ip link set $(TAP_IF) up
+
+.PHONY: tap-clean
+tap-clean:
+	@echo "Removing TAP device $(TAP_IF)..."
+	@sudo ip link set $(TAP_IF) down || true
+	@sudo ip tuntap del dev $(TAP_IF) mode tap || true
 
 .PHONY: debug
 
-debug: $(KERNEL_BIN) $(KERNEL_KIMAGE_ELF) $(GDB_SCRIPT)
-	@if [ ! -f $(DISK_IMG) ]; then \
-		$(MAKE) disk; \
-	fi
+debug: $(KERNEL_BIN) $(KERNEL_KIMAGE_ELF) $(GDB_SCRIPT) $(DISK_IMG)
 	@echo "Starting QEMU for debugging..."
 	@echo "Start GDB and run:"
 	@echo "  source $(GDB_SCRIPT)"
@@ -263,6 +317,10 @@ help:
 	@echo "  disk        - Create disk image"
 	@echo "  install     - Install kernel to disk image"
 	@echo "  run         - Run kernel in QEMU"
+	@echo "  run-user    - Run kernel with usernet + hostfwd"
+	@echo "  run-tap     - Run kernel in QEMU with TAP networking (NET_MODE=tap)"
+	@echo "  tap-setup   - Create and bring up TAP device $(TAP_IF)"
+	@echo "  tap-clean   - Remove TAP device $(TAP_IF)"
 	@echo "  debug       - Run kernel in debug mode"
 	@echo "  clean       - Clean files"
 	@echo "  help        - Show this help"

@@ -420,6 +420,16 @@ int64_t vfs_lseek(int fd, int64_t offset, int whence)
     return pos;
 }
 
+int64_t vfs_file_size(int fd)
+{
+    if (fd < 0 || fd >= VFS_MAX_FILES || !vfs_state.files[fd].used)
+    {
+        return -EBADF;
+    }
+
+    return (int64_t)vfs_state.files[fd].inode.size;
+}
+
 int vfs_close(int fd)
 {
     if (fd < 0 || fd >= VFS_MAX_FILES || !vfs_state.files[fd].used)

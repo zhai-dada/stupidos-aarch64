@@ -425,8 +425,16 @@ static int build_swapper_map(void)
                          (uint64_t)&swapper_pmd, SWAPPER_PMD_TABLES,
                          (uint64_t)&swapper_pt, SWAPPER_PTE_TABLES);
 
+    /*
+     * 第一阶段 ELF 可执行文件先直接运行在内核共享地址空间里。
+     * 为了让从 buddy allocator 分配出来、再通过 linear map 访问的代码页
+     * 能被 EL1 取指，这里先把 linear map 设为 privileged executable。
+     *
+     * 后续演进到真正的 EL0/独立地址空间后，这里会收紧回 XN，再给用户进程
+     * 单独建立受控的代码映射。
+     */
     if (map_range_pmd_block((pgd_t *)&swapper_pgd, &swapper_pool,
-                            PAGE_OFFSET, PHYS_OFFSET, mmu_boot_memory_size(), PMD_KERNEL))
+                            PAGE_OFFSET, PHYS_OFFSET, mmu_boot_memory_size(), PMD_KERNEL_EXEC))
     {
         return -1;
     }

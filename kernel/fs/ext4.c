@@ -606,23 +606,6 @@ static bool ext4_dirent_is_skip(const struct ext4_dir_entry_2 *de)
     return false;
 }
 
-static int ext4_copy_dirent_name(struct vfs_dirent *out, const struct ext4_dir_entry_2 *de)
-{
-    size_t i;
-
-    if (de->name_len > VFS_NAME_MAX)
-    {
-        return -ENAMETOOLONG;
-    }
-
-    for (i = 0; i < de->name_len; i++)
-    {
-        out->name[i] = (int8_t)de->name[i];
-    }
-    out->name[de->name_len] = '\0';
-    return 0;
-}
-
 static int ext4_readdir(struct vfs_inode *dir, uint32_t index, struct vfs_dirent *out)
 {
     struct ext4_fs *fs;
@@ -661,12 +644,30 @@ static int ext4_readdir(struct vfs_inode *dir, uint32_t index, struct vfs_dirent
         while (off < fs->block_size)
         {
             struct ext4_dir_entry_2 *de = (struct ext4_dir_entry_2 *)(ext4_block_buf_a + off);
-            struct vfs_inode child;
             int ret;
 
             if (de->rec_len == 0)
             {
                 break;
+            }
+
+            if (index == 0)
+            {
+                int8_t dbg_name[VFS_NAME_MAX + 1];
+                size_t dbg_i;
+                size_t dbg_len;
+
+                memset(dbg_name, 0, sizeof(dbg_name));
+                dbg_len = de->name_len;
+                if (dbg_len > VFS_NAME_MAX)
+                {
+                    dbg_len = VFS_NAME_MAX;
+                }
+                for (dbg_i = 0; dbg_i < dbg_len; dbg_i++)
+                {
+                    dbg_name[dbg_i] = (int8_t)de->name[dbg_i];
+                }
+                dbg_name[dbg_len] = '\0';
             }
 
             if (ext4_dirent_is_skip(de))
@@ -677,6 +678,27 @@ static int ext4_readdir(struct vfs_inode *dir, uint32_t index, struct vfs_dirent
 
             if (seen == index)
             {
+                /*
+                 * 这里必须先把目录项名字拷贝到栈上。
+                 * ext4_fill_vfs_inode() 会继续读 inode/block 元数据，
+                 * 可能复用 ext4_block_buf_a，直接使用 de->name 会被覆盖。
+                 */
+                int8_t name[VFS_NAME_MAX + 1];
+                size_t name_len;
+                struct vfs_inode child;
+
+                name_len = de->name_len;
+                if (name_len > VFS_NAME_MAX)
+                {
+                    return -ENAMETOOLONG;
+                }
+
+                for (size_t i = 0; i < name_len; i++)
+                {
+                    name[i] = (int8_t)de->name[i];
+                }
+                name[name_len] = '\0';
+
                 ret = ext4_fill_vfs_inode(fs, de->inode, &child);
                 if (ret)
                 {
@@ -686,11 +708,7 @@ static int ext4_readdir(struct vfs_inode *dir, uint32_t index, struct vfs_dirent
                 out->ino = child.ino;
                 out->mode = child.mode;
                 out->size = child.size;
-                ret = ext4_copy_dirent_name(out, de);
-                if (ret)
-                {
-                    return ret;
-                }
+                memcpy(out->name, name, name_len + 1);
                 return 0;
             }
 

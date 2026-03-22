@@ -19,6 +19,7 @@ static struct page_block page_map[TOTAL_MEMORY / PAGE_SIZE];
 static int32_t free_area[PAGE_ALLOC_MAX_ORDER + 1];
 static uint32_t free_pages_count;
 static uint64_t alloc_base_phys;
+static bool page_alloc_ready;
 
 static inline uint32_t page_count(void)
 {
@@ -184,6 +185,7 @@ void page_alloc_init(void)
     }
 
     free_pages_count = 0;
+    page_alloc_ready = false;
 
     kernel_end_phys = kernel_virt_to_phys((uint64_t)&__kernel_end);
     free_start = PAGE_ALIGN_UP(kernel_end_phys);
@@ -222,6 +224,7 @@ void page_alloc_init(void)
         phys += block;
     }
 
+    page_alloc_ready = true;
     printk("[page_alloc\tinit]: buddy ready, free=%u pages\n", free_pages_count);
 }
 
@@ -288,4 +291,9 @@ uint32_t page_alloc_free_pages(void)
 uint32_t page_alloc_total_pages(void)
 {
     return page_count();
+}
+
+bool page_alloc_is_ready(void)
+{
+    return page_alloc_ready;
 }

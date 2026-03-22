@@ -31,9 +31,11 @@ struct net_device
 void net_init(void);
 int net_register_device(struct net_device *dev);
 struct net_device *net_default_device(void);
+int net_set_default_config(uint32_t ipv4, uint32_t netmask, uint32_t gateway);
 int net_show_status(void);
 int net_selftest(void);
 int net_arp_resolve(struct net_device *dev, uint32_t target_ip, uint8_t out_mac[6]);
+int64_t net_ping(struct net_device *dev, uint32_t target_ip, uint16_t icmp_id, uint16_t icmp_seq, uint32_t timeout_ms);
 void net_receive(struct net_device *dev, const void *frame, size_t len);
 ssize_t net_send_frame(struct net_device *dev, const uint8_t dst_mac[6], uint16_t ethertype,
                        const void *payload, size_t len);

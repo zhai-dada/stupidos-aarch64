@@ -124,16 +124,17 @@ struct virtio_net_state
     struct virtq_used rx_used __attribute__((aligned(4096)));
     struct virtio_net_frame rx_buf[VIRTIO_NET_QUEUE_SIZE] __attribute__((aligned(4096)));
     uint16_t rx_last_used;
+    uint32_t rx_packet_seen;
     struct virtq_desc tx_desc __attribute__((aligned(4096)));
     struct virtq_avail tx_avail __attribute__((aligned(4096)));
     struct virtq_used tx_used __attribute__((aligned(4096)));
     struct virtio_net_frame tx_buf __attribute__((aligned(4096)));
     uint16_t tx_last_used;
+    uint32_t tx_packet_seen;
     spinlock_t tx_lock;
 };
 
 static struct virtio_net_state virtio_net_state;
-static bool virtio_net_irq_stable;
 
 static void virtio_net_irq_handle(void);
 
@@ -267,13 +268,13 @@ static void virtio_net_queue_rx(struct virtio_net_state *st, uint32_t slot)
                          sizeof(st->rx_avail.ring[0]));
     st->rx_avail.idx++;
     dma_sync_clean_range((uint64_t)&st->rx_avail, sizeof(st->rx_avail));
+    virtio_mmio_write32(st->mmio_base, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_QUEUE_RX);
 }
 
 static ssize_t virtio_net_tx(struct net_device *dev, const void *buf, size_t len)
 {
     struct virtio_net_state *st;
     uint16_t used_idx;
-    uint32_t spins;
 
     if (!dev || !buf || !len)
     {
@@ -292,7 +293,6 @@ static ssize_t virtio_net_tx(struct net_device *dev, const void *buf, size_t len
     }
 
     spin_lock(&st->tx_lock);
-    printk("[virtio-net\ttx ]: submit len=%lu\n", (uint64_t)len);
 
     memset((int8_t *)&st->tx_buf, 0, sizeof(st->tx_buf));
     st->tx_buf.hdr.flags = 0;
@@ -317,25 +317,28 @@ static ssize_t virtio_net_tx(struct net_device *dev, const void *buf, size_t len
     dma_sync_clean_range((uint64_t)&st->tx_avail, sizeof(st->tx_avail));
 
     dsb(sy);
+    if (!st->tx_packet_seen)
+    {
+        st->tx_packet_seen = 1;
+        printk("[virtio-net\ttx ]: submit len=%lu used=%u\n",
+               (uint64_t)len, st->tx_last_used);
+    }
     virtio_mmio_write32(st->mmio_base, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_QUEUE_TX);
 
-    spins = 0;
-    while (st->tx_used.idx == used_idx)
+    /*
+     * 发送路径不再硬等 used ring 完成。
+     * 对 virtio-net 来说，TX 更适合做成“尽快提交后返回”，
+     * 这样不会因为后端回执慢把整个 ping / shell 卡住。
+     *
+     * 如果后端很快回写 used ring，下面顺手采一次；如果还没回来，
+     * 也不把这次发送当成失败。
+     */
+    dma_sync_invalidate_range((uint64_t)&st->tx_used, sizeof(st->tx_used));
+    if (st->tx_used.idx != used_idx)
     {
-        dma_sync_invalidate_range((uint64_t)&st->tx_used, sizeof(st->tx_used));
-        dsb(sy);
-        if (++spins == 1000000)
-        {
-            printk("[virtio-net\ttx ]: timeout used=%u last=%u\n",
-                   st->tx_used.idx, used_idx);
-            spin_unlock(&st->tx_lock);
-            return -ETIMEDOUT;
-        }
+        st->tx_last_used = st->tx_used.idx;
+        virtio_mmio_write32(st->mmio_base, VIRTIO_MMIO_INTERRUPT_ACK, 0x3);
     }
-
-    st->tx_last_used = st->tx_used.idx;
-    printk("[virtio-net\ttx ]: complete used=%u\n", st->tx_used.idx);
-    virtio_mmio_write32(st->mmio_base, VIRTIO_MMIO_INTERRUPT_ACK, 0x3);
     spin_unlock(&st->tx_lock);
 
     return (ssize_t)len;
@@ -360,9 +363,15 @@ static void virtio_net_poll_rx(struct virtio_net_state *st)
         packet_len = st->rx_used.ring[idx].len;
         dma_sync_invalidate_range((uint64_t)&st->rx_buf[slot], sizeof(st->rx_buf[slot]));
 
+        if (!st->rx_packet_seen)
+        {
+            st->rx_packet_seen = 1;
+            printk("[virtio-net\trx ]: used slot=%u len=%u rx_used=%u last=%u irq=%u\n",
+                   slot, packet_len, st->rx_used.idx, st->rx_last_used, st->irq_count);
+        }
+
         if (packet_len > sizeof(st->rx_buf[slot].hdr))
         {
-            printk("[virtio-net\trx ]: slot=%u len=%u\n", slot, packet_len);
             net_receive(&st->dev, st->rx_buf[slot].payload, packet_len - sizeof(st->rx_buf[slot].hdr));
         }
 
@@ -415,12 +424,15 @@ static void virtio_net_worker(void *arg)
     {
         if (st->ready)
         {
-            if (!st->irq_ready)
-            {
-                virtio_net_poll_rx(st);
-            }
+            /*
+             * 兜底轮询始终保留：
+             * - IRQ 正常时，tasklet 会更快地把包交给协议栈
+             * - IRQ 不稳定或漏中断时，这里仍会在 timer 唤醒后补扫 used ring
+             */
+            virtio_net_poll_rx(st);
+            sched_maybe_resched();
         }
-        sched_yield();
+        asm volatile("wfi" : : : "memory");
     }
 }
 
@@ -443,7 +455,6 @@ int virtio_net_init(void)
     int ret;
 
     memset((int8_t *)&virtio_net_state, 0, sizeof(virtio_net_state));
-    virtio_net_irq_stable = false;
     spin_lock_init(&virtio_net_state.tx_lock);
 
     base = 0;
@@ -496,6 +507,9 @@ int virtio_net_init(void)
     }
 
     virtio_mmio_write32(base, VIRTIO_MMIO_QUEUE_NUM, VIRTIO_NET_QUEUE_SIZE);
+    memset((int8_t *)virtio_net_state.rx_desc, 0, sizeof(virtio_net_state.rx_desc));
+    memset((int8_t *)&virtio_net_state.rx_avail, 0, sizeof(virtio_net_state.rx_avail));
+    memset((int8_t *)&virtio_net_state.rx_used, 0, sizeof(virtio_net_state.rx_used));
     virtio_mmio_write64(base, VIRTIO_MMIO_QUEUE_DESC_LOW, kernel_virt_to_phys((uint64_t)virtio_net_state.rx_desc));
     virtio_mmio_write64(base, VIRTIO_MMIO_QUEUE_AVAIL_LOW, kernel_virt_to_phys((uint64_t)&virtio_net_state.rx_avail));
     virtio_mmio_write64(base, VIRTIO_MMIO_QUEUE_USED_LOW, kernel_virt_to_phys((uint64_t)&virtio_net_state.rx_used));
@@ -510,6 +524,9 @@ int virtio_net_init(void)
     }
 
     virtio_mmio_write32(base, VIRTIO_MMIO_QUEUE_NUM, 1);
+    memset((int8_t *)&virtio_net_state.tx_desc, 0, sizeof(virtio_net_state.tx_desc));
+    memset((int8_t *)&virtio_net_state.tx_avail, 0, sizeof(virtio_net_state.tx_avail));
+    memset((int8_t *)&virtio_net_state.tx_used, 0, sizeof(virtio_net_state.tx_used));
     virtio_mmio_write64(base, VIRTIO_MMIO_QUEUE_DESC_LOW, kernel_virt_to_phys((uint64_t)&virtio_net_state.tx_desc));
     virtio_mmio_write64(base, VIRTIO_MMIO_QUEUE_AVAIL_LOW, kernel_virt_to_phys((uint64_t)&virtio_net_state.tx_avail));
     virtio_mmio_write64(base, VIRTIO_MMIO_QUEUE_USED_LOW, kernel_virt_to_phys((uint64_t)&virtio_net_state.tx_used));
@@ -530,20 +547,46 @@ int virtio_net_init(void)
     virtio_net_state.ready = true;
     virtio_net_state.rx_last_used = 0;
     virtio_net_state.tx_last_used = 0;
+    virtio_net_state.rx_packet_seen = 0;
+    virtio_net_state.tx_packet_seen = 0;
 
+    status |= VIRTIO_STATUS_DRIVER_OK;
+    virtio_mmio_write32(base, VIRTIO_MMIO_STATUS, status);
+    /*
+     * 有些后端更偏好在 DRIVER_OK 之后再看到可用的 RX buffer。
+     * 这样设备侧不会误判“队列虽然配置了，但驱动还没完全 ready”。
+     */
     for (slot = 0; slot < VIRTIO_NET_QUEUE_SIZE; slot++)
     {
         virtio_net_queue_rx(&virtio_net_state, slot);
     }
-
-    status |= VIRTIO_STATUS_DRIVER_OK;
-    virtio_mmio_write32(base, VIRTIO_MMIO_STATUS, status);
+    /*
+     * 这里在 DRIVER_OK 之后再补一次 RX kick。
+     * 一些 virtio 后端会忽略 DRIVER_OK 之前的 notify，
+     * 如果不重新触发，初始化时预置的接收 buffer 可能一直不被设备消费。
+     */
+    virtio_mmio_write32(base, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_QUEUE_RX);
 
     ret = net_register_device(&virtio_net_state.dev);
     if (ret)
     {
         printk("[virtio-net\tinit]: net register failed %d\n", ret);
         return ret;
+    }
+
+    dev_desc = fdt_find_device_by_reg(FDT_DEVICE_VIRTIO_MMIO, kernel_virt_to_phys(base));
+    if (dev_desc && dev_desc->has_irq)
+    {
+        virtio_net_state.irq = dev_desc->irq;
+    }
+
+    printk("[virtio-net\tinit]: base=%#lx mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+           base, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    if (virtio_net_state.irq)
+    {
+        irq_handlers[virtio_net_state.irq] = virtio_net_irq_handle;
+        gic_enable_irq(virtio_net_state.irq);
+        virtio_net_state.irq_ready = true;
     }
 
     ret = kthread_create((const int8_t *)"vnet", virtio_net_worker, &virtio_net_state);
@@ -553,20 +596,6 @@ int virtio_net_init(void)
         return ret;
     }
 
-    dev_desc = fdt_find_device_by_reg(FDT_DEVICE_VIRTIO_MMIO, kernel_virt_to_phys(base));
-    if (dev_desc && dev_desc->has_irq)
-    {
-        virtio_net_state.irq = dev_desc->irq;
-        if (virtio_net_irq_stable)
-        {
-            irq_handlers[virtio_net_state.irq] = virtio_net_irq_handle;
-            gic_enable_irq(virtio_net_state.irq);
-            virtio_net_state.irq_ready = true;
-        }
-    }
-
-    printk("[virtio-net\tinit]: base=%#lx mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
-           base, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     if (virtio_net_state.irq_ready)
     {
         printk("[virtio-net\tinit]: irq=%u gic=%u tasklet=on\n",
@@ -574,11 +603,6 @@ int virtio_net_init(void)
     }
     else if (virtio_net_state.irq)
     {
-        /*
-         * 先和 virtio-input 保持同样策略：IRQ 能探测到，但在早期内核
-         * 尚未把整条中断/软中断路径验证稳定前，默认继续走 worker 轮询。
-         * 这样能保证 make run 先以“可持续启动、可交互”为优先目标。
-         */
         printk("[virtio-net\tinit]: irq=%u discovered, polling fallback enabled\n",
                virtio_net_state.irq);
     }
@@ -586,6 +610,7 @@ int virtio_net_init(void)
     {
         printk("[virtio-net\tinit]: irq unavailable, fallback worker polling\n");
     }
+
     return 0;
 }
 

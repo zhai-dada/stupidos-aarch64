@@ -3,7 +3,17 @@
 #include "errno.h"
 #include "driver/virtio_input.h"
 #include "driver/virtio_net.h"
+#include "exec.h"
+#include "lib/libasm.h"
 #include "tty.h"
+
+static int32_t shell_pid = -1;
+static bool shell_supervisor_started;
+
+int32_t shell_foreground_pid(void)
+{
+    return shell_pid;
+}
 #include "fs/vfs.h"
 #include "lib/libmem.h"
 #include "lib/libstr.h"
@@ -18,6 +28,7 @@
 
 #define SHELL_LINE_MAX 256
 #define SHELL_READ_CHUNK 128
+#define SHELL_MAX_ARGS 8
 
 static void shell_putc(char ch)
 {
@@ -39,51 +50,58 @@ static void shell_write_bytes(const int8_t *buf, size_t len)
     }
 }
 
+static int shell_launch_userspace(void)
+{
+    int ret;
+    const int8_t *argv[] = {(const int8_t *)"sh", 0};
+
+    ret = exec_program((const int8_t *)"/bin/sh", 1, argv);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    shell_pid = ret;
+    return ret;
+}
+
 static bool shell_is_space(char ch)
 {
     return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r';
 }
 
-static const char *shell_skip_spaces(const char *p)
+static int shell_tokenize(int8_t *line, int8_t *argv[], int max_args)
 {
-    while (*p && shell_is_space(*p))
+    int argc;
+    int8_t *p;
+
+    argc = 0;
+    p = line;
+    while (*p != '\0')
     {
-        p++;
-    }
-
-    return p;
-}
-
-static int shell_next_token(const char **cursor, int8_t *out, size_t out_len)
-{
-    const char *p;
-    size_t len;
-
-    if (!cursor || !out || !out_len)
-    {
-        return -EINVAL;
-    }
-
-    p = shell_skip_spaces(*cursor);
-    if (*p == '\0')
-    {
-        *cursor = p;
-        return -ENOENT;
-    }
-
-    len = 0;
-    while (*p && !shell_is_space(*p))
-    {
-        if (len + 1 >= out_len)
+        while (*p != '\0' && shell_is_space((char)*p))
         {
-            return -ENAMETOOLONG;
+            *p++ = '\0';
         }
 
-        out[len++] = (int8_t)*p++;
+        if (*p == '\0')
+        {
+            break;
+        }
+
+        if (argc >= max_args)
+        {
+            return -E2BIG;
+        }
+
+        argv[argc++] = p;
+        while (*p != '\0' && !shell_is_space((char)*p))
+        {
+            p++;
+        }
     }
-    out[len] = '\0';
-    *cursor = p;
-    return 0;
+
+    return argc;
 }
 
 static void shell_print_error(int ret)
@@ -95,14 +113,17 @@ static void shell_help(void)
 {
     shell_puts((const int8_t *)"\r\ncommands:\r\n");
     shell_puts((const int8_t *)"  help            - show this message\r\n");
+    shell_puts((const int8_t *)"  run <path> ...  - run an ELF program from VFS\r\n");
     shell_puts((const int8_t *)"  ls [path]       - list directory entries\r\n");
     shell_puts((const int8_t *)"  cat <path>      - dump a file\r\n");
     shell_puts((const int8_t *)"  write <path> <text> - overwrite a file from offset 0\r\n");
     shell_puts((const int8_t *)"  info            - show kernel status\r\n");
     shell_puts((const int8_t *)"  ps              - show task table\r\n");
     shell_puts((const int8_t *)"  net             - show network devices\r\n");
-    shell_puts((const int8_t *)"  ping/nettest    - run network self-test\r\n");
+    shell_puts((const int8_t *)"  ping [args]     - execute /bin/ping\r\n");
+    shell_puts((const int8_t *)"  nettest         - compatibility alias for /bin/ping\r\n");
     shell_puts((const int8_t *)"  mem             - show buddy allocator state\r\n");
+    shell_puts((const int8_t *)"  external cmds   - /bin/hello /bin/ls /bin/cat /bin/ping\r\n");
 }
 
 static void shell_ls(const int8_t *path)
@@ -220,127 +241,208 @@ static void shell_mem(void)
            (uint64_t)(TOTAL_MEMORY / 0x100000));
 }
 
-static void shell_ping(void)
+static void shell_supervisor(void *arg)
 {
+    struct task_struct *task;
     int ret;
 
-    ret = net_selftest();
-    if (ret)
+    (void)arg;
+    while (1)
     {
-        printk("[shell\t]: network selftest failed %d\n", ret);
-        return;
-    }
+        task = task_by_pid(shell_pid);
+        if (!task || task->state == TASK_DEAD)
+        {
+            ret = shell_launch_userspace();
+            if (ret < 0)
+            {
+                printk("[shell\tinit]: relaunch failed %d\n", ret);
+            }
+        }
 
-    printk("[shell\t]: network selftest passed\n");
+        sched_maybe_resched();
+        /*
+         * 这里是“等 shell 退出 / 重启”的软件等待，不是纯粹省电。
+         * 用 wfe 才能被 task_exit() 里的 sev() 立刻唤醒。
+         */
+        wfe();
+    }
 }
 
-static void shell_execute(const int8_t *line)
+static int shell_exec_external(int argc, int8_t *argv[], bool direct_path_only)
 {
-    const char *cursor;
-    int8_t cmd[32];
     int8_t path[VFS_PATH_MAX];
     int ret;
+    size_t base_len;
 
-    cursor = (const char *)line;
-    cursor = shell_skip_spaces(cursor);
-    if (*cursor == '\0')
+    if (argc <= 0 || !argv || !argv[0] || argv[0][0] == '\0')
+    {
+        return -EINVAL;
+    }
+
+    if (argv[0][0] == '/')
+    {
+        return exec_program(argv[0], argc, (const int8_t **)argv);
+    }
+
+    if (direct_path_only)
+    {
+        return -ENOENT;
+    }
+
+    memset((int8_t *)path, 0, sizeof(path));
+    memcpy(path, (int8_t *)"/bin/", 5);
+    base_len = strlen((int8_t *)argv[0]);
+    if (5 + base_len + 1 > sizeof(path))
+    {
+        return -ENAMETOOLONG;
+    }
+    memcpy(path + 5, argv[0], base_len + 1);
+    ret = exec_program(path, argc, (const int8_t **)argv);
+    return ret;
+}
+
+static void shell_execute(int8_t *line)
+{
+    int8_t *argv[SHELL_MAX_ARGS];
+    int argc;
+    int ret;
+
+    argc = shell_tokenize(line, argv, SHELL_MAX_ARGS);
+    if (argc == 0)
     {
         return;
     }
-
-    ret = shell_next_token(&cursor, cmd, sizeof(cmd));
-    if (ret)
+    if (argc < 0)
     {
-        shell_print_error(ret);
+        shell_print_error(argc);
         return;
     }
 
-    if (strcmp(cmd, (const int8_t *)"help") == 0)
+    if (strcmp(argv[0], (const int8_t *)"help") == 0)
     {
         shell_help();
         return;
     }
 
-    if (strcmp(cmd, (const int8_t *)"ls") == 0)
+    if (strcmp(argv[0], (const int8_t *)"run") == 0)
     {
-        ret = shell_next_token(&cursor, path, sizeof(path));
-        if (ret == -ENOENT)
+        if (argc < 2)
         {
-            path[0] = '/';
-            path[1] = '\0';
+            shell_puts((const int8_t *)"usage: run <path> [args...]\r\n");
+            return;
         }
-        else if (ret)
+
+        ret = shell_exec_external(argc - 1, &argv[1], true);
+        if (ret < 0)
         {
             shell_print_error(ret);
             return;
         }
-
-        shell_ls(path);
         return;
     }
 
-    if (strcmp(cmd, (const int8_t *)"cat") == 0)
+    if (strcmp(argv[0], (const int8_t *)"ls") == 0)
     {
-        ret = shell_next_token(&cursor, path, sizeof(path));
-        if (ret)
+        if (argc >= 2)
         {
-            shell_print_error(ret);
-            return;
+            shell_ls(argv[1]);
         }
-
-        shell_cat(path);
+        else
+        {
+            shell_ls((const int8_t *)"/");
+        }
         return;
     }
 
-    if (strcmp(cmd, (const int8_t *)"write") == 0)
+    if (strcmp(argv[0], (const int8_t *)"cat") == 0)
     {
-        const char *text;
-
-        ret = shell_next_token(&cursor, path, sizeof(path));
-        if (ret)
+        if (argc < 2)
         {
-            shell_print_error(ret);
+            shell_puts((const int8_t *)"usage: cat <path>\r\n");
             return;
         }
 
-        text = shell_skip_spaces(cursor);
-        if (*text == '\0')
-        {
-            shell_puts((const int8_t *)"missing text\r\n");
-            return;
-        }
-
-        shell_write(path, text);
+        shell_cat(argv[1]);
         return;
     }
 
-    if (strcmp(cmd, (const int8_t *)"info") == 0)
+    if (strcmp(argv[0], (const int8_t *)"write") == 0)
+    {
+        int8_t *text;
+
+        if (argc < 3)
+        {
+            shell_puts((const int8_t *)"usage: write <path> <text>\r\n");
+            return;
+        }
+
+        text = argv[2];
+        shell_write(argv[1], (const char *)text);
+        return;
+    }
+
+    if (strcmp(argv[0], (const int8_t *)"info") == 0)
     {
         shell_info();
         return;
     }
 
-    if (strcmp(cmd, (const int8_t *)"ps") == 0)
+    if (strcmp(argv[0], (const int8_t *)"ps") == 0)
     {
         sched_show_tasks();
         return;
     }
 
-    if (strcmp(cmd, (const int8_t *)"mem") == 0)
+    if (strcmp(argv[0], (const int8_t *)"mem") == 0)
     {
         shell_mem();
         return;
     }
 
-    if (strcmp(cmd, (const int8_t *)"net") == 0)
+    if (strcmp(argv[0], (const int8_t *)"net") == 0)
     {
         net_show_status();
         return;
     }
 
-    if (strcmp(cmd, (const int8_t *)"ping") == 0 || strcmp(cmd, (const int8_t *)"nettest") == 0)
+    if (strcmp(argv[0], (const int8_t *)"ping") == 0)
     {
-        shell_ping();
+        ret = shell_exec_external(argc, argv, false);
+        if (ret < 0)
+        {
+            shell_print_error(ret);
+        }
+        return;
+    }
+
+    if (strcmp(argv[0], (const int8_t *)"nettest") == 0)
+    {
+        int8_t *alias_argv[SHELL_MAX_ARGS];
+        size_t i;
+
+        if (argc > SHELL_MAX_ARGS)
+        {
+            shell_print_error(-E2BIG);
+            return;
+        }
+
+        alias_argv[0] = (int8_t *)"ping";
+        for (i = 1; i < (size_t)argc; i++)
+        {
+            alias_argv[i] = argv[i];
+        }
+
+        ret = shell_exec_external(argc, alias_argv, false);
+        if (ret < 0)
+        {
+            shell_print_error(ret);
+        }
+        return;
+    }
+
+    ret = shell_exec_external(argc, argv, false);
+    if (ret >= 0)
+    {
         return;
     }
 
@@ -403,12 +505,33 @@ void shell_init(void)
 {
     int ret;
 
-    ret = kthread_create((const int8_t *)"shell", shell_main, 0);
+    /*
+     * 先清掉启动阶段残留的输入字节，避免 shell 一上线就把脏数据当命令执行。
+     */
+    tty_flush_input();
+
+    ret = shell_launch_userspace();
     if (ret < 0)
     {
-        printk("[shell\tinit]: failed %d\n", ret);
+        printk("[shell\tinit]: exec /bin/sh failed %d, fallback to kernel shell\n", ret);
+        ret = kthread_create((const int8_t *)"shell", shell_main, 0);
+        if (ret < 0)
+        {
+            printk("[shell\tinit]: failed %d\n", ret);
+            return;
+        }
+
+        printk("[shell\tinit]: legacy shell started pid=%d\n", ret);
         return;
     }
 
-    printk("[shell\tinit]: started pid=%d\n", ret);
+    if (!shell_supervisor_started)
+    {
+        shell_supervisor_started = true;
+        ret = kthread_create((const int8_t *)"sh-watch", shell_supervisor, 0);
+        if (ret < 0)
+        {
+            printk("[shell\tinit]: supervisor create failed %d\n", ret);
+        }
+    }
 }

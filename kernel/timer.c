@@ -6,7 +6,6 @@
 #include "lib/librw.h"
 #include "gicv2.h"
 
-#define TICK_RATE_HZ 10
 #define KERNEL_TIMER_IRQ GIC_INTID_EL1_PHYS_TIMER
 
 uint32_t cnt_tval = 0x00;
@@ -34,7 +33,7 @@ static void plat_timer_init()
     );
     
 	/* Calculate the tv */
-	cnt_tval = (cur_freq / TICK_RATE_HZ);
+    cnt_tval = (cur_freq / STUPIDOS_TIMER_HZ);
     
 	/* set the timervalue here */
 	asm volatile
@@ -108,10 +107,17 @@ void handle_timer_irq(void)
     {
         timer_tasklet_selftest_done = true;
         tasklet_schedule(&timer_tasklet_selftest);
-    }
+	}
 
     scheduler_tick();
 	plat_handle_timer_irq();
+
+    /*
+     * 让所有正在 wfe 等待“时间推进”的 CPU 及时醒来。
+     * 这会同时照顾 sys_sleep()/ping 这类基于 jiffies 的等待路径，
+     * 也能顺带维持早期软件事件等待的响应性。
+     */
+    sev();
 }
 
 void timer_init(void)

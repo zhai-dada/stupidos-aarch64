@@ -235,9 +235,14 @@ int32_t vsprintf(int8_t *buf, const int8_t *fmt, va_list args)
         case 's':
 
             s = va_arg(args, int8_t *);
-            if (!s)
+            /*
+             * 许多调试日志都会打印字符串指针。
+             * 一旦上层把一个低地址或空指针传进来，直接 strlen() 会在
+             * 0x1c / 0x0 这类地址上触发 data abort，把整机拖进异常循环。
+             */
+            if (!s || (uint64_t)s < 0x1000UL)
             {
-                s = '\0';
+                s = (int8_t *)"(null)";
             }
             len = strlen(s);
             if (precision < 0)

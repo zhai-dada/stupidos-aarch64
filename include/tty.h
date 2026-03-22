@@ -16,8 +16,10 @@ struct tty_mouse_state
 };
 
 void tty_init(void);
+void tty_flush_input(void);
 void tty_putc(uint8_t ch);
 void tty_write(const int8_t *str);
+int32_t tty_try_getc(void);
 int32_t tty_getc(void);
 void tty_feed_char(uint8_t ch);
 void tty_report_mouse_delta(int32_t dx, int32_t dy, uint32_t buttons);

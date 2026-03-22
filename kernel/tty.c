@@ -60,6 +60,23 @@ void tty_init(void)
     tty_mouse.buttons = 0;
 }
 
+void tty_flush_input(void)
+{
+    uint64_t daif;
+
+    /*
+     * shell 启动前把终端队列清空，避免设备初始化阶段残留的脏输入
+     * 直接被解释成第一条命令。
+     */
+    daif = read_daif();
+    disable_irq();
+    spin_lock(&tty_lock);
+    tty_rx_head = 0;
+    tty_rx_tail = 0;
+    spin_unlock(&tty_lock);
+    write_daif(daif);
+}
+
 void tty_putc(uint8_t ch)
 {
     uart_putc(ch);
@@ -78,6 +95,31 @@ void tty_write(const int8_t *str)
     }
 }
 
+int32_t tty_try_getc(void)
+{
+    uint64_t daif;
+    int32_t ch;
+
+    daif = read_daif();
+    disable_irq();
+    spin_lock(&tty_lock);
+    ch = tty_rx_pop();
+    spin_unlock(&tty_lock);
+    if (ch >= 0)
+    {
+        write_daif(daif);
+        return ch;
+    }
+
+    /*
+     * 终端缓冲区里没有字符时，再顺手查一把 PL011 FIFO。
+     * 这样串口输入和 virtio-input 输入都能走同一条 tty 入口。
+     */
+    ch = uart_try_getc();
+    write_daif(daif);
+    return ch;
+}
+
 void tty_feed_char(uint8_t ch)
 {
     uint64_t daif;
@@ -87,47 +129,38 @@ void tty_feed_char(uint8_t ch)
     spin_lock(&tty_lock);
     tty_rx_push(ch);
     spin_unlock(&tty_lock);
+
+    /*
+     * 唤醒等待输入的 CPU。
+     * 这样 sys_read()/tty_getc() 里用 wfe 时，不会卡到下一次 timer tick。
+     */
+    sev();
     write_daif(daif);
 }
 
 int32_t tty_getc(void)
 {
-    uint64_t daif;
     int32_t ch;
 
     while (1)
     {
-        daif = read_daif();
+        /*
+         * 只做一次快速探测，避免把输入路径拖进多次调度切换。
+         * 这样字符一到，能立刻从 FIFO/TTY 队列里取走。
+         */
+        ch = tty_try_getc();
+        if (ch >= 0)
+        {
+            return ch;
+        }
+
+        /*
+         * 备用 tty 读取路径也切到事件等待。
+         * 输入 IRQ 在入队时会发 sev，这里用 wfe 可以更快被唤醒。
+         */
+        enable_irq();
+        wfe();
         disable_irq();
-        spin_lock(&tty_lock);
-        ch = tty_rx_pop();
-        spin_unlock(&tty_lock);
-        if (ch >= 0)
-        {
-            write_daif(daif);
-            return ch;
-        }
-
-        /*
-         * 串口输入优先走中断队列，但如果中断暂时没到，这里再直接轮询
-         * 一次 PL011 RX FIFO，避免用户在 QEMU 里按键后 shell 一直无响应。
-         * 这样既保留中断路径，也给早期调试留一条可靠兜底通道。
-         */
-        ch = uart_try_getc();
-        if (ch >= 0)
-        {
-            write_daif(daif);
-            return ch;
-        }
-
-        write_daif(daif);
-
-        /*
-         * 当前还没有做完整的等待队列和阻塞唤醒。
-         * shell 线程在没有输入时主动让出 CPU，既不会空转卡死，
-         * 也能让 boot 线程继续推进后面的驱动初始化。
-         */
-        sched_yield();
     }
 }
 

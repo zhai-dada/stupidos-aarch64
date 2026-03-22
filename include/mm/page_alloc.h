@@ -12,5 +12,6 @@ void free_pages(void *addr, uint32_t order);
 void free_pages_phys(uint64_t phys, uint32_t order);
 uint32_t page_alloc_free_pages(void);
 uint32_t page_alloc_total_pages(void);
+bool page_alloc_is_ready(void);
 
 #endif

@@ -126,7 +126,7 @@ void uart_init(void)
     *(uint32_t *)(PL011_UART0_BASE + UART_CR) = UART_CR_UARTEN | UART_CR_TXE | UART_CR_RXE;
 
     uart_irq_line = uart_detect_irq_line();
-    uart_irq_seen = false;
+    // uart_irq_seen = false;
     irq_handlers[uart_irq_line] = uart_irq_handle;
     gic_enable_irq(uart_irq_line);
 
@@ -141,7 +141,12 @@ void uart_init(void)
 
 int32_t uart_printf(int8_t* front, int8_t* back, const int8_t* fmt, ...)
 {
-    int8_t buffer[2048];
+    /*
+     * 串口日志是全局串行的，所以这里完全可以用共享静态缓冲，
+     * 避免每次 printk 都在当前任务栈上再压一个 2KB 大对象。
+     * 这能显著降低 shell / IRQ / 调度混跑时的栈污染风险。
+     */
+    static int8_t buffer[4096];
     int32_t i = 0;
     uint64_t daif;
 
@@ -195,5 +200,5 @@ void uart_irq_handle(void)
     }
 
     /* 清掉本次收包相关中断，避免 UART 继续挂着未处理状态。 */
-    *(uint32_t *)(PL011_UART0_BASE + UART_ICR) = UART_IMSC_RTIM | UART_IMSC_RXIM;
+    *(uint32_t *)(PL011_UART0_BASE + UART_ICR) = 0x7ff;
 }

@@ -23,11 +23,16 @@ trap cleanup EXIT
 dd if=/dev/zero of="$DISK_IMG" bs=512M count=6 status=none
 cat fdisk.args | fdisk "$DISK_IMG" >/dev/null
 
-mkdir -p "$TMP_ROOT/etc" "$TMP_ROOT/boot"
+mkdir -p "$TMP_ROOT/etc" "$TMP_ROOT/boot" "$TMP_ROOT/bin"
 printf "hello from ext4 root\n" > "$TMP_ROOT/hello.txt"
 printf "rewrite me via kernel vfs\n" > "$TMP_ROOT/rw-demo.txt"
 printf "nested file\n" > "$TMP_ROOT/etc/info.txt"
 printf "mount point for fat32\n" > "$TMP_ROOT/boot/README"
+
+if [ -n "${USER_BINS_DIR:-}" ] && [ -d "$USER_BINS_DIR" ]; then
+    find "$USER_BINS_DIR" -maxdepth 1 -type f -exec cp {} "$TMP_ROOT/bin/" \;
+    find "$TMP_ROOT/bin" -maxdepth 1 -type f -exec chmod 755 {} \;
+fi
 
 printf "hello from fat32 boot volume\n" > "$TMP_FAT/README.TXT"
 printf "kernel overwrites me via fat32\n" > "$TMP_FAT/RWDEMO.TXT"
@@ -39,5 +44,12 @@ mmd -i "$DISK_IMG@@$P1_OFFSET" ::/EFI/BOOT >/dev/null
 mcopy -i "$DISK_IMG@@$P1_OFFSET" "$TMP_FAT/README.TXT" ::/README.TXT >/dev/null
 mcopy -i "$DISK_IMG@@$P1_OFFSET" "$TMP_FAT/RWDEMO.TXT" ::/RWDEMO.TXT >/dev/null
 mcopy -i "$DISK_IMG@@$P1_OFFSET" "$TMP_FAT/INFO.TXT" ::/EFI/BOOT/INFO.TXT >/dev/null
-mkfs.ext4 -F -q -b "$EXT4_BLOCK_SIZE" -d "$TMP_ROOT" \
+#
+# 当前内核里的 ext4 目录遍历只实现了最小线性目录格式，
+# 还没有支持 htree(dir_index) 目录索引。
+# 如果 mkfs 默认把 /bin 之类目录做成 indexed directory，
+# lookup("/bin/ls") 可能还能靠顺扫命中，但 readdir("/bin") 会看起来像空目录。
+# 这里显式关闭 dir_index，让磁盘镜像和当前 ext4 驱动能力保持一致。
+#
+mkfs.ext4 -F -q -O ^dir_index -b "$EXT4_BLOCK_SIZE" -d "$TMP_ROOT" \
     -E "offset=$P2_OFFSET" "$DISK_IMG" "$EXT4_BLOCKS"

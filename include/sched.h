@@ -6,16 +6,18 @@
 
 #define TASK_COMM_LEN       16
 #define TASK_STACK_SIZE     16384
-#define CONFIG_MAX_TASKS    8
+#define CONFIG_MAX_TASKS    16
 #define SCHED_LATENCY_TICKS 4
 
 typedef void (*task_entry_t)(void *arg);
+typedef void (*task_cleanup_t)(void *arg);
 
 enum task_state
 {
     TASK_UNUSED = 0,
     TASK_RUNNING,
     TASK_RUNNABLE,
+    TASK_SLEEPING,
     TASK_DEAD,
 };
 
@@ -50,8 +52,14 @@ struct task_struct
     uint64_t vruntime;
     uint64_t exec_start;
     uint64_t weight;
+    uint64_t sleep_until;
     task_entry_t entry;
     void *arg;
+    task_cleanup_t cleanup;
+    void *cleanup_arg;
+    uint64_t exec_base;
+    uint64_t exec_end;
+    bool has_exec_image;
     int8_t comm[TASK_COMM_LEN];
     struct cpu_context cpu_ctx;
     uint8_t stack[TASK_STACK_SIZE] __attribute__((aligned(16)));
@@ -76,11 +84,15 @@ void sched_init(void);
 void sched_init_secondary(uint32_t cpu_id);
 int kthread_create(const int8_t *name, task_entry_t entry, void *arg);
 void sched_yield(void);
+void sched_sleep_until(uint64_t wake_jiffies);
+void sched_sleep_ms(uint32_t sleep_ms);
 void scheduler_tick(void);
 void sched_maybe_resched(void);
 void sched_show_tasks(void);
 void task_exit(void) __attribute__((noreturn));
 struct task_struct *task_current(void);
+struct task_struct *task_by_pid(int32_t pid);
+void task_set_cleanup(task_cleanup_t cleanup, void *arg);
 
 /*
  * 汇编实现的上下文切换例程。

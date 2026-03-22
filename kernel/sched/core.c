@@ -1,9 +1,13 @@
 #include "sched.h"
 #include "asm/barrier.h"
 #include "lib/libirq.h"
+#include "lib/libasm.h"
 #include "lib/libmem.h"
+#include "mmu.h"
 #include "printk.h"
 #include "smp.h"
+#include "timer.h"
+#include "shell.h"
 #include "spinlock.h"
 
 struct sched_state
@@ -27,6 +31,10 @@ static void init_idle_task(struct task_struct *idle, uint32_t cpu)
     idle->is_idle = true;
     idle->state = TASK_RUNNING;
     idle->weight = 1024;
+    idle->sleep_until = 0;
+    idle->exec_base = 0;
+    idle->exec_end = 0;
+    idle->has_exec_image = false;
     copy_task_name(idle->comm, (const int8_t *)"idle");
 }
 
@@ -38,6 +46,10 @@ static void init_boot_task(struct task_struct *task, uint32_t cpu)
     task->is_idle = false;
     task->state = TASK_RUNNING;
     task->weight = 1024;
+    task->sleep_until = 0;
+    task->exec_base = 0;
+    task->exec_end = 0;
+    task->has_exec_image = false;
     copy_task_name(task->comm, (const int8_t *)"boot");
 }
 
@@ -62,6 +74,22 @@ static struct rq *this_rq(void)
     return &sched_state.rq[smp_cpu_id()];
 }
 
+struct task_struct *task_by_pid(int32_t pid)
+{
+    uint32_t i;
+
+    for (i = 0; i < CONFIG_MAX_TASKS; i++)
+    {
+        if (sched_state.tasks[i].state != TASK_UNUSED &&
+            sched_state.tasks[i].pid == pid)
+        {
+            return &sched_state.tasks[i];
+        }
+    }
+
+    return 0;
+}
+
 static bool task_is_runnable_on_cpu(const struct task_struct *task, uint32_t cpu)
 {
     if (task->cpu != cpu)
@@ -70,6 +98,55 @@ static bool task_is_runnable_on_cpu(const struct task_struct *task, uint32_t cpu
     }
 
     return task->state == TASK_RUNNABLE || task->state == TASK_RUNNING;
+}
+
+static bool task_has_valid_context(const struct task_struct *task)
+{
+    uint64_t lr;
+
+    if (!task)
+    {
+        return false;
+    }
+
+    /*
+     * cpu_switch_to() 依赖 next->cpu_ctx 里已经有一份可恢复的 sp/lr。
+     * 一旦这里被异常写坏，继续切过去就会直接跳进数据区或空地址。
+     * 先做最小合法性检查，宁可回落到 idle，也不要把整颗 CPU 交给坏上下文。
+     */
+    if (!task->cpu_ctx.sp || !task->cpu_ctx.lr)
+    {
+        return false;
+    }
+
+    if ((task->cpu_ctx.sp & 0xfUL) != 0)
+    {
+        return false;
+    }
+
+    /*
+     * 返回地址必须落在“当前可解释的代码区域”里：
+     * - kernel thread / syscall 路径：kernel text
+     * - exec 出来的 ELF 任务：自己的装载区
+     *
+     * 这样即使某次栈被写坏，也不会把 next task 直接跳进 .bss / framebuffer。
+     */
+    lr = task->cpu_ctx.lr;
+    if ((lr >= (uint64_t)&__text_start && lr < (uint64_t)&__text_end) ||
+        (lr >= kimage_phys_to_virt((uint64_t)&__text_start) &&
+         lr < kimage_phys_to_virt((uint64_t)&__text_end)))
+    {
+        return true;
+    }
+
+    if (task->has_exec_image &&
+        lr >= task->exec_base &&
+        lr < task->exec_end)
+    {
+        return true;
+    }
+
+    return false;
 }
 
 static void rq_recalc_min_vruntime(struct rq *rq, uint32_t cpu)
@@ -95,27 +172,6 @@ static void rq_recalc_min_vruntime(struct rq *rq, uint32_t cpu)
             found = true;
         }
     }
-}
-
-static uint32_t rq_nr_schedulable_tasks(uint32_t cpu)
-{
-    uint32_t i;
-    uint32_t nr;
-
-    nr = 0;
-    for (i = 0; i < CONFIG_MAX_TASKS; i++)
-    {
-        struct task_struct *task = &sched_state.tasks[i];
-
-        if (!task_is_runnable_on_cpu(task, cpu) || task->is_idle)
-        {
-            continue;
-        }
-
-        nr++;
-    }
-
-    return nr;
 }
 
 static uint32_t sched_pick_target_cpu(void)
@@ -151,6 +207,8 @@ static const int8_t *task_state_name(enum task_state state)
         return (const int8_t *)"running";
     case TASK_RUNNABLE:
         return (const int8_t *)"runnable";
+    case TASK_SLEEPING:
+        return (const int8_t *)"sleeping";
     case TASK_DEAD:
         return (const int8_t *)"dead";
     default:
@@ -172,6 +230,11 @@ static struct task_struct *pick_next_task(struct rq *rq, struct task_struct *pre
         struct task_struct *task = &sched_state.tasks[i];
 
         if (!task_is_runnable_on_cpu(task, cpu))
+        {
+            continue;
+        }
+
+        if (task != prev && !task_has_valid_context(task))
         {
             continue;
         }
@@ -221,6 +284,37 @@ static void sched_prepare_yield(struct rq *rq)
     curr->vruntime++;
 }
 
+static void sched_wake_sleepers_locked(void)
+{
+    uint32_t i;
+
+    /*
+     * 任务数很少，先用线性扫描实现睡眠唤醒。
+     * 这比复杂的时间轮更适合当前阶段，也方便后续扩展到 futex / timeout read。
+     */
+    for (i = 0; i < CONFIG_MAX_TASKS; i++)
+    {
+        struct task_struct *task = &sched_state.tasks[i];
+        struct rq *rq;
+
+        if (task->state != TASK_SLEEPING)
+        {
+            continue;
+        }
+
+        if (task->sleep_until > jiffies)
+        {
+            continue;
+        }
+
+        rq = &sched_state.rq[task->cpu];
+        task->state = TASK_RUNNABLE;
+        task->sleep_until = 0;
+        rq->nr_running++;
+        rq->need_resched = true;
+    }
+}
+
 static void __schedule_locked(struct rq *rq)
 {
     struct task_struct *prev;
@@ -263,7 +357,6 @@ static void task_trampoline(void)
     enable_irq();
 
     task = task_current();
-    printk("[sched\tinit]: task %d (%s) started\n", task->pid, task->comm);
     task->entry(task->arg);
     task_exit();
 }
@@ -271,6 +364,22 @@ static void task_trampoline(void)
 struct task_struct *task_current(void)
 {
     return this_rq()->curr;
+}
+
+void task_set_cleanup(task_cleanup_t cleanup, void *arg)
+{
+    struct task_struct *task;
+    uint64_t daif;
+
+    daif = read_daif();
+    disable_irq();
+    task = task_current();
+    if (task)
+    {
+        task->cleanup = cleanup;
+        task->cleanup_arg = arg;
+    }
+    write_daif(daif);
 }
 
 void sched_init(void)
@@ -365,6 +474,9 @@ int kthread_create(const int8_t *name, task_entry_t entry, void *arg)
     task->weight = 1024;
     task->entry = entry;
     task->arg = arg;
+    task->exec_base = 0;
+    task->exec_end = 0;
+    task->has_exec_image = false;
     copy_task_name(task->comm, name);
 
     sp = (uint64_t)&task->stack[TASK_STACK_SIZE];
@@ -372,12 +484,11 @@ int kthread_create(const int8_t *name, task_entry_t entry, void *arg)
     task->cpu_ctx.sp = sp;
     task->cpu_ctx.lr = (uint64_t)task_trampoline;
     sched_state.rq[task->cpu].nr_running++;
+    rq_recalc_min_vruntime(&sched_state.rq[task->cpu], task->cpu);
     sched_state.rq[task->cpu].need_resched = true;
 
     spin_unlock(&sched_state.lock);
     enable_irq();
-
-    printk("[sched\tinit]: created task %d (%s)\n", pid, task->comm);
     return pid;
 }
 
@@ -388,7 +499,7 @@ void sched_yield(void)
     disable_irq();
     spin_lock(&sched_state.lock);
     rq = this_rq();
-    if (rq_nr_schedulable_tasks(smp_cpu_id()) > 1)
+    if (rq->nr_running > 1)
     {
         sched_prepare_yield(rq);
     }
@@ -396,6 +507,53 @@ void sched_yield(void)
     __schedule_locked(rq);
     spin_unlock(&sched_state.lock);
     enable_irq();
+}
+
+void sched_sleep_until(uint64_t wake_jiffies)
+{
+    struct rq *rq;
+    struct task_struct *curr;
+
+    disable_irq();
+    spin_lock(&sched_state.lock);
+
+    rq = this_rq();
+    curr = rq->curr;
+    if (!curr || curr->is_idle)
+    {
+        spin_unlock(&sched_state.lock);
+        enable_irq();
+        return;
+    }
+
+    /*
+     * 睡眠时直接从当前 CPU 的 runnable 计数中移除，
+     * 到期后由 timer tick 重新放回 runnable 集合。
+     */
+    curr->state = TASK_SLEEPING;
+    curr->sleep_until = wake_jiffies;
+    if (rq->nr_running > 0)
+    {
+        rq->nr_running--;
+    }
+    rq->need_resched = true;
+    __schedule_locked(rq);
+
+    spin_unlock(&sched_state.lock);
+    enable_irq();
+}
+
+void sched_sleep_ms(uint32_t sleep_ms)
+{
+    uint64_t wake_jiffies;
+
+    if (!sleep_ms)
+    {
+        return;
+    }
+
+    wake_jiffies = (uint64_t)jiffies + ((uint64_t)sleep_ms * STUPIDOS_TIMER_HZ + 999ULL) / 1000ULL;
+    sched_sleep_until(wake_jiffies);
 }
 
 void scheduler_tick(void)
@@ -414,12 +572,21 @@ void scheduler_tick(void)
      * 这里先实现一个最小 CFS 雏形：
      * 每个 tick 增加当前任务的 vruntime；
      * 当它领先当前 runqueue 最小 vruntime 足够多时，请求重新调度。
-     */
+    */
     task->exec_start++;
     task->vruntime += 1024 / task->weight;
+    /*
+     * 让当前 CPU 的最小虚拟运行时间保持新鲜。
+     * 这样后续 need_resched 的判断不会一直拿着旧账本，前台输入和短任务
+     * 的抢占会更及时。
+     */
     rq_recalc_min_vruntime(rq, smp_cpu_id());
 
-    if (rq_nr_schedulable_tasks(smp_cpu_id()) > 1 &&
+    spin_lock(&sched_state.lock);
+    sched_wake_sleepers_locked();
+    spin_unlock(&sched_state.lock);
+
+    if (rq->nr_running > 1 &&
         task->vruntime >= rq->min_vruntime + SCHED_LATENCY_TICKS)
     {
         rq->need_resched = true;
@@ -473,20 +640,44 @@ void sched_maybe_resched(void)
 
 void task_exit(void)
 {
+    task_cleanup_t cleanup;
+    void *cleanup_arg;
     struct rq *rq;
+    struct task_struct *curr;
+
+    curr = task_current();
 
     disable_irq();
+    cleanup = 0;
+    cleanup_arg = 0;
+    if (curr)
+    {
+        cleanup = curr->cleanup;
+        cleanup_arg = curr->cleanup_arg;
+        curr->cleanup = 0;
+        curr->cleanup_arg = 0;
+    }
+    if (cleanup)
+    {
+        cleanup(cleanup_arg);
+    }
+
     spin_lock(&sched_state.lock);
 
     rq = this_rq();
 
-    printk("[sched\texit]: task %d (%s) exited\n",
-           rq->curr->pid, rq->curr->comm);
     rq->curr->state = TASK_DEAD;
+    /*
+     * 退出事件不是中断，所以不能只靠 wfi 等 timer。
+     * 这里发一个 event，把所有在 wfe 上等“进程退出 / 输入到达”的线程
+     * 一起唤醒，父 shell 就能马上继续执行。
+     */
+    sev();
     if (rq->nr_running)
     {
         rq->nr_running--;
     }
+    rq_recalc_min_vruntime(rq, rq->curr->cpu);
     __schedule_locked(rq);
 
     spin_unlock(&sched_state.lock);

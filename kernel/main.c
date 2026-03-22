@@ -67,6 +67,14 @@ static void debug_irq_snapshot(void)
            ppi_pending, spi_pending, gicd_ctlr, gicc_ctlr, hppir, ahppir);
 }
 
+#if 0
+/*
+ * 默认不开启演示 worker。
+ * 之前这两个线程一直主动 sched_yield()，会在单核环境里制造大量
+ * 无意义的上下文切换，直接把 shell 和输入响应拖慢。
+ *
+ * 需要做调度器压测时，再手动恢复这两个线程即可。
+ */
 static void demo_worker_a(void *arg)
 {
     uint64_t rounds = 0;
@@ -80,11 +88,6 @@ static void demo_worker_a(void *arg)
             printk("[sched\tdemo]: worker-a round=%lx\n", rounds);
         }
 
-        /*
-         * 这里先保留主动 yield 的演示线程模型。
-         * 定时器驱动的抢占式调度会在后续把本路径替换掉，但当前先确保
-         * 上下文切换、runqueue 和 vruntime 记账是稳定可验证的。
-         */
         sched_yield();
     }
 }
@@ -105,6 +108,7 @@ static void demo_worker_b(void *arg)
         sched_yield();
     }
 }
+#endif
 
 /*
  * 打开 MMU 后，主动跳到 KIMAGE_VADDR 对应的高地址内核镜像区继续执行。
@@ -130,19 +134,20 @@ static __attribute__((noreturn)) void kernel_main_high(void)
     fdt_log_summary();
 
     /*
-     * 先把调度器和 shell 拉起来。
-     * shell 等待输入时会主动 yield，不会再像之前那样把 boot 线程卡死，
-     * 这样后面的文件系统、PCI、输入和网络初始化可以继续在后台推进。
+     * 先只拉起调度器和输入子系统，不立刻开放 shell。
+     *
+     * 之前 shell prompt 会在文件系统 / syscall / 网络都还没完全准备好时就出现，
+     * 用户一旦立刻输入 run /bin/ls 之类命令，就会和启动线程后续初始化并发交错，
+     * 现象上看起来像 “ls/ping/cat 跑飞了”，实际上是启动时序不稳定。
+     *
+     * 这里改成：等关键子系统都 ready 之后，再把 shell 交给用户。
      */
     sched_init();
     smp_init();
-    printk("[boot\tinit]: shell start\n");
-    shell_init();
     if (virtio_input_init())
     {
         printk("[input\tinit]: virtio-input init failed\n");
     }
-    sched_yield();
 
     ramfb_putstring(COLOR_BLACK, COLOR_WHITE, (uint8_t*)"Hello World\n\btest");
     assert(6 > 5);
@@ -203,28 +208,27 @@ static __attribute__((noreturn)) void kernel_main_high(void)
 
     page_alloc_init();
     syscall_init();
-
     pci_init();
     net_init();
     if (virtio_net_init())
     {
         printk("[net\tinit]: virtio-net init failed\n");
     }
-    else
-    {
-        /*
-         * 先在启动阶段主动做一次 ARP + ICMP 探测。
-         * 这样不用等到人工进 shell，串口日志就能直接告诉我们链路是否通了。
-         */
-        if (net_selftest())
-        {
-            printk("[net\tinit]: selftest failed\n");
-        }
-    }
 
     printk("[boot\tinit]: ui dashboard start\n");
     ui_boot_screen();
     printk("[boot\tinit]: ui dashboard done\n");
+
+    /*
+     * shell 放到所有核心初始化之后再拉起。
+     *
+     * 之前 shell 提前上线时，boot 线程后面还会继续做 PCI / 网络 / UI 的重活，
+     * 单核下会把 shell 的调度时间和输入响应一起拖慢。
+     * 现在等系统“基本安静”以后再启动 shell，交互会更丝滑，也更接近 Linux 的
+     * “初始化完成后再进入登录/命令行”模式。
+     */
+    printk("[boot\tinit]: shell start\n");
+    shell_init();
 
     /*
      * 这一轮先保留最小内核线程框架：
@@ -233,13 +237,16 @@ static __attribute__((noreturn)) void kernel_main_high(void)
      * - 通过主动 yield 验证上下文切换链路稳定
      * - 同时继续保留 per-cpu runqueue / vruntime 账本，为后续 CFS 演进打底
      */
-    kthread_create((const int8_t *)"worker-a", demo_worker_a, 0);
-    kthread_create((const int8_t *)"worker-b", demo_worker_b, 0);
     printk("[sched\tinit]: entering boot idle loop\n");
 
     while (1)
     {
         sched_maybe_resched();
+        /*
+         * 没有可运行任务时让 CPU 进入低功耗等待，避免 boot 线程空转抢占串口和调度带宽。
+         * timer / input IRQ 到来后会把 CPU 唤醒。
+         */
+        asm volatile("wfi" : : : "memory");
     }
 }
 

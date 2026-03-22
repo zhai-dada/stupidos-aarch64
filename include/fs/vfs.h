@@ -64,6 +64,7 @@ int vfs_readdir(const int8_t *path, uint32_t index, struct vfs_dirent *out);
 ssize_t vfs_read(int fd, void *buf, size_t len);
 ssize_t vfs_write(int fd, const void *buf, size_t len);
 int64_t vfs_lseek(int fd, int64_t offset, int whence);
+int64_t vfs_file_size(int fd);
 int vfs_close(int fd);
 
 #endif

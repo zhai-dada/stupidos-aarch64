@@ -1,4 +1,5 @@
 #include "irq.h"
+#include "sched.h"
 #include "softirq.h"
 #include "syscall.h"
 
@@ -22,22 +23,72 @@ static inline bool gic_irq_is_special_id(uint32_t irqnr)
     return irqnr >= 1020U;
 }
 
+static void dump_backtrace(pt_regs_t *regs)
+{
+    uint64_t *fp;
+    uint32_t depth;
+
+    if (!regs)
+    {
+        return;
+    }
+
+    fp = (uint64_t *)regs->s_fp;
+    for (depth = 0; depth < 6; depth++)
+    {
+        uint64_t prev_fp;
+        uint64_t ret;
+
+        if (!fp)
+        {
+            break;
+        }
+
+        /*
+         * 只做最小的链路检查，避免在异常里又因为回溯本身踩到更坏的地址。
+         */
+        if ((uint64_t)fp < regs->s_sp || (uint64_t)fp >= regs->s_sp + 0x4000UL)
+        {
+            break;
+        }
+
+        prev_fp = fp[0];
+        ret = fp[1];
+        printk("[irq\ttrace]: bt%u fp=%#lx lr=%#lx\n", depth, (uint64_t)fp, ret);
+        if (prev_fp <= (uint64_t)fp)
+        {
+            break;
+        }
+
+        fp = (uint64_t *)prev_fp;
+    }
+}
+
 void do_irq(void *stack)
 {
 	// pt_regs_t* regs = (pt_regs_t*)stack;
 
-	disable_irq();
+    disable_irq();
 	// show_ptregs(regs);
 	
 	handle_irq();
     softirq_irq_exit();
-	enable_irq();
+    /*
+     * 这里补上一次真正的抢占检查。
+     *
+     * 之前 timer IRQ 虽然已经把 rq->need_resched 置位，但中断返回后仍然
+     * 直接 eret 回当前任务，导致新建 ELF 任务必须等 shell 退出后才有机会跑。
+     * 在 IRQ 退出前主动进一次调度，才能让 /bin/hello、/bin/ls 这类前台任务
+     * 像 Linux 那样及时获得 CPU。
+     */
+    sched_maybe_resched();
 	return;
 }
 
 void do_sync(void *stack, uint32_t esr)
 {
 	pt_regs_t* regs = (pt_regs_t*)stack;
+    struct task_struct *curr;
 	uint32_t ec;
 	
 	disable_irq();
@@ -46,11 +97,37 @@ void do_sync(void *stack, uint32_t esr)
 	if (ec == ESR_EC_SVC64)
 	{
 		regs->s_reg[0] = (uint64_t)syscall_dispatch(regs);
-		regs->s_pc += 4;
+		/*
+		 * AArch64 的 SVC 进入异常时，ELR_EL1 已经指向 SVC 之后的下一条指令。
+		 * 这里如果再手动 +4，就会跳过 userspace syscall stub 里的 `ret`，
+		 * 直接落到后续函数/数据区，表现为 shell 一执行 syscall 就跑飞。
+		 */
+        sched_maybe_resched();
 		return;
 	}
 
+    curr = task_current();
+    if (curr && curr->has_exec_image)
+    {
+        /*
+         * 用户态 ELF 任务异常时，优先回收当前任务。
+         * 由上层 supervisor 负责重启 shell，避免整个系统卡死在异常循环里。
+         */
+        printk("[irq\ttrace]: exec task fault pid=%d comm=%s ec=0x%x far_el1=%#lx\n",
+               curr->pid, curr->comm, ec, read_sysreg(far_el1));
+        show_ptregs(regs);
+        dump_backtrace(regs);
+        printk("[irq\ttrace]: fault pc=%#lx inst=%08x\n",
+               regs->s_pc,
+               *(uint32_t *)regs->s_pc);
+        task_exit();
+    }
+
 	show_ptregs(regs);
+    dump_backtrace(regs);
+    printk("[irq\ttrace]: fault pc=%#lx inst=%08x\n",
+	       regs->s_pc,
+	       *(uint32_t *)regs->s_pc);
     printk("[irq\ttrace]: stage=%u iar=%#x aiar=%#x irq=%u eoir=%#x hppir=%u ahppir=%u ctlr=%#x\n",
            irq_debug_stage,
            irq_debug_iar,

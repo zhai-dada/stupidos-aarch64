@@ -19,6 +19,14 @@ enum syscall_no
     SYS_YIELD,
     SYS_GETPID,
     SYS_TIME,
+    SYS_EXIT,
+    SYS_READDIR,
+    SYS_NETTEST,
+    SYS_EXEC,
+    SYS_NETPING,
+    SYS_WAITPID,
+    SYS_SLEEP,
+    SYS_NETCFG,
     SYS_MAX,
 };
 
