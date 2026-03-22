@@ -4,6 +4,20 @@
 #define PING_DEFAULT_INTERVAL_MS  1000
 #define PING_DEFAULT_TIMEOUT_MS   3000
 #define PING_PAYLOAD_BYTES        56
+static int8_t ping_out_buf[256];
+static size_t ping_out_len;
+
+static void ping_flush(void)
+{
+    if (ping_out_len == 0)
+    {
+        return;
+    }
+
+    (void)u_write(STUPIDOS_STDOUT_FILENO, ping_out_buf, ping_out_len);
+    ping_out_len = 0;
+}
+
 static void ping_puts(const int8_t *str)
 {
     if (!str)
@@ -11,12 +25,22 @@ static void ping_puts(const int8_t *str)
         return;
     }
 
+    ping_flush();
     u_puts(str);
 }
 
 static void ping_putc(char ch)
 {
-    u_putc((int8_t)ch);
+    if (ping_out_len >= sizeof(ping_out_buf))
+    {
+        ping_flush();
+    }
+
+    ping_out_buf[ping_out_len++] = (int8_t)ch;
+    if (ch == '\n')
+    {
+        ping_flush();
+    }
 }
 
 static void ping_put_u64(uint64_t value)
@@ -284,6 +308,7 @@ int main(int argc, char **argv)
     if (!target_ip)
     {
         ping_usage();
+        ping_flush();
         return 1;
     }
 
@@ -394,5 +419,6 @@ int main(int argc, char **argv)
         ping_puts((const int8_t *)" ms\n");
     }
 
+    ping_flush();
     return received ? 0 : 1;
 }

@@ -8,6 +8,10 @@
 #define TASK_STACK_SIZE     16384
 #define CONFIG_MAX_TASKS    16
 #define SCHED_LATENCY_TICKS 4
+#define TASK_CWD_LEN        256
+#define TASK_HEAP_PAGES     2048
+#define TASK_HEAP_ORDER     11
+#define TASK_MAX_MMAPS      8
 
 typedef void (*task_entry_t)(void *arg);
 typedef void (*task_cleanup_t)(void *arg);
@@ -45,6 +49,7 @@ struct cpu_context
 struct task_struct
 {
     int32_t pid;
+    int32_t ppid;
     uint32_t cpu;
     bool is_idle;
     enum task_state state;
@@ -60,6 +65,18 @@ struct task_struct
     uint64_t exec_base;
     uint64_t exec_end;
     bool has_exec_image;
+    uint32_t heap_order;
+    uint64_t heap_base;
+    uint64_t heap_brk;
+    uint64_t heap_end;
+    struct
+    {
+        bool used;
+        uint64_t addr;
+        uint64_t size;
+        uint32_t order;
+    } mmaps[TASK_MAX_MMAPS];
+    int8_t cwd[TASK_CWD_LEN];
     int8_t comm[TASK_COMM_LEN];
     struct cpu_context cpu_ctx;
     uint8_t stack[TASK_STACK_SIZE] __attribute__((aligned(16)));
@@ -92,7 +109,10 @@ void sched_show_tasks(void);
 void task_exit(void) __attribute__((noreturn));
 struct task_struct *task_current(void);
 struct task_struct *task_by_pid(int32_t pid);
+void task_wake(struct task_struct *task);
 void task_set_cleanup(task_cleanup_t cleanup, void *arg);
+const int8_t *task_cwd(void);
+int task_set_cwd(const int8_t *path);
 
 /*
  * 汇编实现的上下文切换例程。

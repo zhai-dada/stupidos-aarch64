@@ -27,7 +27,9 @@ GDB_SCRIPT      := $(BUILD_DIR)/stupidos-debug.gdb
 QEMU           :=  qemu-system-aarch64
 NET_MODE       ?=  user
 TAP_IF         ?=  stupidos-tap
+NET_DUMP       ?=
 HOSTFWD_SSH    ?=
+comma          :=  ,
 ifeq ($(strip $(HOSTFWD_SSH)),)
 QEMU_NET_USER  :=  -device virtio-net-device,netdev=net0 -netdev user,id=net0
 else
@@ -35,6 +37,7 @@ QEMU_NET_USER  :=  -device virtio-net-device,netdev=net0 -netdev user,id=net0,ho
 endif
 QEMU_NET_TAP   :=  -netdev tap,id=net0,ifname=$(TAP_IF),script=no,downscript=no -device virtio-net-device,netdev=net0
 QEMU_NET_ARGS  =  $(if $(filter tap,$(NET_MODE)),$(QEMU_NET_TAP),$(QEMU_NET_USER))
+QEMU_NET_DUMP  =  $(if $(strip $(NET_DUMP)),-object filter-dump$(comma)id=netdump$(comma)netdev=net0$(comma)file=$(NET_DUMP))
 
 # Compiler flags
 CFLAGS          :=  -g -Wall -fno-builtin -Iinclude -O0 -march=armv8-a+nofp
@@ -217,6 +220,7 @@ run: $(KERNEL_BIN) $(QEMU_DTB) $(DISK_IMG)
 	-device virtio-keyboard-device -device virtio-tablet-device \
 	-device ramfb \
 	-display gtk \
+	$(QEMU_NET_DUMP) \
 	$(QEMU_NET_ARGS) \
 	-kernel $(KERNEL_BIN) \
 	-dtb $(QEMU_DTB) \
@@ -240,6 +244,7 @@ run-headless: $(KERNEL_BIN) $(QEMU_DTB) $(DISK_IMG)
 	-drive file=$(DISK_IMG),if=none,format=raw,id=hd0 \
 	-device virtio-blk-device,drive=hd0 \
 	-device virtio-keyboard-device -device virtio-tablet-device \
+	$(QEMU_NET_DUMP) \
 	$(QEMU_NET_ARGS) \
 	-kernel $(KERNEL_BIN) \
 	-dtb $(QEMU_DTB) \
@@ -280,15 +285,16 @@ debug: $(KERNEL_BIN) $(KERNEL_KIMAGE_ELF) $(GDB_SCRIPT) $(DISK_IMG)
 		-m 4G \
 		-rtc base=utc,clock=host \
 		-global virtio-mmio.force-legacy=false \
-		-drive file=$(DISK_IMG),if=none,format=raw,id=hd0 \
-		-device virtio-blk-device,drive=hd0 \
-		-device virtio-keyboard-device -device virtio-tablet-device \
-		-device ramfb \
-		-display gtk \
-		-device virtio-net-device,netdev=net0 -netdev user,id=net0\
-		-device virtio-net-pci,netdev=pcinet0,mac=52:54:00:12:34:56 -netdev user,id=pcinet0 \
-		-device virtio-sound-device,audiodev=audio0 -audiodev sdl,id=audio0\
-		-kernel ./build/stupidos.elf \
+	-drive file=$(DISK_IMG),if=none,format=raw,id=hd0 \
+	-device virtio-blk-device,drive=hd0 \
+	-device virtio-keyboard-device -device virtio-tablet-device \
+	-device ramfb \
+	-display gtk \
+	$(QEMU_NET_DUMP) \
+	-device virtio-net-device,netdev=net0 -netdev user,id=net0\
+	-device virtio-net-pci,netdev=pcinet0,mac=52:54:00:12:34:56 -netdev user,id=pcinet0 \
+	-device virtio-sound-device,audiodev=audio0 -audiodev sdl,id=audio0\
+	-kernel ./build/stupidos.elf \
 		-serial mon:stdio \
 		-S -s
 

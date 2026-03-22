@@ -74,6 +74,8 @@ static struct net_probe_state net_probe = {
     .lock = SPINLOCK_INIT,
 };
 static uint32_t net_rx_packet_seen;
+static bool net_ping_cache_log_seen;
+static bool net_ping_arp_log_seen;
 struct net_arp_cache_entry
 {
     bool valid;
@@ -465,7 +467,7 @@ static ssize_t net_send_icmp_echo(struct net_device *dev, const uint8_t dst_mac[
     ip->checksum = 0;
     net_ipv4_to_bytes(dev->ipv4, ip->src);
     net_ipv4_to_bytes(dst_ip, ip->dst);
-    ip->checksum = net_checksum16(ip, sizeof(*ip));
+    ip->checksum = net_bswap16(net_checksum16(ip, sizeof(*ip)));
 
     icmp->type = 8;
     icmp->code = 0;
@@ -478,7 +480,7 @@ static ssize_t net_send_icmp_echo(struct net_device *dev, const uint8_t dst_mac[
         data[i] = (uint8_t)(0x30 + (i & 0x0f));
     }
 
-    icmp->checksum = net_checksum16(icmp, sizeof(*icmp) + payload_len);
+    icmp->checksum = net_bswap16(net_checksum16(icmp, sizeof(*icmp) + payload_len));
     return net_send_frame(dev, dst_mac, NET_ETHERTYPE_IPV4, packet, total_len);
 }
 
@@ -660,11 +662,11 @@ static void net_handle_icmp(struct net_device *dev, const struct net_eth_hdr *et
     memcpy((int8_t *)ricmp, (int8_t *)payload, icmp_len);
     ricmp->type = 0;
     ricmp->checksum = 0;
-    ricmp->checksum = net_checksum16(ricmp, icmp_len);
+    ricmp->checksum = net_bswap16(net_checksum16(ricmp, icmp_len));
 
     ip_total_len = (uint16_t)(sizeof(*rip) + icmp_len);
     rip->total_len = net_bswap16(ip_total_len);
-    rip->checksum = net_checksum16(rip, sizeof(*rip));
+    rip->checksum = net_bswap16(net_checksum16(rip, sizeof(*rip)));
 
     if (dev->tx)
     {
@@ -1014,11 +1016,15 @@ int64_t net_ping(struct net_device *dev, uint32_t target_ip, uint16_t icmp_id, u
 
     if (net_arp_cache_lookup(target_ip, dst_mac) == 0)
     {
-        printk("[net\tping]: resolved target=%u.%u.%u.%u via cache\n",
-               (target_ip >> 24) & 0xff,
-               (target_ip >> 16) & 0xff,
-               (target_ip >> 8) & 0xff,
-               target_ip & 0xff);
+        if (!net_ping_cache_log_seen)
+        {
+            net_ping_cache_log_seen = true;
+            printk("[net\tping]: resolved target=%u.%u.%u.%u via cache\n",
+                   (target_ip >> 24) & 0xff,
+                   (target_ip >> 16) & 0xff,
+                   (target_ip >> 8) & 0xff,
+                   target_ip & 0xff);
+        }
         net_probe_begin(target_ip, true, icmp_id, icmp_seq);
         ret = net_send_icmp_echo(dev, dst_mac, target_ip, icmp_id, icmp_seq);
         if (ret < 0)
@@ -1045,12 +1051,16 @@ int64_t net_ping(struct net_device *dev, uint32_t target_ip, uint16_t icmp_id, u
         return ret == -ETIMEDOUT ? -EHOSTUNREACH : (int64_t)ret;
     }
 
-    printk("[net\tping]: resolved target=%u.%u.%u.%u via arp mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
-           (target_ip >> 24) & 0xff,
-           (target_ip >> 16) & 0xff,
-           (target_ip >> 8) & 0xff,
-           target_ip & 0xff,
-           dst_mac[0], dst_mac[1], dst_mac[2], dst_mac[3], dst_mac[4], dst_mac[5]);
+    if (!net_ping_arp_log_seen)
+    {
+        net_ping_arp_log_seen = true;
+        printk("[net\tping]: resolved target=%u.%u.%u.%u via arp mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+               (target_ip >> 24) & 0xff,
+               (target_ip >> 16) & 0xff,
+               (target_ip >> 8) & 0xff,
+               target_ip & 0xff,
+               dst_mac[0], dst_mac[1], dst_mac[2], dst_mac[3], dst_mac[4], dst_mac[5]);
+    }
     net_probe_begin(target_ip, true, icmp_id, icmp_seq);
     ret = net_send_icmp_echo(dev, dst_mac, target_ip, icmp_id, icmp_seq);
     if (ret < 0)

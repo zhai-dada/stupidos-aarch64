@@ -10,7 +10,67 @@
 
 static spinlock_t uart_log_lock = SPINLOCK_INIT;
 static uint32_t uart_irq_line = UART_IRQ;
-static bool uart_irq_seen;
+static bool uart_quiet_mode;
+
+static int8_t uart_ascii_lower(int8_t ch)
+{
+    if (ch >= 'A' && ch <= 'Z')
+    {
+        return (int8_t)(ch - 'A' + 'a');
+    }
+
+    return ch;
+}
+
+static bool uart_contains_ci(const int8_t *haystack, const int8_t *needle)
+{
+    size_t i;
+    size_t j;
+
+    if (!haystack || !needle || !needle[0])
+    {
+        return false;
+    }
+
+    for (i = 0; haystack[i] != '\0'; i++)
+    {
+        for (j = 0; needle[j] != '\0'; j++)
+        {
+            if (haystack[i + j] == '\0')
+            {
+                return false;
+            }
+
+            if (uart_ascii_lower(haystack[i + j]) != uart_ascii_lower(needle[j]))
+            {
+                break;
+            }
+        }
+
+        if (needle[j] == '\0')
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool uart_log_is_important(const int8_t *fmt)
+{
+    /*
+     * 用户态 shell 已经接管之后，串口日志默认应尽量安静。
+     * 这里保留真正有意义的错误信息，避免把终端重新刷满。
+     */
+    return uart_contains_ci(fmt, (const int8_t *)"error") ||
+           uart_contains_ci(fmt, (const int8_t *)"failed") ||
+           uart_contains_ci(fmt, (const int8_t *)"fail") ||
+           uart_contains_ci(fmt, (const int8_t *)"fault") ||
+           uart_contains_ci(fmt, (const int8_t *)"panic") ||
+           uart_contains_ci(fmt, (const int8_t *)"abort") ||
+           uart_contains_ci(fmt, (const int8_t *)"timeout") ||
+           uart_contains_ci(fmt, (const int8_t *)"Unhandled");
+}
 
 static uint32_t uart_detect_irq_line(void)
 {
@@ -53,6 +113,16 @@ void uart_send_string(int8_t *str)
     uart_send_string_raw(str);
     spin_unlock(&uart_log_lock);
     write_daif(daif);
+}
+
+void uart_set_quiet(bool quiet)
+{
+    uart_quiet_mode = quiet;
+}
+
+bool uart_is_quiet(void)
+{
+    return uart_quiet_mode;
 }
 
 void uart_putc(uint8_t ch)
@@ -126,7 +196,6 @@ void uart_init(void)
     *(uint32_t *)(PL011_UART0_BASE + UART_CR) = UART_CR_UARTEN | UART_CR_TXE | UART_CR_RXE;
 
     uart_irq_line = uart_detect_irq_line();
-    // uart_irq_seen = false;
     irq_handlers[uart_irq_line] = uart_irq_handle;
     gic_enable_irq(uart_irq_line);
 
@@ -152,8 +221,13 @@ int32_t uart_printf(int8_t* front, int8_t* back, const int8_t* fmt, ...)
 
 	va_list args;
 	va_start(args, fmt);
-	i = vsprintf(buffer, fmt, args);
-	va_end(args);
+    i = vsprintf(buffer, fmt, args);
+    va_end(args);
+
+    if (uart_quiet_mode && !uart_log_is_important(buffer) && !uart_log_is_important(fmt))
+    {
+        return i;
+    }
 
     /*
      * 多核环境下串口是全局共享资源。
@@ -180,12 +254,6 @@ void uart_irq_handle(void)
 {
     uint32_t fr;
     uint8_t ch;
-
-    if (!uart_irq_seen)
-    {
-        uart_irq_seen = true;
-        printk("[uart\tirq ]: first rx irq on line %u\n", uart_irq_line);
-    }
 
     while (1)
     {

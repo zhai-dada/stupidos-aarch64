@@ -102,6 +102,15 @@ struct virtio_net_hdr
     uint16_t gso_size;
     uint16_t csum_start;
     uint16_t csum_offset;
+    /*
+     * 这里补一个 2 字节扩展位，兼容部分后端/抓包路径对 virtio-net
+     * 头部的 12 字节布局预期。
+     *
+     * 标准 UAPI 里基础头是 10 字节，但一些实现路径会把最后的
+     * num_buffers/pad 一并当作头部对齐字段处理。我们这里把它显式补齐，
+     * 以避免后端把以太网帧的前 2 字节错当成头部内容。
+     */
+    uint16_t num_buffers;
 } __attribute__((packed));
 
 struct virtio_net_frame
@@ -301,6 +310,7 @@ static ssize_t virtio_net_tx(struct net_device *dev, const void *buf, size_t len
     st->tx_buf.hdr.gso_size = 0;
     st->tx_buf.hdr.csum_start = 0;
     st->tx_buf.hdr.csum_offset = 0;
+    st->tx_buf.hdr.num_buffers = 0;
     memcpy((int8_t *)st->tx_buf.payload, (int8_t *)buf, len);
 
     used_idx = st->tx_last_used;

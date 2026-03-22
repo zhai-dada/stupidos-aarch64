@@ -19,6 +19,7 @@ void tty_init(void);
 void tty_flush_input(void);
 void tty_putc(uint8_t ch);
 void tty_write(const int8_t *str);
+void tty_write_bytes(const void *buf, size_t len);
 int32_t tty_try_getc(void);
 int32_t tty_getc(void);
 void tty_feed_char(uint8_t ch);

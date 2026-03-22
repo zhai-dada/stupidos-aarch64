@@ -103,6 +103,8 @@ int32_t uart_try_getc(void);
 
 void uart_send_string(int8_t *str);
 int32_t uart_printf(int8_t* front, int8_t* back, const int8_t* fmt, ...);
+void uart_set_quiet(bool quiet);
+bool uart_is_quiet(void);
 
 void uart_irq_handle(void);
 

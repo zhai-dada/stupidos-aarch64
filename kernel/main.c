@@ -229,6 +229,15 @@ static __attribute__((noreturn)) void kernel_main_high(void)
      */
     printk("[boot\tinit]: shell start\n");
     shell_init();
+    if (shell_foreground_pid() >= 0)
+    {
+        /*
+         * 用户态 shell 接管后，把串口日志收敛为静音模式。
+         * 这样正常交互不会再被大量内核 init/debug 日志刷屏，
+         * 但真正的 error/failed 类信息仍然会保留。
+         */
+        uart_set_quiet(true);
+    }
 
     /*
      * 这一轮先保留最小内核线程框架：

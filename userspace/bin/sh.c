@@ -1,8 +1,12 @@
 #include "stupidos_user.h"
+#include "errno.h"
 
 #define SH_LINE_MAX 256
 #define SH_MAX_ARGS  8
 #define SH_READ_CHUNK 128
+#define SH_CWD_MAX STUPIDOS_PATH_MAX
+#define SH_PROMPT_MAX (SH_CWD_MAX + 32)
+#define SH_HISTORY_MAX 16
 
 /*
  * shell 运行在一个很低层的环境里，syscall / IRQ / 调度都会反复打断它。
@@ -13,6 +17,10 @@ static int8_t sh_line_buf[SH_LINE_MAX];
 static int8_t sh_arg_storage[SH_MAX_ARGS][SH_LINE_MAX];
 static int8_t *sh_argv_buf[SH_MAX_ARGS];
 static int8_t sh_cmd_buf[SH_LINE_MAX];
+static int8_t sh_cwd_buf[SH_CWD_MAX];
+static int8_t sh_prompt_buf[SH_PROMPT_MAX];
+static int8_t sh_history[SH_HISTORY_MAX][SH_LINE_MAX];
+static uint32_t sh_history_count;
 
 static void sh_puts(const int8_t *str)
 {
@@ -23,9 +31,136 @@ static void sh_puts(const int8_t *str)
     u_putsn(str, u_strnlen(str, 4096));
 }
 
-static void sh_putc(int8_t ch)
+static int sh_exec_path(const int8_t *path, int argc, int8_t *argv[]);
+
+static void sh_put_u64(uint64_t value)
 {
-    u_putc(ch);
+    int8_t buf[32];
+    size_t pos;
+
+    pos = sizeof(buf);
+    buf[--pos] = '\0';
+    if (value == 0)
+    {
+        buf[--pos] = '0';
+        sh_puts(&buf[pos]);
+        return;
+    }
+
+    while (value > 0 && pos > 0)
+    {
+        buf[--pos] = (int8_t)('0' + (value % 10ULL));
+        value /= 10ULL;
+    }
+
+    sh_puts(&buf[pos]);
+}
+
+static void sh_put_hex_u64(uint64_t value)
+{
+    int8_t buf[34];
+    size_t pos;
+    static const int8_t hex[] = "0123456789abcdef";
+
+    pos = sizeof(buf);
+    buf[--pos] = '\0';
+    if (value == 0)
+    {
+        buf[--pos] = '0';
+        buf[--pos] = 'x';
+        sh_puts(&buf[pos]);
+        return;
+    }
+
+    while (value > 0 && pos > 2)
+    {
+        buf[--pos] = hex[value & 0xfULL];
+        value >>= 4;
+    }
+    buf[--pos] = 'x';
+    buf[--pos] = '0';
+    sh_puts(&buf[pos]);
+}
+
+static int8_t sh_mode_type_char(uint32_t mode)
+{
+    switch (mode & STUPIDOS_VFS_S_IFMT)
+    {
+    case STUPIDOS_VFS_S_IFDIR:
+        return 'd';
+    case STUPIDOS_VFS_S_IFCHR:
+        return 'c';
+    case STUPIDOS_VFS_S_IFREG:
+        return '-';
+    default:
+        return '?';
+    }
+}
+
+static void sh_mode_perm_string(uint32_t mode, int8_t out[11])
+{
+    out[0] = sh_mode_type_char(mode);
+    out[1] = (mode & STUPIDOS_VFS_S_IRUSR) ? 'r' : '-';
+    out[2] = (mode & STUPIDOS_VFS_S_IWUSR) ? 'w' : '-';
+    out[3] = (mode & STUPIDOS_VFS_S_IXUSR) ? 'x' : '-';
+    out[4] = (mode & STUPIDOS_VFS_S_IRGRP) ? 'r' : '-';
+    out[5] = (mode & STUPIDOS_VFS_S_IWGRP) ? 'w' : '-';
+    out[6] = (mode & STUPIDOS_VFS_S_IXGRP) ? 'x' : '-';
+    out[7] = (mode & STUPIDOS_VFS_S_IROTH) ? 'r' : '-';
+    out[8] = (mode & STUPIDOS_VFS_S_IWOTH) ? 'w' : '-';
+    out[9] = (mode & STUPIDOS_VFS_S_IXOTH) ? 'x' : '-';
+    out[10] = '\0';
+}
+
+static void sh_refresh_cwd(void)
+{
+    int64_t ret;
+
+    /*
+     * prompt 不需要每次都重新向内核要 cwd。
+     * 这里把 cwd 作为 shell 自己的状态缓存下来：
+     * - 启动时刷新一次
+     * - cd 成功后刷新一次
+     * - pwd 直接打印缓存值
+     */
+    u_memset(sh_cwd_buf, 0, sizeof(sh_cwd_buf));
+    ret = u_getcwd(sh_cwd_buf, sizeof(sh_cwd_buf));
+    if (ret < 0 || sh_cwd_buf[0] == '\0')
+    {
+        u_memset(sh_cwd_buf, 0, sizeof(sh_cwd_buf));
+        u_memcpy(sh_cwd_buf, (const int8_t *)"/", 2);
+    }
+}
+
+static void sh_redraw_line(const int8_t *line)
+{
+    /*
+     * 重绘当前输入行：
+     * - 回到行首
+     * - 打印 prompt
+     * - 打印当前缓冲
+     * - 用 ANSI 清到行尾，避免旧字符残留
+     */
+    (void)u_write(STUPIDOS_STDOUT_FILENO, (const int8_t *)"\r", 1);
+    if (sh_prompt_buf[0] != '\0')
+    {
+        sh_puts(sh_prompt_buf);
+    }
+    if (line && line[0] != '\0')
+    {
+        sh_puts(line);
+    }
+    (void)u_write(STUPIDOS_STDOUT_FILENO, (const int8_t *)"\x1b[K", 3);
+}
+
+static int32_t sh_history_oldest_index(void)
+{
+    if (sh_history_count <= SH_HISTORY_MAX)
+    {
+        return 0;
+    }
+
+    return (int32_t)(sh_history_count - SH_HISTORY_MAX);
 }
 
 static bool sh_is_space(char ch)
@@ -85,13 +220,25 @@ static int sh_read_line(int8_t *line, size_t max_len)
     uint8_t chunk[SH_READ_CHUNK];
     uint8_t ch;
     ssize_t nread;
+    int32_t history_pos;
+    int32_t history_oldest;
+    size_t saved_len;
+    int8_t saved_line[SH_LINE_MAX];
+    uint8_t esc_state;
+    bool esc_seq_active;
 
     /*
      * 每轮先清空输入缓冲，避免上一条命令残留在空输入或异常中断后
      * 被误当作新命令继续解析。
      */
     u_memset(line, 0, max_len);
+    u_memset(saved_line, 0, sizeof(saved_line));
     len = 0;
+    saved_len = 0;
+    history_pos = -1;
+    history_oldest = 0;
+    esc_state = 0;
+    esc_seq_active = false;
     while (1)
     {
         /*
@@ -125,14 +272,98 @@ static int sh_read_line(int8_t *line, size_t max_len)
         {
             ch = chunk[i];
 
+            if (esc_state != 0)
+            {
+                if (esc_state == 1)
+                {
+                    if (ch == '[')
+                    {
+                        esc_state = 2;
+                    }
+                    else
+                    {
+                        esc_state = 0;
+                    }
+                    continue;
+                }
+
+                if (esc_state == 2)
+                {
+                    esc_state = 0;
+                    if (ch == 'A' || ch == 'B')
+                    {
+                        uint32_t history_count;
+                        const int8_t *src;
+
+                        history_count = sh_history_count;
+                        if (history_count == 0)
+                        {
+                            continue;
+                        }
+
+                        if (!esc_seq_active)
+                        {
+                            u_memset(saved_line, 0, sizeof(saved_line));
+                            u_memcpy(saved_line, line, len);
+                            saved_len = len;
+                            esc_seq_active = true;
+                            history_pos = (int32_t)history_count - 1;
+                            history_oldest = sh_history_oldest_index();
+                        }
+
+                        if (ch == 'A')
+                        {
+                            if (history_pos > history_oldest)
+                            {
+                                history_pos--;
+                            }
+                        }
+                        else if (ch == 'B')
+                        {
+                            if (history_pos < (int32_t)history_count - 1)
+                            {
+                                history_pos++;
+                            }
+                            else
+                            {
+                                history_pos = -1;
+                            }
+                        }
+
+                        u_memset(line, 0, max_len);
+                        if (history_pos >= 0)
+                        {
+                            src = sh_history[(uint32_t)history_pos % SH_HISTORY_MAX];
+                            u_memcpy(line, src, u_strnlen(src, max_len - 1));
+                            len = u_strnlen(src, max_len - 1);
+                        }
+                        else
+                        {
+                            u_memcpy(line, saved_line, saved_len);
+                            len = saved_len;
+                        }
+
+                        line[len] = '\0';
+                        sh_redraw_line(line);
+                    }
+                    continue;
+                }
+            }
+
+            if (ch == 0x1b)
+            {
+                esc_state = 1;
+                continue;
+            }
+
             /*
              * tty 层已经在内核里接好了中断输入，这里只做最小行编辑。
              * shell 不需要知道底层是 UART 还是 virtio keyboard。
              */
             if (ch == '\r' || ch == '\n')
             {
-                sh_puts((const int8_t *)"\r\n");
                 line[len] = '\0';
+                esc_seq_active = false;
                 return (int)len;
             }
 
@@ -141,7 +372,7 @@ static int sh_read_line(int8_t *line, size_t max_len)
                 if (len > 0)
                 {
                     len--;
-                    sh_puts((const int8_t *)"\b \b");
+                    line[len] = '\0';
                 }
                 continue;
             }
@@ -157,7 +388,7 @@ static int sh_read_line(int8_t *line, size_t max_len)
             }
 
             line[len++] = (int8_t)ch;
-            sh_putc((char)ch);
+            line[len] = '\0';
         }
     }
 }
@@ -166,6 +397,15 @@ static void sh_help(void)
 {
     sh_puts((const int8_t *)"commands:\r\n");
     sh_puts((const int8_t *)"  help            - show this message\r\n");
+    sh_puts((const int8_t *)"  cd <path>       - change current directory\r\n");
+    sh_puts((const int8_t *)"  pwd             - print current directory\r\n");
+    sh_puts((const int8_t *)"  history         - show recent commands\r\n");
+    sh_puts((const int8_t *)"  !!              - repeat last command\r\n");
+    sh_puts((const int8_t *)"  clear           - clear the terminal screen\r\n");
+    sh_puts((const int8_t *)"  echo [args...]  - print arguments\r\n");
+    sh_puts((const int8_t *)"  stat [path]     - show file metadata\r\n");
+    sh_puts((const int8_t *)"  uname           - show system identity\r\n");
+    sh_puts((const int8_t *)"  time            - show current time\r\n");
     sh_puts((const int8_t *)"  run <path> ...  - run an ELF program\r\n");
     sh_puts((const int8_t *)"  ls [path]       - execute /bin/ls\r\n");
     sh_puts((const int8_t *)"  cat <path>      - execute /bin/cat\r\n");
@@ -173,6 +413,386 @@ static void sh_help(void)
     sh_puts((const int8_t *)"  sleep [args]    - execute /bin/sleep\r\n");
     sh_puts((const int8_t *)"  netcfg ...      - execute /bin/netcfg\r\n");
     sh_puts((const int8_t *)"  exit            - exit shell\r\n");
+}
+
+static size_t sh_prompt(void)
+{
+    size_t len;
+
+    u_memset(sh_prompt_buf, 0, sizeof(sh_prompt_buf));
+    if (sh_cwd_buf[0] == '\0')
+    {
+        sh_refresh_cwd();
+    }
+
+    len = 0;
+    u_memcpy(&sh_prompt_buf[len], (const int8_t *)"stupidos:", sizeof("stupidos:") - 1);
+    len += sizeof("stupidos:") - 1;
+    u_memcpy(&sh_prompt_buf[len], sh_cwd_buf, u_strnlen(sh_cwd_buf, sizeof(sh_cwd_buf) - 1));
+    len += u_strnlen(sh_cwd_buf, sizeof(sh_cwd_buf) - 1);
+    u_memcpy(&sh_prompt_buf[len], (const int8_t *)"$ ", sizeof("$ ") - 1);
+    len += sizeof("$ ") - 1;
+    sh_prompt_buf[len] = '\0';
+    (void)u_write(STUPIDOS_STDOUT_FILENO, sh_prompt_buf, len);
+    return len;
+}
+
+static void sh_history_add(const int8_t *line)
+{
+    uint32_t slot;
+
+    if (!line || line[0] == '\0')
+    {
+        return;
+    }
+
+    slot = sh_history_count % SH_HISTORY_MAX;
+    u_memset(sh_history[slot], 0, sizeof(sh_history[slot]));
+    u_memcpy(sh_history[slot], line, u_strnlen(line, SH_LINE_MAX - 1));
+    sh_history[slot][SH_LINE_MAX - 1] = '\0';
+    sh_history_count++;
+}
+
+static int sh_history_expand(int8_t *line, size_t line_len)
+{
+    const int8_t *src;
+    size_t len;
+    uint32_t index;
+
+    if (!line || line_len == 0)
+    {
+        return -1;
+    }
+
+    if (line[0] != '!')
+    {
+        return 0;
+    }
+
+    if (line[1] == '\0')
+    {
+        if (sh_history_count == 0)
+        {
+            return -1;
+        }
+
+        src = sh_history[(sh_history_count - 1) % SH_HISTORY_MAX];
+    }
+    else if (line[1] == '!' && line[2] == '\0')
+    {
+        if (sh_history_count == 0)
+        {
+            return -1;
+        }
+
+        src = sh_history[(sh_history_count - 1) % SH_HISTORY_MAX];
+    }
+    else
+    {
+        index = 0;
+        for (len = 1; line[len] != '\0'; len++)
+        {
+            if (line[len] < '0' || line[len] > '9')
+            {
+                return -1;
+            }
+
+            index = index * 10U + (uint32_t)(line[len] - '0');
+        }
+
+        if (index == 0 || index > sh_history_count)
+        {
+            return -1;
+        }
+
+        src = sh_history[(index - 1) % SH_HISTORY_MAX];
+    }
+
+    u_memset(line, 0, line_len);
+    u_memcpy(line, src, u_strnlen(src, line_len - 1));
+    line[line_len - 1] = '\0';
+    return 1;
+}
+
+static void sh_history_print(void)
+{
+    uint32_t start;
+    uint32_t i;
+    uint32_t count;
+
+    count = (sh_history_count < SH_HISTORY_MAX) ? sh_history_count : SH_HISTORY_MAX;
+    if (count == 0)
+    {
+        sh_puts((const int8_t *)"history: empty\r\n");
+        return;
+    }
+
+    start = (sh_history_count > SH_HISTORY_MAX) ? (sh_history_count - SH_HISTORY_MAX) : 0;
+    for (i = 0; i < count; i++)
+    {
+        uint32_t slot;
+
+        slot = (start + i) % SH_HISTORY_MAX;
+        sh_puts((const int8_t *)"  ");
+        {
+            int8_t num_buf[16];
+            int8_t *p;
+            uint32_t n;
+
+            p = &num_buf[sizeof(num_buf) - 1];
+            *p = '\0';
+            n = start + i + 1;
+            if (n == 0)
+            {
+                *--p = '0';
+            }
+            else
+            {
+                while (n > 0 && p > num_buf)
+                {
+                    *--p = (int8_t)('0' + (n % 10U));
+                    n /= 10U;
+                }
+            }
+            sh_puts(p);
+        }
+        sh_puts((const int8_t *)"  ");
+        sh_puts(sh_history[slot]);
+        sh_puts((const int8_t *)"\r\n");
+    }
+}
+
+static void sh_clear_screen(void)
+{
+    /*
+     * 清屏后回到左上角。
+     * shell 下一轮会重新打印 prompt，所以这里只做最小的终端清理。
+     */
+    (void)u_write(STUPIDOS_STDOUT_FILENO, (const int8_t *)"\x1b[2J\x1b[H", 7);
+}
+
+static void sh_echo(int argc, int8_t *argv[])
+{
+    int i;
+    bool newline;
+
+    newline = true;
+    i = 1;
+    if (argc > 1 && u_strcmp(argv[1], (const int8_t *)"-n") == 0)
+    {
+        newline = false;
+        i = 2;
+    }
+
+    for (; i < argc; i++)
+    {
+        if (argv[i])
+        {
+            sh_puts(argv[i]);
+        }
+
+        if (i + 1 < argc)
+        {
+            sh_puts((const int8_t *)" ");
+        }
+    }
+
+    if (newline)
+    {
+        sh_puts((const int8_t *)"\r\n");
+    }
+}
+
+static void sh_stat_cmd(const int8_t *path)
+{
+    struct stupidos_stat st;
+    int8_t perm[11];
+    int ret;
+
+    ret = u_stat(path, &st);
+    if (ret < 0)
+    {
+        sh_puts((const int8_t *)"stat: failed\r\n");
+        return;
+    }
+
+    sh_puts((const int8_t *)"\r\n");
+    sh_puts((const int8_t *)"  File: ");
+    sh_puts(path);
+    sh_puts((const int8_t *)"\r\n");
+    sh_mode_perm_string((uint32_t)st.mode, perm);
+    sh_puts((const int8_t *)"  Mode: ");
+    sh_puts(perm);
+    sh_puts((const int8_t *)" (");
+    sh_put_hex_u64((uint64_t)st.mode);
+    sh_puts((const int8_t *)")\r\n");
+    sh_puts((const int8_t *)"  Links: ");
+    sh_put_u64((uint64_t)st.nlink);
+    sh_puts((const int8_t *)"  UID: ");
+    sh_put_u64((uint64_t)st.uid);
+    sh_puts((const int8_t *)"  GID: ");
+    sh_put_u64((uint64_t)st.gid);
+    sh_puts((const int8_t *)"\r\n");
+    sh_puts((const int8_t *)"  Size: ");
+    sh_put_u64(st.size);
+    sh_puts((const int8_t *)"  Blocks: ");
+    sh_put_u64(st.blocks);
+    sh_puts((const int8_t *)"  Blksize: ");
+    sh_put_u64((uint64_t)st.blksize);
+    sh_puts((const int8_t *)"\r\n  Ino: ");
+    sh_put_u64((uint64_t)st.ino);
+    sh_puts((const int8_t *)"\r\n");
+}
+
+static void sh_uname_cmd(void)
+{
+    struct stupidos_utsname uts;
+    int ret;
+
+    ret = u_uname(&uts);
+    if (ret < 0)
+    {
+        sh_puts((const int8_t *)"uname: failed\r\n");
+        return;
+    }
+
+    sh_puts((const int8_t *)"\r\n");
+    sh_puts(uts.sysname);
+    sh_puts((const int8_t *)" ");
+    sh_puts(uts.nodename);
+    sh_puts((const int8_t *)" ");
+    sh_puts(uts.release);
+    sh_puts((const int8_t *)" ");
+    sh_puts(uts.version);
+    sh_puts((const int8_t *)" ");
+    sh_puts(uts.machine);
+    sh_puts((const int8_t *)"\r\n");
+}
+
+static void sh_time_cmd(void)
+{
+    struct stupidos_timeval tv;
+    int64_t ret;
+
+    ret = u_gettimeofday(&tv);
+    if (ret < 0)
+    {
+        sh_puts((const int8_t *)"time: failed\r\n");
+        return;
+    }
+
+    sh_puts((const int8_t *)"\r\ntime=");
+    sh_put_u64((uint64_t)tv.tv_sec);
+    sh_puts((const int8_t *)".");
+    if (tv.tv_usec < 100000)
+    {
+        sh_puts((const int8_t *)"0");
+        if (tv.tv_usec < 10000)
+        {
+            sh_puts((const int8_t *)"0");
+            if (tv.tv_usec < 1000)
+            {
+                sh_puts((const int8_t *)"0");
+                if (tv.tv_usec < 100)
+                {
+                    sh_puts((const int8_t *)"0");
+                    if (tv.tv_usec < 10)
+                    {
+                        sh_puts((const int8_t *)"0");
+                    }
+                }
+            }
+        }
+    }
+    sh_put_u64((uint64_t)tv.tv_usec);
+    sh_puts((const int8_t *)" s\r\n");
+}
+
+static bool sh_contains_slash(const int8_t *path)
+{
+    size_t i;
+
+    if (!path)
+    {
+        return false;
+    }
+
+    for (i = 0; path[i] != '\0'; i++)
+    {
+        if (path[i] == '/')
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static int sh_exec_search(int argc, int8_t *argv[])
+{
+    /*
+     * 这里不能用“字符串指针数组”保存前缀。
+     *
+     * 我们当前的 userspace ELF 加载器只负责把段复制到目标地址，
+     * 不做动态重定位。若把 `const char *prefixes[]` 直接编进 rodata，
+     * 里面的指针值会保留为链接期地址（例如 0x24e0 这种低地址）。
+     * 一旦 shell 运行到这里，就会把这些旧地址当真实指针使用并触发异常。
+     *
+     * 改成二维字符数组后，每个前缀都跟随本体存放，不再依赖重定位。
+     */
+    static const int8_t prefixes[][16] =
+    {
+        "",
+        "/bin/",
+        "/usr/bin/",
+        "/sbin/",
+    };
+    int8_t path[STUPIDOS_PATH_MAX];
+    size_t arg_len;
+    size_t prefix_len;
+    size_t i;
+    int ret;
+
+    if (argc <= 0 || !argv || !argv[0] || argv[0][0] == '\0')
+    {
+        return -EINVAL;
+    }
+
+    if (sh_contains_slash(argv[0]))
+    {
+        return sh_exec_path(argv[0], argc, argv);
+    }
+
+    arg_len = u_strnlen(argv[0], sizeof(path) - 1);
+    for (i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++)
+    {
+        prefix_len = u_strnlen(prefixes[i], sizeof(prefixes[i]) - 1);
+        if (prefix_len + arg_len + 1 > sizeof(path))
+        {
+            continue;
+        }
+
+        u_memset(path, 0, sizeof(path));
+        if (prefix_len)
+        {
+            u_memcpy(path, prefixes[i], prefix_len);
+        }
+        u_memcpy(path + prefix_len, argv[0], arg_len);
+        path[prefix_len + arg_len] = '\0';
+
+        ret = sh_exec_path(path, argc, argv);
+        if (ret >= 0)
+        {
+            return ret;
+        }
+
+        if (ret != -ENOENT)
+        {
+            return ret;
+        }
+    }
+
+    return -ENOENT;
 }
 
 static int sh_exec_path(const int8_t *path, int argc, int8_t *argv[])
@@ -199,17 +819,24 @@ int main(void)
     int argc;
     int ret;
     size_t cmd_len;
+    size_t prompt_len;
 
     (void)u_write(STUPIDOS_STDOUT_FILENO,
                   (const int8_t *)"\r\nstupidos userspace shell\r\n",
                   sizeof("\r\nstupidos userspace shell\r\n") - 1);
+    sh_refresh_cwd();
 
     while (1)
     {
-        (void)u_write(STUPIDOS_STDOUT_FILENO,
-                      (const int8_t *)"stupidos$ ",
-                      sizeof("stupidos$ ") - 1);
+        prompt_len = sh_prompt();
+        (void)prompt_len;
         argc = sh_read_line(sh_line_buf, sizeof(sh_line_buf));
+        ret = sh_history_expand(sh_line_buf, sizeof(sh_line_buf));
+        if (ret < 0)
+        {
+            sh_puts((const int8_t *)"history: no such entry\r\n");
+            continue;
+        }
         u_memset(sh_argv_buf, 0, sizeof(sh_argv_buf));
         u_memset(sh_arg_storage, 0, sizeof(sh_arg_storage));
         argc = sh_parse_line(sh_line_buf, sh_argv_buf, SH_MAX_ARGS);
@@ -245,11 +872,40 @@ int main(void)
         if (u_strcmp(sh_cmd_buf, (const int8_t *)"help") == 0)
         {
             sh_help();
+            sh_history_add(sh_line_buf);
+            continue;
+        }
+
+        if (u_strcmp(sh_cmd_buf, (const int8_t *)"pwd") == 0)
+        {
+            sh_refresh_cwd();
+            sh_puts(sh_cwd_buf);
+            sh_puts((const int8_t *)"\r\n");
+            sh_history_add(sh_line_buf);
+            continue;
+        }
+
+        if (u_strcmp(sh_cmd_buf, (const int8_t *)"cd") == 0)
+        {
+            const int8_t *target;
+
+            target = (argc >= 2 && sh_argv_buf[1]) ? (const int8_t *)sh_argv_buf[1] : (const int8_t *)"/";
+            ret = (int)u_chdir(target);
+            if (ret < 0)
+            {
+                sh_puts((const int8_t *)"cd: failed\r\n");
+            }
+            else
+            {
+                sh_refresh_cwd();
+            }
+            sh_history_add(sh_line_buf);
             continue;
         }
 
         if (u_strcmp(sh_cmd_buf, (const int8_t *)"exit") == 0)
         {
+            sh_history_add(sh_line_buf);
             u_exit(0);
         }
 
@@ -268,61 +924,64 @@ int main(void)
                 continue;
             }
 
+            sh_history_add(sh_line_buf);
             continue;
         }
 
-        if (u_strcmp(sh_cmd_buf, (const int8_t *)"ls") == 0)
+        if (u_strcmp(sh_cmd_buf, (const int8_t *)"history") == 0)
         {
-            ret = sh_exec_path((const int8_t *)"/bin/ls", argc, sh_argv_buf);
-            if (ret < 0)
-            {
-                sh_puts((const int8_t *)"ls: exec failed\r\n");
-            }
+            sh_history_print();
+            sh_history_add(sh_line_buf);
             continue;
         }
 
-        if (u_strcmp(sh_cmd_buf, (const int8_t *)"cat") == 0)
+        if (u_strcmp(sh_cmd_buf, (const int8_t *)"clear") == 0)
         {
-            ret = sh_exec_path((const int8_t *)"/bin/cat", argc, sh_argv_buf);
-            if (ret < 0)
-            {
-                sh_puts((const int8_t *)"cat: exec failed\r\n");
-            }
+            sh_clear_screen();
+            sh_history_add(sh_line_buf);
             continue;
         }
 
-        if (u_strcmp(sh_cmd_buf, (const int8_t *)"ping") == 0 ||
-            u_strcmp(sh_cmd_buf, (const int8_t *)"nettest") == 0)
+        if (u_strcmp(sh_cmd_buf, (const int8_t *)"echo") == 0)
         {
-            ret = sh_exec_path((const int8_t *)"/bin/ping", argc, sh_argv_buf);
-            if (ret < 0)
-            {
-                sh_puts((const int8_t *)"ping: exec failed\r\n");
-            }
+            sh_echo(argc, sh_argv_buf);
+            sh_history_add(sh_line_buf);
             continue;
         }
 
-        if (u_strcmp(sh_cmd_buf, (const int8_t *)"sleep") == 0)
+        if (u_strcmp(sh_cmd_buf, (const int8_t *)"stat") == 0)
         {
-            ret = sh_exec_path((const int8_t *)"/bin/sleep", argc, sh_argv_buf);
-            if (ret < 0)
-            {
-                sh_puts((const int8_t *)"sleep: exec failed\r\n");
-            }
+            const int8_t *target;
+
+            target = (argc >= 2 && sh_argv_buf[1]) ? (const int8_t *)sh_argv_buf[1] : sh_cwd_buf;
+            sh_stat_cmd(target);
+            sh_history_add(sh_line_buf);
             continue;
         }
 
-        if (u_strcmp(sh_cmd_buf, (const int8_t *)"netcfg") == 0)
+        if (u_strcmp(sh_cmd_buf, (const int8_t *)"uname") == 0)
         {
-            ret = sh_exec_path((const int8_t *)"/bin/netcfg", argc, sh_argv_buf);
-            if (ret < 0)
-            {
-                sh_puts((const int8_t *)"netcfg: exec failed\r\n");
-            }
+            sh_uname_cmd();
+            sh_history_add(sh_line_buf);
+            continue;
+        }
+
+        if (u_strcmp(sh_cmd_buf, (const int8_t *)"time") == 0)
+        {
+            sh_time_cmd();
+            sh_history_add(sh_line_buf);
+            continue;
+        }
+
+        ret = sh_exec_search(argc, sh_argv_buf);
+        if (ret >= 0)
+        {
+            sh_history_add(sh_line_buf);
             continue;
         }
 
         sh_puts((const int8_t *)"unknown command\r\n");
+        sh_history_add(sh_line_buf);
     }
 
     return 0;

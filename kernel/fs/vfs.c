@@ -1,5 +1,6 @@
 #include "fs/vfs.h"
 #include "errno.h"
+#include "sched.h"
 #include "lib/libmem.h"
 #include "printk.h"
 
@@ -47,6 +48,208 @@ static bool vfs_is_reg(struct vfs_inode *inode)
 static bool vfs_is_valid_dirent(const struct vfs_dirent *dirent)
 {
     return dirent && dirent->name[0] != '\0';
+}
+
+static void vfs_fill_stat_from_inode(const struct vfs_inode *inode, struct vfs_stat *out)
+{
+    if (!inode || !out)
+    {
+        return;
+    }
+
+    memset((int8_t *)out, 0, sizeof(*out));
+    out->ino = inode->ino;
+    out->mode = inode->mode;
+    out->nlink = inode->nlink ? inode->nlink : 1;
+    out->uid = inode->uid;
+    out->gid = inode->gid;
+    out->size = inode->size;
+    out->blocks = inode->blocks ? inode->blocks : ((inode->size + 511ULL) >> 9);
+    out->blksize = inode->blksize ? inode->blksize : 4096;
+}
+
+static int vfs_path_reset(int8_t *path, size_t out_len)
+{
+    if (!path || out_len < 2)
+    {
+        return -EINVAL;
+    }
+
+    path[0] = '/';
+    path[1] = '\0';
+    return 0;
+}
+
+static int vfs_path_pop(int8_t *path)
+{
+    size_t len;
+
+    if (!path)
+    {
+        return -EINVAL;
+    }
+
+    len = strlen(path);
+    if (len <= 1)
+    {
+        path[0] = '/';
+        path[1] = '\0';
+        return 0;
+    }
+
+    while (len > 1 && path[len - 1] == '/')
+    {
+        len--;
+    }
+
+    while (len > 1 && path[len - 1] != '/')
+    {
+        len--;
+    }
+
+    if (len == 0)
+    {
+        len = 1;
+    }
+
+    path[len] = '\0';
+    if (path[0] != '/')
+    {
+        path[0] = '/';
+        path[1] = '\0';
+    }
+
+    return 0;
+}
+
+static int vfs_path_push(int8_t *path, size_t out_len, const int8_t *name, size_t name_len)
+{
+    size_t path_len;
+
+    if (!path || !name || name_len == 0)
+    {
+        return -EINVAL;
+    }
+
+    if (name_len == 1 && name[0] == '.')
+    {
+        return 0;
+    }
+
+    if (name_len == 2 && name[0] == '.' && name[1] == '.')
+    {
+        return vfs_path_pop(path);
+    }
+
+    path_len = strlen(path);
+    if (path_len == 0)
+    {
+        if (vfs_path_reset(path, out_len))
+        {
+            return -EINVAL;
+        }
+        path_len = 1;
+    }
+
+    if (path_len > 1 && path[path_len - 1] != '/')
+    {
+        if (path_len + 1 >= out_len)
+        {
+            return -ENAMETOOLONG;
+        }
+        path[path_len++] = '/';
+        path[path_len] = '\0';
+    }
+
+    if (path_len + name_len >= out_len)
+    {
+        return -ENAMETOOLONG;
+    }
+
+    memcpy(path + path_len, (int8_t *)name, name_len);
+    path[path_len + name_len] = '\0';
+    return 0;
+}
+
+static int vfs_path_apply(int8_t *path, size_t out_len, const int8_t *src)
+{
+    size_t i;
+
+    if (!path || !src)
+    {
+        return -EINVAL;
+    }
+
+    i = 0;
+    while (src[i] != '\0')
+    {
+        size_t start;
+        size_t len;
+        int ret;
+
+        while (src[i] == '/')
+        {
+            i++;
+        }
+
+        if (src[i] == '\0')
+        {
+            break;
+        }
+
+        start = i;
+        while (src[i] != '\0' && src[i] != '/')
+        {
+            i++;
+        }
+        len = i - start;
+
+        ret = vfs_path_push(path, out_len, &src[start], len);
+        if (ret)
+        {
+            return ret;
+        }
+    }
+
+    return 0;
+}
+
+int vfs_canonicalize_path(const int8_t *path, int8_t *out, size_t out_len)
+{
+    const int8_t *cwd;
+    int ret;
+
+    if (!path || !out || out_len < 2)
+    {
+        return -EINVAL;
+    }
+
+    ret = vfs_path_reset(out, out_len);
+    if (ret)
+    {
+        return ret;
+    }
+
+    if (path[0] != '/')
+    {
+        cwd = task_cwd();
+        if (cwd && cwd[0] == '/')
+        {
+            ret = vfs_path_apply(out, out_len, cwd);
+            if (ret)
+            {
+                return ret;
+            }
+        }
+    }
+
+    ret = vfs_path_apply(out, out_len, path);
+    if (ret)
+    {
+        return ret;
+    }
+
+    return 0;
 }
 
 static bool vfs_mount_path_match(const struct vfs_mount *mnt, const int8_t *path)
@@ -180,6 +383,7 @@ static int vfs_lookup_path_from(struct vfs_inode *root, const int8_t *path, stru
 
 static int vfs_lookup_path(const int8_t *path, struct vfs_inode *out)
 {
+    int8_t resolved[VFS_PATH_MAX];
     struct vfs_mount *mnt;
     const int8_t *subpath;
     int ret;
@@ -189,12 +393,18 @@ static int vfs_lookup_path(const int8_t *path, struct vfs_inode *out)
         return -ENODEV;
     }
 
-    if (!path || path[0] != '/')
+    if (!path)
     {
         return -EINVAL;
     }
 
-    ret = vfs_resolve_mount(path, &mnt, &subpath);
+    ret = vfs_canonicalize_path(path, resolved, sizeof(resolved));
+    if (ret)
+    {
+        return ret;
+    }
+
+    ret = vfs_resolve_mount(resolved, &mnt, &subpath);
     if (ret)
     {
         return ret;
@@ -247,6 +457,32 @@ int vfs_mount_root(struct vfs_superblock *sb, struct vfs_inode *root)
 {
     memset((int8_t *)&vfs_state, 0, sizeof(vfs_state));
     return vfs_mount((const int8_t *)"/", sb, root);
+}
+
+int vfs_chdir(const int8_t *path)
+{
+    int8_t resolved[VFS_PATH_MAX];
+    struct vfs_inode inode;
+    int ret;
+
+    ret = vfs_canonicalize_path(path, resolved, sizeof(resolved));
+    if (ret)
+    {
+        return ret;
+    }
+
+    ret = vfs_lookup_path(resolved, &inode);
+    if (ret)
+    {
+        return ret;
+    }
+
+    if (!vfs_is_dir(&inode))
+    {
+        return -ENOTDIR;
+    }
+
+    return task_set_cwd(resolved);
 }
 
 int vfs_readdir(const int8_t *path, uint32_t index, struct vfs_dirent *out)
@@ -318,6 +554,61 @@ int vfs_open(const int8_t *path, int flags)
     return -EMFILE;
 }
 
+int vfs_stat(const int8_t *path, struct vfs_stat *out)
+{
+    struct vfs_inode inode;
+    int ret;
+
+    if (!out)
+    {
+        return -EINVAL;
+    }
+
+    memset((int8_t *)out, 0, sizeof(*out));
+    ret = vfs_lookup_path(path, &inode);
+    if (ret)
+    {
+        return ret;
+    }
+
+    vfs_fill_stat_from_inode(&inode, out);
+    return 0;
+}
+
+int vfs_fstat(int fd, struct vfs_stat *out)
+{
+    if (!out)
+    {
+        return -EINVAL;
+    }
+
+    memset((int8_t *)out, 0, sizeof(*out));
+
+    if (fd < 0 || fd >= VFS_MAX_FILES || !vfs_state.files[fd].used)
+    {
+        if (fd >= 0 && fd < 3)
+        {
+            /*
+             * 标准输入输出先按“字符设备”返回，方便 shell / Python 这类程序
+             * 通过 isatty() 或 fstat() 识别交互终端。
+            */
+            out->ino = (uint32_t)fd;
+            out->mode = VFS_S_IFCHR | 0600;
+            out->nlink = 1;
+            out->uid = 0;
+            out->gid = 0;
+            out->size = 0;
+            out->blocks = 0;
+            out->blksize = 4096;
+            return 0;
+        }
+        return -EBADF;
+    }
+
+    vfs_fill_stat_from_inode(&vfs_state.files[fd].inode, out);
+    return 0;
+}
+
 ssize_t vfs_read(int fd, void *buf, size_t len)
 {
     struct vfs_file *file;
@@ -382,6 +673,54 @@ ssize_t vfs_write(int fd, const void *buf, size_t len)
     return ret;
 }
 
+ssize_t vfs_pread(int fd, void *buf, size_t len, uint64_t offset)
+{
+    struct vfs_file *file;
+    uint64_t old_pos;
+    ssize_t ret;
+
+    if (fd < 0 || fd >= VFS_MAX_FILES || !vfs_state.files[fd].used)
+    {
+        return -EBADF;
+    }
+
+    if (fd < 3)
+    {
+        return vfs_read(fd, buf, len);
+    }
+
+    file = &vfs_state.files[fd];
+    old_pos = file->pos;
+    file->pos = offset;
+    ret = vfs_read(fd, buf, len);
+    file->pos = old_pos;
+    return ret;
+}
+
+ssize_t vfs_pwrite(int fd, const void *buf, size_t len, uint64_t offset)
+{
+    struct vfs_file *file;
+    uint64_t old_pos;
+    ssize_t ret;
+
+    if (fd < 0 || fd >= VFS_MAX_FILES || !vfs_state.files[fd].used)
+    {
+        return -EBADF;
+    }
+
+    if (fd < 3)
+    {
+        return vfs_write(fd, buf, len);
+    }
+
+    file = &vfs_state.files[fd];
+    old_pos = file->pos;
+    file->pos = offset;
+    ret = vfs_write(fd, buf, len);
+    file->pos = old_pos;
+    return ret;
+}
+
 int64_t vfs_lseek(int fd, int64_t offset, int whence)
 {
     struct vfs_file *file;
@@ -439,4 +778,106 @@ int vfs_close(int fd)
 
     memset((int8_t *)&vfs_state.files[fd], 0, sizeof(vfs_state.files[fd]));
     return 0;
+}
+
+int vfs_dup(int fd)
+{
+    int newfd;
+
+    if (fd < 0 || fd >= VFS_MAX_FILES || !vfs_state.files[fd].used)
+    {
+        return -EBADF;
+    }
+
+    for (newfd = 0; newfd < VFS_MAX_FILES; newfd++)
+    {
+        if (!vfs_state.files[newfd].used)
+        {
+            return vfs_dup2(fd, newfd);
+        }
+    }
+
+    return -EMFILE;
+}
+
+int vfs_dup2(int oldfd, int newfd)
+{
+    struct vfs_file dup_file;
+
+    /*
+     * 最小 dup2：
+     * - 先复用现有全局 fd 表
+     * - 复制打开状态、偏移和 inode 元数据
+     * - 不做引用计数，先满足 shell / 后续用户态程序对“复制描述符”的基本需求
+     *
+     * 这一步还不等价于完整 Linux 语义，但足够作为 Python / shell 的起点。
+     */
+    if (oldfd < 0 || oldfd >= VFS_MAX_FILES || !vfs_state.files[oldfd].used)
+    {
+        return -EBADF;
+    }
+
+    if (newfd < 0 || newfd >= VFS_MAX_FILES)
+    {
+        return -EBADF;
+    }
+
+    if (oldfd == newfd)
+    {
+        return newfd;
+    }
+
+    dup_file = vfs_state.files[oldfd];
+    if (vfs_state.files[newfd].used)
+    {
+        memset((int8_t *)&vfs_state.files[newfd], 0, sizeof(vfs_state.files[newfd]));
+    }
+
+    vfs_state.files[newfd] = dup_file;
+    vfs_state.files[newfd].used = true;
+    return newfd;
+}
+
+int vfs_fcntl(int fd, int cmd, uint64_t arg)
+{
+    struct vfs_file *file;
+    int newfd;
+
+    if (fd < 0 || fd >= VFS_MAX_FILES)
+    {
+        return -EBADF;
+    }
+
+    if (!vfs_state.files[fd].used)
+    {
+        if (fd < 3 && (cmd == VFS_F_GETFD || cmd == VFS_F_GETFL))
+        {
+            return 0;
+        }
+        return -EBADF;
+    }
+
+    file = &vfs_state.files[fd];
+    switch (cmd)
+    {
+    case VFS_F_GETFD:
+        return 0;
+    case VFS_F_SETFD:
+        return 0;
+    case VFS_F_GETFL:
+        return file->flags;
+    case VFS_F_SETFL:
+        file->flags = (file->flags & (VFS_O_RDONLY | VFS_O_WRONLY)) | (int)arg;
+        return 0;
+    case VFS_F_DUPFD:
+    case VFS_F_DUPFD_CLOEXEC:
+        newfd = (int)arg;
+        if (newfd < 0 || newfd >= VFS_MAX_FILES)
+        {
+            return -EINVAL;
+        }
+        return vfs_dup2(fd, newfd);
+    default:
+        return -ENOTTY;
+    }
 }

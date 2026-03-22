@@ -4,6 +4,7 @@
 #include "lib/libasm.h"
 #include "lib/libmem.h"
 #include "mmu.h"
+#include "mm/page_alloc.h"
 #include "printk.h"
 #include "smp.h"
 #include "timer.h"
@@ -22,11 +23,15 @@ struct sched_state
 static struct sched_state sched_state;
 
 static void copy_task_name(int8_t *dst, const int8_t *src);
+static void copy_task_cwd(int8_t *dst, const int8_t *src);
+static void task_runtime_init(struct task_struct *task);
+static void task_runtime_release(struct task_struct *task);
 static void init_boot_task(struct task_struct *task, uint32_t cpu);
 static void init_idle_task(struct task_struct *idle, uint32_t cpu)
 {
     memset((int8_t *)idle, 0, sizeof(*idle));
     idle->pid = -1;
+    idle->ppid = -1;
     idle->cpu = cpu;
     idle->is_idle = true;
     idle->state = TASK_RUNNING;
@@ -35,6 +40,11 @@ static void init_idle_task(struct task_struct *idle, uint32_t cpu)
     idle->exec_base = 0;
     idle->exec_end = 0;
     idle->has_exec_image = false;
+    idle->heap_order = 0;
+    idle->heap_base = 0;
+    idle->heap_brk = 0;
+    idle->heap_end = 0;
+    copy_task_cwd(idle->cwd, (const int8_t *)"/");
     copy_task_name(idle->comm, (const int8_t *)"idle");
 }
 
@@ -42,6 +52,7 @@ static void init_boot_task(struct task_struct *task, uint32_t cpu)
 {
     memset((int8_t *)task, 0, sizeof(*task));
     task->pid = 0;
+    task->ppid = -1;
     task->cpu = cpu;
     task->is_idle = false;
     task->state = TASK_RUNNING;
@@ -50,7 +61,80 @@ static void init_boot_task(struct task_struct *task, uint32_t cpu)
     task->exec_base = 0;
     task->exec_end = 0;
     task->has_exec_image = false;
+    task_runtime_init(task);
+    copy_task_cwd(task->cwd, (const int8_t *)"/");
     copy_task_name(task->comm, (const int8_t *)"boot");
+}
+
+static void task_runtime_init(struct task_struct *task)
+{
+    void *heap;
+    uint64_t heap_bytes;
+    uint32_t i;
+
+    if (!task)
+    {
+        return;
+    }
+
+    heap = alloc_pages(TASK_HEAP_ORDER);
+    if (!heap)
+    {
+        task->heap_order = 0;
+        task->heap_base = 0;
+        task->heap_brk = 0;
+        task->heap_end = 0;
+    }
+    else
+    {
+        heap_bytes = (uint64_t)PAGE_SIZE << TASK_HEAP_ORDER;
+        task->heap_order = TASK_HEAP_ORDER;
+        task->heap_base = (uint64_t)heap;
+        task->heap_brk = task->heap_base;
+        task->heap_end = task->heap_base + heap_bytes;
+        memset((int8_t *)heap, 0, (size_t)heap_bytes);
+    }
+
+    for (i = 0; i < TASK_MAX_MMAPS; i++)
+    {
+        task->mmaps[i].used = false;
+        task->mmaps[i].addr = 0;
+        task->mmaps[i].size = 0;
+        task->mmaps[i].order = 0;
+    }
+}
+
+static void task_runtime_release(struct task_struct *task)
+{
+    uint32_t i;
+
+    if (!task)
+    {
+        return;
+    }
+
+    for (i = 0; i < TASK_MAX_MMAPS; i++)
+    {
+        if (!task->mmaps[i].used || !task->mmaps[i].addr || !task->mmaps[i].order)
+        {
+            continue;
+        }
+
+        free_pages((void *)task->mmaps[i].addr, task->mmaps[i].order);
+        task->mmaps[i].used = false;
+        task->mmaps[i].addr = 0;
+        task->mmaps[i].size = 0;
+        task->mmaps[i].order = 0;
+    }
+
+    if (task->heap_base && task->heap_order)
+    {
+        free_pages((void *)task->heap_base, task->heap_order);
+    }
+    task->heap_base = 0;
+    task->heap_brk = 0;
+    task->heap_end = 0;
+    task->heap_order = 0;
 }
 
 static void copy_task_name(int8_t *dst, const int8_t *src)
@@ -63,6 +147,27 @@ static void copy_task_name(int8_t *dst, const int8_t *src)
     }
 
     for (i = 0; i < TASK_COMM_LEN - 1 && src[i] != '\0'; i++)
+    {
+        dst[i] = src[i];
+    }
+    dst[i] = '\0';
+}
+
+static void copy_task_cwd(int8_t *dst, const int8_t *src)
+{
+    size_t i;
+
+    if (!dst)
+    {
+        return;
+    }
+
+    if (!src || src[0] == '\0')
+    {
+        src = (const int8_t *)"/";
+    }
+
+    for (i = 0; i < TASK_CWD_LEN - 1 && src[i] != '\0'; i++)
     {
         dst[i] = src[i];
     }
@@ -382,6 +487,38 @@ void task_set_cleanup(task_cleanup_t cleanup, void *arg)
     write_daif(daif);
 }
 
+const int8_t *task_cwd(void)
+{
+    struct task_struct *task;
+
+    task = task_current();
+    if (!task || task->cwd[0] == '\0')
+    {
+        return (const int8_t *)"/";
+    }
+
+    return task->cwd;
+}
+
+int task_set_cwd(const int8_t *path)
+{
+    struct task_struct *task;
+
+    if (!path || path[0] == '\0')
+    {
+        return -1;
+    }
+
+    task = task_current();
+    if (!task)
+    {
+        return -1;
+    }
+
+    copy_task_cwd(task->cwd, path);
+    return 0;
+}
+
 void sched_init(void)
 {
     struct task_struct *boot_task;
@@ -413,6 +550,7 @@ void sched_init(void)
      */
     boot_task = &sched_state.tasks[0];
     init_boot_task(boot_task, boot_cpu);
+    boot_task->ppid = 0;
 
     rq = this_rq();
     rq->curr = boot_task;
@@ -469,6 +607,7 @@ int kthread_create(const int8_t *name, task_entry_t entry, void *arg)
 
     pid = sched_state.next_pid++;
     task->pid = pid;
+    task->ppid = task_current() ? task_current()->pid : 0;
     task->cpu = sched_pick_target_cpu();
     task->state = TASK_RUNNABLE;
     task->weight = 1024;
@@ -477,6 +616,8 @@ int kthread_create(const int8_t *name, task_entry_t entry, void *arg)
     task->exec_base = 0;
     task->exec_end = 0;
     task->has_exec_image = false;
+    task_runtime_init(task);
+    copy_task_cwd(task->cwd, task_cwd());
     copy_task_name(task->comm, name);
 
     sp = (uint64_t)&task->stack[TASK_STACK_SIZE];
@@ -519,7 +660,7 @@ void sched_sleep_until(uint64_t wake_jiffies)
 
     rq = this_rq();
     curr = rq->curr;
-    if (!curr || curr->is_idle)
+    if (!curr || curr->is_idle || curr->state == TASK_RUNNABLE || curr->state == TASK_DEAD)
     {
         spin_unlock(&sched_state.lock);
         enable_irq();
@@ -554,6 +695,31 @@ void sched_sleep_ms(uint32_t sleep_ms)
 
     wake_jiffies = (uint64_t)jiffies + ((uint64_t)sleep_ms * STUPIDOS_TIMER_HZ + 999ULL) / 1000ULL;
     sched_sleep_until(wake_jiffies);
+}
+
+void task_wake(struct task_struct *task)
+{
+    struct rq *rq;
+    uint64_t daif;
+
+    if (!task || task->is_idle || task->state != TASK_SLEEPING)
+    {
+        return;
+    }
+
+    daif = read_daif();
+    disable_irq();
+    spin_lock(&sched_state.lock);
+
+    rq = &sched_state.rq[task->cpu];
+    task->state = TASK_RUNNABLE;
+    task->sleep_until = 0;
+    rq->nr_running++;
+    rq->need_resched = true;
+    sev();
+
+    spin_unlock(&sched_state.lock);
+    write_daif(daif);
 }
 
 void scheduler_tick(void)
@@ -661,6 +827,8 @@ void task_exit(void)
     {
         cleanup(cleanup_arg);
     }
+
+    task_runtime_release(curr);
 
     spin_lock(&sched_state.lock);
 

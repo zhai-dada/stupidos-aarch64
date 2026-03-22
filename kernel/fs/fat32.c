@@ -330,8 +330,13 @@ static void fat32_fill_root_inode(struct fat32_fs *fs, struct vfs_inode *out)
     out->sb = &fs->sb;
     out->ops = &fat32_inode_ops;
     out->ino = fs->root_cluster;
-    out->mode = VFS_S_IFDIR;
+    out->mode = VFS_S_IFDIR | 0755;
     out->size = 0;
+    out->nlink = 2;
+    out->uid = 0;
+    out->gid = 0;
+    out->blksize = fs->cluster_size;
+    out->blocks = 0;
     out->fs_private = fs;
     out->private_data[0] = fs->root_cluster;
     out->private_data[1] = 0;
@@ -352,8 +357,14 @@ static void fat32_fill_inode(struct fat32_fs *fs, const struct fat32_dirent *de,
     out->sb = &fs->sb;
     out->ops = &fat32_inode_ops;
     out->ino = first_cluster ? first_cluster : ((dir_cluster << 16) | dir_offset);
-    out->mode = (de->attr & FAT32_ATTR_DIRECTORY) ? VFS_S_IFDIR : VFS_S_IFREG;
+    out->mode = (de->attr & FAT32_ATTR_DIRECTORY) ? (VFS_S_IFDIR | 0755)
+                                                   : (VFS_S_IFREG | ((de->attr & FAT32_ATTR_READ_ONLY) ? 0444 : 0644));
     out->size = de->file_size;
+    out->nlink = (de->attr & FAT32_ATTR_DIRECTORY) ? 2 : 1;
+    out->uid = 0;
+    out->gid = 0;
+    out->blksize = fs->cluster_size;
+    out->blocks = (de->file_size + 511ULL) >> 9;
     out->fs_private = fs;
     out->private_data[0] = first_cluster;
     out->private_data[1] = dir_cluster;

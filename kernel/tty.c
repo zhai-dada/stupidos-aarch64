@@ -16,6 +16,8 @@ static spinlock_t tty_lock = SPINLOCK_INIT;
 static uint8_t tty_rx_buf[TTY_RX_BUF_SIZE];
 static uint32_t tty_rx_head;
 static uint32_t tty_rx_tail;
+static uint32_t tty_line_len;
+static uint8_t tty_escape_state;
 static struct tty_mouse_state tty_mouse;
 
 static void tty_rx_push(uint8_t ch)
@@ -50,11 +52,76 @@ static int32_t tty_rx_pop(void)
     return ch;
 }
 
+static size_t tty_ingest_char_locked(uint8_t ch, uint8_t *echo_buf)
+{
+    uint8_t stored_ch;
+    size_t echo_len;
+
+    /*
+     * 所有输入源统一在这里做规范化和回显：
+     * - 回车统一成换行
+     * - 字符进入 TTY 队列
+     * - 生成对应的本地回显序列
+     *
+     * 这样 UART IRQ、virtio keyboard IRQ，以及轮询补位路径的表现一致。
+    */
+    stored_ch = (ch == '\r') ? '\n' : ch;
+    tty_rx_push(stored_ch);
+
+    /*
+     * 方向键会以 ANSI escape 序列发进来，例如 ESC [ A。
+     * 这些字节要继续留给上层 shell 解析，但不要直接回显出来，
+     * 否则终端上会看到 "[A" 这类碎片字符。
+     */
+    if (tty_escape_state == 1)
+    {
+        tty_escape_state = (stored_ch == '[') ? 2 : 0;
+        return 0;
+    }
+    if (tty_escape_state == 2)
+    {
+        tty_escape_state = 0;
+        return 0;
+    }
+    if (stored_ch == 0x1b)
+    {
+        tty_escape_state = 1;
+        return 0;
+    }
+
+    echo_len = 0;
+    if (stored_ch == '\n')
+    {
+        tty_line_len = 0;
+        echo_buf[echo_len++] = '\r';
+        echo_buf[echo_len++] = '\n';
+    }
+    else if (stored_ch == '\b' || stored_ch == 0x7f)
+    {
+        if (tty_line_len > 0)
+        {
+            tty_line_len--;
+            echo_buf[echo_len++] = '\b';
+            echo_buf[echo_len++] = ' ';
+            echo_buf[echo_len++] = '\b';
+        }
+    }
+    else if (stored_ch >= 0x20 && stored_ch <= 0x7e)
+    {
+        tty_line_len++;
+        echo_buf[echo_len++] = stored_ch;
+    }
+
+    return echo_len;
+}
+
 void tty_init(void)
 {
     spin_lock_init(&tty_lock);
     tty_rx_head = 0;
     tty_rx_tail = 0;
+    tty_line_len = 0;
+    tty_escape_state = 0;
     tty_mouse.x = 0;
     tty_mouse.y = 0;
     tty_mouse.buttons = 0;
@@ -73,6 +140,8 @@ void tty_flush_input(void)
     spin_lock(&tty_lock);
     tty_rx_head = 0;
     tty_rx_tail = 0;
+    tty_line_len = 0;
+    tty_escape_state = 0;
     spin_unlock(&tty_lock);
     write_daif(daif);
 }
@@ -95,10 +164,34 @@ void tty_write(const int8_t *str)
     }
 }
 
+void tty_write_bytes(const void *buf, size_t len)
+{
+    const uint8_t *bytes;
+    size_t i;
+
+    if (!buf || !len)
+    {
+        return;
+    }
+
+    /*
+     * 给 stdout / shell 回显提供一个批量入口。
+     * 底层还是走同一条串口发送路径，但可以减少上层反复拆成
+     * 单字节调用带来的函数开销和调度抖动。
+     */
+    bytes = (const uint8_t *)buf;
+    for (i = 0; i < len; i++)
+    {
+        tty_putc(bytes[i]);
+    }
+}
+
 int32_t tty_try_getc(void)
 {
+    uint8_t echo_buf[3];
     uint64_t daif;
     int32_t ch;
+    size_t echo_len;
 
     daif = read_daif();
     disable_irq();
@@ -116,6 +209,18 @@ int32_t tty_try_getc(void)
      * 这样串口输入和 virtio-input 输入都能走同一条 tty 入口。
      */
     ch = uart_try_getc();
+    if (ch >= 0)
+    {
+        spin_lock(&tty_lock);
+        echo_len = tty_ingest_char_locked((uint8_t)ch, echo_buf);
+        ch = tty_rx_pop();
+        spin_unlock(&tty_lock);
+        if (echo_len)
+        {
+            tty_write_bytes(echo_buf, echo_len);
+        }
+        sev();
+    }
     write_daif(daif);
     return ch;
 }
@@ -123,12 +228,18 @@ int32_t tty_try_getc(void)
 void tty_feed_char(uint8_t ch)
 {
     uint64_t daif;
+    uint8_t echo_buf[3];
+    size_t echo_len;
 
     daif = read_daif();
     disable_irq();
     spin_lock(&tty_lock);
-    tty_rx_push(ch);
+    echo_len = tty_ingest_char_locked(ch, echo_buf);
     spin_unlock(&tty_lock);
+    if (echo_len)
+    {
+        tty_write_bytes(echo_buf, echo_len);
+    }
 
     /*
      * 唤醒等待输入的 CPU。

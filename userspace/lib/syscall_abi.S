@@ -16,6 +16,47 @@
 #define SYS_WAITPID     13
 #define SYS_SLEEP       14
 #define SYS_NETCFG      15
+#define SYS_CHDIR       16
+#define SYS_GETCWD      17
+#define SYS_STAT        18
+#define SYS_FSTAT       19
+#define SYS_UNAME       20
+#define SYS_GETTIMEOFDAY 21
+#define SYS_ISATTY      22
+#define SYS_DUP2        23
+#define SYS_BRK         24
+#define SYS_MMAP        25
+#define SYS_MUNMAP      26
+#define SYS_MPROTECT    27
+#define SYS_CLOCK_GETTIME 28
+#define SYS_NANOSLEEP   29
+#define SYS_GETUID      30
+#define SYS_GETGID      31
+#define SYS_GETEUID     32
+#define SYS_GETEGID     33
+#define SYS_ACCESS      34
+#define SYS_OPENAT      35
+#define SYS_FSTATAT     36
+#define SYS_READLINK    37
+#define SYS_IOCTL       38
+#define SYS_DUP         39
+#define SYS_READV       40
+#define SYS_WRITEV      41
+#define SYS_GETTID      42
+#define SYS_GETPPID     43
+#define SYS_EXIT_GROUP  44
+#define SYS_GETRANDOM   45
+#define SYS_SET_TID_ADDRESS 46
+#define SYS_RT_SIGACTION 47
+#define SYS_RT_SIGPROCMASK 48
+#define SYS_SIGALTSTACK 49
+#define SYS_FUTEX      50
+#define SYS_PREAD64    51
+#define SYS_PWRITE64   52
+#define SYS_FCNTL      53
+#define SYS_SCHED_GETAFFINITY 54
+#define SYS_SYSINFO    55
+#define SYS_PRLIMIT64   56
 
 .section .text
 
@@ -113,6 +154,253 @@ FUNC_GLOBAL(u_netcfg)
 	svc #0
 	ret
 FUNC_END(u_netcfg)
+
+FUNC_GLOBAL(u_chdir)
+	mov x8, #SYS_CHDIR
+	svc #0
+	ret
+FUNC_END(u_chdir)
+
+FUNC_GLOBAL(u_getcwd)
+	mov x8, #SYS_GETCWD
+	svc #0
+	ret
+FUNC_END(u_getcwd)
+
+FUNC_GLOBAL(u_stat)
+	mov x8, #SYS_STAT
+	svc #0
+	ret
+FUNC_END(u_stat)
+
+FUNC_GLOBAL(u_fstat)
+	mov x8, #SYS_FSTAT
+	svc #0
+	ret
+FUNC_END(u_fstat)
+
+FUNC_GLOBAL(u_uname)
+	mov x8, #SYS_UNAME
+	svc #0
+	ret
+FUNC_END(u_uname)
+
+FUNC_GLOBAL(u_gettimeofday)
+	mov x8, #SYS_GETTIMEOFDAY
+	svc #0
+	ret
+FUNC_END(u_gettimeofday)
+
+FUNC_GLOBAL(u_isatty)
+	mov x8, #SYS_ISATTY
+	svc #0
+	ret
+FUNC_END(u_isatty)
+
+FUNC_GLOBAL(u_dup2)
+	mov x8, #SYS_DUP2
+	svc #0
+	ret
+FUNC_END(u_dup2)
+
+FUNC_GLOBAL(u_brk)
+	mov x8, #SYS_BRK
+	svc #0
+	ret
+FUNC_END(u_brk)
+
+FUNC_GLOBAL(u_mmap)
+	mov x8, #SYS_MMAP
+	svc #0
+	ret
+FUNC_END(u_mmap)
+
+FUNC_GLOBAL(u_munmap)
+	mov x8, #SYS_MUNMAP
+	svc #0
+	ret
+FUNC_END(u_munmap)
+
+FUNC_GLOBAL(u_mprotect)
+	mov x8, #SYS_MPROTECT
+	svc #0
+	ret
+FUNC_END(u_mprotect)
+
+FUNC_GLOBAL(u_clock_gettime)
+	mov x8, #SYS_CLOCK_GETTIME
+	svc #0
+	ret
+FUNC_END(u_clock_gettime)
+
+FUNC_GLOBAL(u_nanosleep)
+	mov x8, #SYS_NANOSLEEP
+	svc #0
+	ret
+FUNC_END(u_nanosleep)
+
+FUNC_GLOBAL(u_getuid)
+	mov x8, #SYS_GETUID
+	svc #0
+	ret
+FUNC_END(u_getuid)
+
+FUNC_GLOBAL(u_getgid)
+	mov x8, #SYS_GETGID
+	svc #0
+	ret
+FUNC_END(u_getgid)
+
+FUNC_GLOBAL(u_geteuid)
+	mov x8, #SYS_GETEUID
+	svc #0
+	ret
+FUNC_END(u_geteuid)
+
+FUNC_GLOBAL(u_getegid)
+	mov x8, #SYS_GETEGID
+	svc #0
+	ret
+FUNC_END(u_getegid)
+
+FUNC_GLOBAL(u_access)
+	mov x8, #SYS_ACCESS
+	svc #0
+	ret
+FUNC_END(u_access)
+
+FUNC_GLOBAL(u_openat)
+	mov x8, #SYS_OPENAT
+	svc #0
+	ret
+FUNC_END(u_openat)
+
+FUNC_GLOBAL(u_fstatat)
+	mov x8, #SYS_FSTATAT
+	svc #0
+	ret
+FUNC_END(u_fstatat)
+
+FUNC_GLOBAL(u_readlink)
+	mov x8, #SYS_READLINK
+	svc #0
+	ret
+FUNC_END(u_readlink)
+
+FUNC_GLOBAL(u_ioctl)
+	mov x8, #SYS_IOCTL
+	svc #0
+	ret
+FUNC_END(u_ioctl)
+
+FUNC_GLOBAL(u_dup)
+	mov x8, #SYS_DUP
+	svc #0
+	ret
+FUNC_END(u_dup)
+
+FUNC_GLOBAL(u_readv)
+	mov x8, #SYS_READV
+	svc #0
+	ret
+FUNC_END(u_readv)
+
+FUNC_GLOBAL(u_writev)
+	mov x8, #SYS_WRITEV
+	svc #0
+	ret
+FUNC_END(u_writev)
+
+FUNC_GLOBAL(u_gettid)
+	mov x8, #SYS_GETTID
+	svc #0
+	ret
+FUNC_END(u_gettid)
+
+FUNC_GLOBAL(u_getppid)
+	mov x8, #SYS_GETPPID
+	svc #0
+	ret
+FUNC_END(u_getppid)
+
+FUNC_GLOBAL(u_exit_group)
+	mov x8, #SYS_EXIT_GROUP
+	svc #0
+1:
+	b 1b
+FUNC_END(u_exit_group)
+
+FUNC_GLOBAL(u_getrandom)
+	mov x8, #SYS_GETRANDOM
+	svc #0
+	ret
+FUNC_END(u_getrandom)
+
+FUNC_GLOBAL(u_set_tid_address)
+	mov x8, #SYS_SET_TID_ADDRESS
+	svc #0
+	ret
+FUNC_END(u_set_tid_address)
+
+FUNC_GLOBAL(u_rt_sigaction)
+	mov x8, #SYS_RT_SIGACTION
+	svc #0
+	ret
+FUNC_END(u_rt_sigaction)
+
+FUNC_GLOBAL(u_rt_sigprocmask)
+	mov x8, #SYS_RT_SIGPROCMASK
+	svc #0
+	ret
+FUNC_END(u_rt_sigprocmask)
+
+FUNC_GLOBAL(u_sigaltstack)
+	mov x8, #SYS_SIGALTSTACK
+	svc #0
+	ret
+FUNC_END(u_sigaltstack)
+
+FUNC_GLOBAL(u_futex)
+	mov x8, #SYS_FUTEX
+	svc #0
+	ret
+FUNC_END(u_futex)
+
+FUNC_GLOBAL(u_pread64)
+	mov x8, #SYS_PREAD64
+	svc #0
+	ret
+FUNC_END(u_pread64)
+
+FUNC_GLOBAL(u_pwrite64)
+	mov x8, #SYS_PWRITE64
+	svc #0
+	ret
+FUNC_END(u_pwrite64)
+
+FUNC_GLOBAL(u_fcntl)
+	mov x8, #SYS_FCNTL
+	svc #0
+	ret
+FUNC_END(u_fcntl)
+
+FUNC_GLOBAL(u_sched_getaffinity)
+	mov x8, #SYS_SCHED_GETAFFINITY
+	svc #0
+	ret
+FUNC_END(u_sched_getaffinity)
+
+FUNC_GLOBAL(u_sysinfo)
+	mov x8, #SYS_SYSINFO
+	svc #0
+	ret
+FUNC_END(u_sysinfo)
+
+FUNC_GLOBAL(u_prlimit64)
+	mov x8, #SYS_PRLIMIT64
+	svc #0
+	ret
+FUNC_END(u_prlimit64)
 
 FUNC_GLOBAL(u_exit)
 	mov x8, #SYS_EXIT

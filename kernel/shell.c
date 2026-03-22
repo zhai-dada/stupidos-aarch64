@@ -30,11 +30,6 @@ int32_t shell_foreground_pid(void)
 #define SHELL_READ_CHUNK 128
 #define SHELL_MAX_ARGS 8
 
-static void shell_putc(char ch)
-{
-    tty_putc((uint8_t)ch);
-}
-
 static void shell_puts(const int8_t *str)
 {
     tty_write(str);
@@ -42,12 +37,7 @@ static void shell_puts(const int8_t *str)
 
 static void shell_write_bytes(const int8_t *buf, size_t len)
 {
-    size_t i;
-
-    for (i = 0; i < len; i++)
-    {
-        shell_putc((char)buf[i]);
-    }
+    tty_write_bytes(buf, len);
 }
 
 static int shell_launch_userspace(void)
@@ -149,7 +139,7 @@ static void shell_ls(const int8_t *path)
             return;
         }
 
-        shell_puts((const int8_t *)(ent.mode == VFS_S_IFDIR ? "[d] " : "[-] "));
+        shell_puts((const int8_t *)((ent.mode & VFS_S_IFMT) == VFS_S_IFDIR ? "[d] " : "[-] "));
         shell_puts((const int8_t *)ent.name);
         shell_puts((const int8_t *)"\r\n");
     }
@@ -469,7 +459,6 @@ static void shell_main(void *arg)
 	            ch = tty_getc();
             if (ch == '\r' || ch == '\n')
             {
-                shell_puts((const int8_t *)"\r\n");
                 line[len] = '\0';
                 shell_execute(line);
                 break;
@@ -480,7 +469,6 @@ static void shell_main(void *arg)
                 if (len > 0)
                 {
                     len--;
-                    shell_puts((const int8_t *)"\b \b");
                 }
                 continue;
             }
@@ -496,7 +484,6 @@ static void shell_main(void *arg)
             }
 
             line[len++] = (int8_t)ch;
-            shell_putc((char)ch);
         }
     }
 }

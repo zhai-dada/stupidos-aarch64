@@ -525,6 +525,11 @@ static int ext4_fill_vfs_inode(struct ext4_fs *fs, uint32_t ino, struct vfs_inod
     out->ino = ino;
     out->mode = raw_inode.mode;
     out->size = ext4_inode_size(&raw_inode);
+    out->nlink = raw_inode.links_count ? raw_inode.links_count : 1;
+    out->uid = raw_inode.uid;
+    out->gid = raw_inode.gid;
+    out->blksize = fs->block_size;
+    out->blocks = raw_inode.blocks_lo;
     out->fs_private = fs;
     return 0;
 }
