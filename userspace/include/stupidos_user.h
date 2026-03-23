@@ -84,6 +84,9 @@
 #define STUPIDOS_O_RDONLY       0x1
 #define STUPIDOS_O_WRONLY       0x2
 #define STUPIDOS_O_RDWR         (STUPIDOS_O_RDONLY | STUPIDOS_O_WRONLY)
+#define STUPIDOS_O_CREAT        0x0100
+#define STUPIDOS_O_TRUNC        0x0200
+#define STUPIDOS_O_APPEND       0x0400
 
 #define STUPIDOS_SEEK_SET       0
 #define STUPIDOS_SEEK_CUR       1

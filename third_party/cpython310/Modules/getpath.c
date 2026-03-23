@@ -1092,6 +1092,19 @@ resolve_symlinks(wchar_t **path_p)
 }
 #endif /* HAVE_READLINK */
 
+#ifndef HAVE_READLINK
+static PyStatus
+resolve_symlinks(wchar_t **path_p)
+{
+    /*
+     * stupidos 当前如果没有启用 readlink，路径解析就直接退化为“原样返回”。
+     * 这样 Python 仍然可以完成启动路径计算，不会因为缺少符号而中断。
+     */
+    (void)path_p;
+    return _PyStatus_OK();
+}
+#endif
+
 
 #ifdef WITH_NEXT_FRAMEWORK
 static PyStatus

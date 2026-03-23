@@ -7,4 +7,8 @@
  * 直接使用工具链的时间类型定义，避免与 CPython 的尺寸探测冲突。
  */
 
+struct tm *gmtime_r(const time_t *timep, struct tm *result);
+struct tm *localtime_r(const time_t *timep, struct tm *result);
+time_t timegm(struct tm *tm);
+
 #endif

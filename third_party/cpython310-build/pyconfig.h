@@ -132,10 +132,10 @@
 /* #undef HAVE_CHOWN */
 
 /* Define if you have the 'chroot' function. */
-#define HAVE_CHROOT 1
+/* #undef HAVE_CHROOT */
 
 /* Define to 1 if you have the `clock' function. */
-/* #undef HAVE_CLOCK */
+#define HAVE_CLOCK 1
 
 /* Define to 1 if you have the `clock_getres' function. */
 /* #undef HAVE_CLOCK_GETRES */
@@ -286,7 +286,7 @@
 #define HAVE_DLFCN_H 1
 
 /* Define to 1 if you have the `dlopen' function. */
-#define HAVE_DLOPEN 1
+/* #undef HAVE_DLOPEN */
 
 /* Define to 1 if you have the `dup2' function. */
 /* #undef HAVE_DUP2 */
@@ -373,10 +373,10 @@
 /* #undef HAVE_FLOCK */
 
 /* Define to 1 if you have the `fork' function. */
-#define HAVE_FORK 1
+/* #undef HAVE_FORK */
 
 /* Define to 1 if you have the `forkpty' function. */
-#define HAVE_FORKPTY 1
+/* #undef HAVE_FORKPTY */
 
 /* Define to 1 if you have the `fpathconf' function. */
 /* #undef HAVE_FPATHCONF */
@@ -814,25 +814,25 @@
 #define HAVE_PROTOTYPES 1
 
 /* Define to 1 if you have the `pthread_condattr_setclock' function. */
-#define HAVE_PTHREAD_CONDATTR_SETCLOCK 1
+/* #undef HAVE_PTHREAD_CONDATTR_SETCLOCK */
 
 /* Defined for Solaris 2.6 bug in pthread header. */
 /* #undef HAVE_PTHREAD_DESTRUCTOR */
 
 /* Define to 1 if you have the `pthread_getcpuclockid' function. */
-#define HAVE_PTHREAD_GETCPUCLOCKID 1
+/* #undef HAVE_PTHREAD_GETCPUCLOCKID */
 
 /* Define to 1 if you have the <pthread.h> header file. */
-#define HAVE_PTHREAD_H 1
+/* #undef HAVE_PTHREAD_H */
 
 /* Define to 1 if you have the `pthread_init' function. */
 /* #undef HAVE_PTHREAD_INIT */
 
 /* Define to 1 if you have the `pthread_kill' function. */
-#define HAVE_PTHREAD_KILL 1
+/* #undef HAVE_PTHREAD_KILL */
 
 /* Define to 1 if you have the `pthread_sigmask' function. */
-#define HAVE_PTHREAD_SIGMASK 1
+/* #undef HAVE_PTHREAD_SIGMASK */
 
 /* Define to 1 if you have the <pty.h> header file. */
 #define HAVE_PTY_H 1
@@ -910,19 +910,19 @@
 /* #undef HAVE_SCHED_SETSCHEDULER */
 
 /* Define to 1 if you have the `sem_clockwait' function. */
-#define HAVE_SEM_CLOCKWAIT 1
+/* #undef HAVE_SEM_CLOCKWAIT */
 
 /* Define to 1 if you have the `sem_getvalue' function. */
-#define HAVE_SEM_GETVALUE 1
+/* #undef HAVE_SEM_GETVALUE */
 
 /* Define to 1 if you have the `sem_open' function. */
-#define HAVE_SEM_OPEN 1
+/* #undef HAVE_SEM_OPEN */
 
 /* Define to 1 if you have the `sem_timedwait' function. */
-#define HAVE_SEM_TIMEDWAIT 1
+/* #undef HAVE_SEM_TIMEDWAIT */
 
 /* Define to 1 if you have the `sem_unlink' function. */
-#define HAVE_SEM_UNLINK 1
+/* #undef HAVE_SEM_UNLINK */
 
 /* Define to 1 if you have the `sendfile' function. */
 /* #undef HAVE_SENDFILE */
@@ -1267,7 +1267,7 @@
 #define HAVE_TGAMMA 1
 
 /* Define to 1 if you have the `timegm' function. */
-/* #undef HAVE_TIMEGM */
+#define HAVE_TIMEGM 1
 
 /* Define to 1 if you have the `times' function. */
 /* #undef HAVE_TIMES */

@@ -326,8 +326,10 @@ corresponding Unix manual entries for more information on calls.");
 #  else
      /* Unix functions that the configure script doesn't check for */
 #    ifndef __VXWORKS__
-#      define HAVE_EXECV      1
-#      define HAVE_FORK       1
+#      ifndef STUPIDOS_MINIMAL_OS
+#        define HAVE_EXECV      1
+#        define HAVE_FORK       1
+#      endif
 #      if defined(__USLC__) && defined(__SCO_VERSION__)       /* SCO UDK Compiler */
 #        define HAVE_FORK1      1
 #      endif

@@ -81,7 +81,7 @@ MAKESETUP=      $(srcdir)/Modules/makesetup
 OPT=		-DNDEBUG -g -fwrapv -O3 -Wall
 BASECFLAGS=	 -Wno-unused-result -Wsign-compare
 BASECPPFLAGS=	-IObjects -IInclude -IPython
-CONFIGURE_CFLAGS=	-ffreestanding -fno-stack-protector -fno-builtin -I/home/zhai/myspace/stupidos-aarch64/userspace/include -I/home/zhai/myspace/stupidos-aarch64/include -O0
+CONFIGURE_CFLAGS=	-ffreestanding -fno-stack-protector -fno-builtin -I/home/zhai/myspace/stupidos-aarch64/userspace/include -I/home/zhai/myspace/stupidos-aarch64/include -O0 -DSTUPIDOS_MINIMAL_OS
 # CFLAGS_NODIST is used for building the interpreter and stdlib C extensions.
 # Use it when a compiler flag should _not_ be part of the distutils CFLAGS
 # once Python is installed (Issue #21121).
@@ -251,8 +251,19 @@ LIBC=
 SYSLIBS=	$(LIBM) $(LIBC)
 SHLIBS=		$(LIBS)
 
+STUPIDOS_USERLIB_SRCS= \
+	../../userspace/lib/compat.c \
+	../../userspace/lib/string.c \
+	../../userspace/lib/stdio.c \
+	../../userspace/lib/syscall.c
+STUPIDOS_USERLIB_S_SRCS= \
+	../../userspace/lib/syscall_abi.S
+STUPIDOS_USERLIB_OBJS= \
+	$(patsubst ../../userspace/lib/%.c,Stupidos/%.o,$(STUPIDOS_USERLIB_SRCS)) \
+	$(patsubst ../../userspace/lib/%.S,Stupidos/%.o,$(STUPIDOS_USERLIB_S_SRCS))
+
 DLINCLDIR=	.
-DYNLOADFILE=	dynload_shlib.o
+DYNLOADFILE=	dynload_stub.o
 MACHDEP_OBJS=	
 LIBOBJDIR=	Python/
 LIBOBJS=	 ${LIBOBJDIR}dup2$U.o
@@ -597,8 +608,8 @@ clinic: check-clean-src $(srcdir)/Modules/_blake2/blake2s_impl.c
 	$(PYTHON_FOR_REGEN) $(srcdir)/Tools/clinic/clinic.py --make --srcdir $(srcdir)
 
 # Build the interpreter
-$(BUILDPYTHON):	Programs/python.o $(LIBRARY_DEPS)
-	$(LINKCC) $(PY_CORE_LDFLAGS) $(LINKFORSHARED) -o $@ Programs/python.o $(BLDLIBRARY) $(LIBS) $(MODLIBS) $(SYSLIBS)
+$(BUILDPYTHON):	Programs/python.o $(LIBRARY_DEPS) $(STUPIDOS_USERLIB_OBJS)
+	$(LINKCC) $(PY_CORE_LDFLAGS) $(LINKFORSHARED) -o $@ Programs/python.o $(BLDLIBRARY) $(STUPIDOS_USERLIB_OBJS) $(LIBS) $(MODLIBS) $(SYSLIBS)
 
 platform: $(BUILDPYTHON) pybuilddir.txt
 	$(RUNSHARED) $(PYTHON_FOR_BUILD) -c 'import sys ; from sysconfig import get_platform ; print("%s-%d.%d" % (get_platform(), *sys.version_info[:2]))' >platform
@@ -732,8 +743,8 @@ Makefile Modules/config.c: Makefile.pre \
 	@echo "The Makefile was updated, you may need to re-run make."
 
 
-Programs/_testembed: Programs/_testembed.o $(LIBRARY_DEPS)
-	$(LINKCC) $(PY_CORE_LDFLAGS) $(LINKFORSHARED) -o $@ Programs/_testembed.o $(BLDLIBRARY) $(LIBS) $(MODLIBS) $(SYSLIBS)
+Programs/_testembed: Programs/_testembed.o $(LIBRARY_DEPS) $(STUPIDOS_USERLIB_OBJS)
+	$(LINKCC) $(PY_CORE_LDFLAGS) $(LINKFORSHARED) -o $@ Programs/_testembed.o $(BLDLIBRARY) $(STUPIDOS_USERLIB_OBJS) $(LIBS) $(MODLIBS) $(SYSLIBS)
 
 ############################################################################
 # Importlib
@@ -742,6 +753,14 @@ Programs/_freeze_importlib.o: Programs/_freeze_importlib.c Makefile
 
 Programs/_freeze_importlib: Programs/_freeze_importlib.o $(LIBRARY_OBJS_OMIT_FROZEN)
 	$(LINKCC) $(PY_CORE_LDFLAGS) -o $@ Programs/_freeze_importlib.o $(LIBRARY_OBJS_OMIT_FROZEN) $(LIBS) $(MODLIBS) $(SYSLIBS)
+
+Stupidos/%.o: ../../userspace/lib/%.c
+	@mkdir -p $(dir $@)
+	$(CC) -c $(CCSHARED) $(PY_CORE_CFLAGS) -o $@ $<
+
+Stupidos/%.o: ../../userspace/lib/%.S
+	@mkdir -p $(dir $@)
+	$(CC) -c $(CCSHARED) $(PY_CORE_CFLAGS) -o $@ $<
 
 .PHONY: regen-importlib
 regen-importlib: Programs/_freeze_importlib
@@ -825,10 +844,8 @@ Modules/pwdmodule.o: $(srcdir)/Modules/pwdmodule.c $(srcdir)/Modules/posixmodule
 
 Modules/signalmodule.o: $(srcdir)/Modules/signalmodule.c $(srcdir)/Modules/posixmodule.h
 
-Python/dynload_shlib.o: $(srcdir)/Python/dynload_shlib.c Makefile
-	$(CC) -c $(PY_CORE_CFLAGS) \
-		-DSOABI='"$(SOABI)"' \
-		-o $@ $(srcdir)/Python/dynload_shlib.c
+Python/dynload_stub.o: $(srcdir)/Python/dynload_stub.c Makefile
+	$(CC) -c $(PY_CORE_CFLAGS) -o $@ $(srcdir)/Python/dynload_stub.c
 
 Python/dynload_hpux.o: $(srcdir)/Python/dynload_hpux.c Makefile
 	$(CC) -c $(PY_CORE_CFLAGS) \
