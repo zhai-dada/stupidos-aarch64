@@ -373,7 +373,7 @@
 /* #undef HAVE_FLOCK */
 
 /* Define to 1 if you have the `fork' function. */
-/* #undef HAVE_FORK */
+#define HAVE_FORK 1
 
 /* Define to 1 if you have the `forkpty' function. */
 /* #undef HAVE_FORKPTY */

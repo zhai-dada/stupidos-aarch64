@@ -13,7 +13,11 @@ USER_DIR        :=  userspace
 USER_INC_DIR    :=  $(USER_DIR)/include
 USER_LD_SCRIPT  :=  $(USER_DIR)/user.ld
 USER_BIN_DIR    :=  $(BUILD_DIR)/$(USER_DIR)/bin
-USER_PROGRAMS   :=  hello ls cat ping sleep netcfg sh
+PYTHON_BUILD_DIR := third_party/cpython310-build
+PYTHON_LIBPY    :=  $(PYTHON_BUILD_DIR)/libpython3.10.a
+PYTHON_LIB_DIR  :=  third_party/cpython310/Lib
+PYTHON_INC_DIR  :=  third_party/cpython310/Include
+USER_PROGRAMS   :=  hello ls cat ping sleep netcfg sh python3
 
 # Toolchain
 CC              :=  $(CROSS_COMPILE)gcc
@@ -44,7 +48,7 @@ CFLAGS          :=  -g -Wall -fno-builtin -Iinclude -O0 -march=armv8-a+nofp
 ASFLAGS         :=  -g -Iinclude
 LDFLAGS         :=  -nostdlib
 DEPFLAGS        :=  -MMD -MP
-USER_CFLAGS     :=  -g -Wall -fno-builtin -ffreestanding -fno-stack-protector -I$(USER_INC_DIR) -Iinclude -O0 -march=armv8-a+nofp
+USER_CFLAGS     :=  -g -Wall -fno-builtin -ffreestanding -fno-stack-protector -I$(USER_INC_DIR) -Iinclude -I$(PYTHON_INC_DIR) -I$(PYTHON_BUILD_DIR) -O0 -march=armv8-a+fp+simd
 USER_ASFLAGS    :=  -g -Iinclude -I$(USER_INC_DIR)
 
 # Linker script
@@ -111,6 +115,13 @@ $(USER_BIN_DIR)/%: $(BUILD_DIR)/$(USER_DIR)/bin/%.o $(USER_LIB_OBJS) $(USER_CRT_
 	@mkdir -p $(dir $@)
 	$(LD) -nostdlib -z max-page-size=0x1000 $(USER_CRT_OBJ) $(USER_LIB_OBJS) $< -o $@ -T $(USER_LD_SCRIPT)
 
+$(USER_BIN_DIR)/python3: $(BUILD_DIR)/$(USER_DIR)/bin/python3.o $(USER_LIB_OBJS) $(USER_CRT_OBJ) $(USER_LD_SCRIPT) $(PYTHON_LIBPY)
+	@mkdir -p $(dir $@)
+	$(LD) -nostdlib -z max-page-size=0x1000 $(USER_CRT_OBJ) $(USER_LIB_OBJS) $< $(PYTHON_LIBPY) -o $@ -T $(USER_LD_SCRIPT)
+
+$(PYTHON_LIBPY):
+	@$(MAKE) -C $(PYTHON_BUILD_DIR) -j2 V=1 libpython3.10.a
+
 $(FONT_GEN_SRC): $(FONT_TTF) tools/gen_font.py
 	@mkdir -p $(dir $@)
 	python3 tools/gen_font.py --ttf $(FONT_TTF) --out $@
@@ -166,7 +177,10 @@ $(GDB_SCRIPT): $(KERNEL_ELF) $(KERNEL_KIMAGE_ELF)
 $(DISK_IMG): $(USER_BINS) script/disk.sh script/Makefile script/fdisk.args
 	@echo "Creating disk image..."
 	@rm -f $(DISK_IMG)
-	@$(MAKE) -C script USER_BINS_DIR="$(abspath $(USER_BIN_DIR))"
+	@$(MAKE) -C script \
+		USER_BINS_DIR="$(abspath $(USER_BIN_DIR))" \
+		PYTHON_BIN="$(abspath $(USER_BIN_DIR)/python3)" \
+		PYTHON_LIB_DIR="$(abspath $(PYTHON_LIB_DIR))"
 	@mv script/disk.img $(DISK_IMG)
 
 .PHONY: disk

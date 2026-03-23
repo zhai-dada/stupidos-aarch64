@@ -7,6 +7,7 @@
 #include "lib/libstr.h"
 #include "mm/mm.h"
 #include "mm/page_alloc.h"
+#include "mmu.h"
 #include "sched.h"
 
 struct exec_image
@@ -124,6 +125,15 @@ static void exec_task_main(void *arg)
     {
         task_exit();
     }
+
+    /*
+     * 这里在“新任务真正开始执行”的第一时间标记 exec 镜像范围。
+     * 避免 kthread_create() 返回到父任务后，子任务已经先跑起来导致的竞态：
+     * 竞态窗口里若发生 fault，会被误判成非 exec 任务。
+     */
+    task->exec_base = (uint64_t)image->image_base;
+    task->exec_end = (uint64_t)image->image_base + ((uint64_t)PAGE_SIZE << image->image_order);
+    task->has_exec_image = true;
 
     task_set_cleanup(exec_cleanup, image);
     stack_top = (uint64_t)&task->stack[TASK_STACK_SIZE];
@@ -301,6 +311,28 @@ int exec_program(const int8_t *path, int argc, const int8_t *argv[])
             memset((int8_t *)(load_base + phdr[i].p_vaddr + phdr[i].p_filesz),
                    0,
                    (size_t)(phdr[i].p_memsz - phdr[i].p_filesz));
+        }
+    }
+
+    if (min_vaddr < PAGE_OFFSET &&
+        (!strcmp((int8_t *)path, (int8_t *)"/bin/python3") ||
+         !strcmp((int8_t *)path, (int8_t *)"/bin/python")))
+    {
+        uint64_t alias_va;
+        uint64_t alias_size;
+        uint64_t alias_pa;
+
+        /*
+         * Python 静态链接产物里存在少量“绝对低地址”引用。
+         * 这里给它补一个低地址 alias 窗口，让这些引用能落到同一份镜像内容。
+         */
+        alias_va = PAGE_ALIGN_DOWN(min_vaddr);
+        alias_size = exec_align_up(max_vaddr - alias_va, PAGE_SIZE);
+        alias_pa = kernel_virt_to_phys((uint64_t)image->image_base + (alias_va - min_vaddr));
+        if (mmu_map_low_alias(alias_va, alias_pa, alias_size, PAGE_KERNEL_EXEC))
+        {
+            exec_cleanup(image);
+            return -ENOMEM;
         }
     }
 

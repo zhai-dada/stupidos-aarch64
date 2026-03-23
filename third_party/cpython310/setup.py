@@ -2225,6 +2225,11 @@ class PyBuildExt(build_ext):
     def detect_ctypes(self):
         # Thomas Heller's _ctypes module
 
+        if os.environ.get("STUPIDOS_MINIMAL_OS") == "1":
+            # stupidos 最小环境暂时不带 libffi，先跳过 _ctypes，
+            # 避免构建时去找宿主机的 ffi.h / libffi。
+            return
+
         if (not sysconfig.get_config_var("LIBFFI_INCLUDEDIR") and MACOS):
             self.use_system_libffi = True
         else:

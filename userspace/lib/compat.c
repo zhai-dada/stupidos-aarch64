@@ -59,7 +59,7 @@ struct u_aligned_cookie
 
 static struct u_heap_arena *u_heap_arenas;
 static char *u_environ_items[16];
-char **environ = u_environ_items;
+char **environ;
 int errno;
 static char u_locale_name[16] = "C";
 static struct lconv u_locale_conv;
@@ -81,6 +81,21 @@ struct u_dir_stream
     uint32_t index;
 };
 static struct dirent u_dirent_entry;
+
+void u_lib_early_init(void)
+{
+    /*
+     * 关键修复：不要用全局静态初始化把 environ 指向 u_environ_items。
+     * 该初始化会在可执行文件链接虚拟地址下固化成低地址常量，加载到高地址后失效。
+     * 这里在运行时用真实地址重新绑定，避免 Python/stdlib 在 getenv/setenv 路径崩溃。
+     */
+    environ = u_environ_items;
+}
+
+static bool u_sysret_is_error(int64_t value)
+{
+    return value < 0 && value >= -4095;
+}
 
 static uint64_t u_align_up(uint64_t value, uint64_t align)
 {
@@ -108,12 +123,21 @@ static struct u_heap_arena *u_heap_new_arena(uint64_t need)
 {
     struct u_heap_arena *arena;
     struct u_heap_chunk *chunk;
+    int64_t map_ret;
     uint64_t size;
 
     size = u_heap_round_size(need);
-    arena = (struct u_heap_arena *)u_mmap(0, size, 0, 0, -1, 0);
+    map_ret = (int64_t)u_mmap(0, size, 0, 0, -1, 0);
+    if (u_sysret_is_error(map_ret))
+    {
+        errno = (int)(-map_ret);
+        return 0;
+    }
+
+    arena = (struct u_heap_arena *)(uint64_t)map_ret;
     if (!arena)
     {
+        errno = ENOMEM;
         return 0;
     }
 
@@ -645,6 +669,11 @@ int isspace(int ch)
     return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\v' || ch == '\f';
 }
 
+int isascii(int ch)
+{
+    return ((unsigned int)ch & ~0x7FU) == 0U;
+}
+
 int isdigit(int ch)
 {
     return ch >= '0' && ch <= '9';
@@ -1125,9 +1154,21 @@ long wcstol(const wchar_t *nptr, wchar_t **endptr, int base)
 size_t mbstowcs(wchar_t *dst, const char *src, size_t len)
 {
     size_t i = 0;
+    uintptr_t src_addr;
 
-    if (!src)
+    src_addr = (uintptr_t)src;
+    if (!src ||
+        src_addr == (uintptr_t)-1 ||
+        src_addr == (uintptr_t)0xffffffffU ||
+        (src_addr >= (uintptr_t)0x80000000ULL &&
+         src_addr < (uintptr_t)0xffff000000000000ULL) ||
+        src_addr < 0x1000U)
     {
+        /*
+         * 某些兼容路径（尤其是 Python 启动早期探测）可能把错误码哨兵值
+         * 当成字符串指针传进来。这里统一返回 DECODE_ERROR，避免用户态
+         * 直接触发 data abort。
+         */
         return (size_t)-1;
     }
     while (src[i] && (!dst || i < len))
@@ -1148,8 +1189,15 @@ size_t mbstowcs(wchar_t *dst, const char *src, size_t len)
 size_t wcstombs(char *dst, const wchar_t *src, size_t len)
 {
     size_t i = 0;
+    uintptr_t src_addr;
 
-    if (!src)
+    src_addr = (uintptr_t)src;
+    if (!src ||
+        src_addr == (uintptr_t)-1 ||
+        src_addr == (uintptr_t)0xffffffffU ||
+        (src_addr >= (uintptr_t)0x80000000ULL &&
+         src_addr < (uintptr_t)0xffff000000000000ULL) ||
+        src_addr < 0x1000U)
     {
         return (size_t)-1;
     }
@@ -1990,6 +2038,22 @@ int open(const char *path, int flags, ...)
     return u_open((const int8_t *)path, u_translate_open_flags(flags));
 }
 
+int open64(const char *path, int flags, ...)
+{
+    va_list ap;
+    int mode;
+
+    if (flags & O_CREAT)
+    {
+        va_start(ap, flags);
+        mode = va_arg(ap, int);
+        va_end(ap);
+        (void)mode;
+    }
+
+    return u_open((const int8_t *)path, u_translate_open_flags(flags));
+}
+
 int openat(int dirfd, const char *path, int flags, ...)
 {
     va_list ap;
@@ -2026,6 +2090,11 @@ off_t lseek(int fd, off_t offset, int whence)
     return (off_t)u_lseek(fd, offset, whence);
 }
 
+off_t lseek64(int fd, off_t offset, int whence)
+{
+    return (off_t)u_lseek(fd, offset, whence);
+}
+
 int stat(const char *path, struct stat *out)
 {
     return u_stat((const int8_t *)path, (struct stupidos_stat *)out);
@@ -2044,6 +2113,16 @@ int stat64(const char *path, struct stat64 *out)
 int fstat64(int fd, struct stat64 *out)
 {
     return u_fstat(fd, (struct stupidos_stat *)out);
+}
+
+ssize_t pread64(int fd, void *buf, size_t len, off_t off)
+{
+    return u_pread64(fd, buf, len, (uint64_t)off);
+}
+
+ssize_t pwrite64(int fd, const void *buf, size_t len, off_t off)
+{
+    return u_pwrite64(fd, buf, len, (uint64_t)off);
 }
 
 int lstat64(const char *path, struct stat64 *out)
@@ -2263,12 +2342,30 @@ time_t time(time_t *tloc)
 
 ssize_t getrandom(void *buf, size_t len, unsigned int flags)
 {
-    return u_getrandom(buf, len, flags);
+    int64_t ret;
+
+    ret = (int64_t)u_getrandom(buf, len, flags);
+    if (u_sysret_is_error(ret))
+    {
+        errno = (int)(-ret);
+        return -1;
+    }
+
+    return (ssize_t)ret;
 }
 
 void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off)
 {
-    return u_mmap(addr, len, prot, flags, fd, off);
+    int64_t ret;
+
+    ret = (int64_t)u_mmap(addr, len, prot, flags, fd, off);
+    if (u_sysret_is_error(ret))
+    {
+        errno = (int)(-ret);
+        return (void *)-1;
+    }
+
+    return (void *)(uint64_t)ret;
 }
 
 int munmap(void *addr, size_t len)
@@ -2700,6 +2797,27 @@ int pipe2(int fds[2], int flags)
     return -ENOSYS;
 }
 
+int openpty(int *amaster, int *aslave, char *name, void *termp, void *winp)
+{
+    (void)amaster;
+    (void)aslave;
+    (void)name;
+    (void)termp;
+    (void)winp;
+    errno = ENOSYS;
+    return -1;
+}
+
+int pause(void)
+{
+    /*
+     * 当前还没有完整的异步信号挂起语义。
+     * 返回 EINTR 让上层回到错误处理路径，比死等更安全。
+     */
+    errno = EINTR;
+    return -1;
+}
+
 int getrlimit(int resource, struct rlimit *rlim)
 {
     return u_prlimit64(0, resource, 0, (struct stupidos_rlimit *)rlim);
@@ -3037,6 +3155,11 @@ long syscall(long number, ...)
         size_t len = va_arg(ap, size_t);
         unsigned int flags = va_arg(ap, unsigned int);
         ret = (long)u_getrandom(buf, len, flags);
+        if (ret < 0)
+        {
+            errno = (int)(-ret);
+            ret = -1;
+        }
         break;
     }
 #endif

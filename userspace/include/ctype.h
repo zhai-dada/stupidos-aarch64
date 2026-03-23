@@ -2,6 +2,7 @@
 #define __STUPIDOS_CTYPE_H__
 
 int isspace(int ch);
+int isascii(int ch);
 int isdigit(int ch);
 int isxdigit(int ch);
 int isalpha(int ch);

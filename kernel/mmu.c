@@ -569,6 +569,34 @@ int page_map_init(void)
     return 0;
 }
 
+int mmu_map_low_alias(uint64_t va_start, uint64_t pa_start, uint64_t size, uint64_t prot)
+{
+    if (!size)
+    {
+        return 0;
+    }
+
+    if (va_start >= PAGE_OFFSET)
+    {
+        return -1;
+    }
+
+    if (map_range_pte((pgd_t *)&idmap_pgd, &idmap_pool, va_start, pa_start, size, prot))
+    {
+        return -1;
+    }
+
+    /*
+     * 低地址 alias 动态更新后，需要显式失效旧 TLB。
+     * 这里直接用全局 TLBI，先保证行为正确，再考虑后续细化范围刷新。
+     */
+    dsb(ishst);
+    asm volatile("tlbi vmalle1");
+    dsb(ish);
+    isb();
+    return 0;
+}
+
 /*
  * 真正打开 MMU。
  *

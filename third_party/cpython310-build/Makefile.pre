@@ -251,7 +251,7 @@ SYSLIBS=	$(LIBM) $(LIBC)
 SHLIBS=		$(LIBS)
 
 DLINCLDIR=	.
-DYNLOADFILE=	dynload_shlib.o
+DYNLOADFILE=	dynload_stub.o
 MACHDEP_OBJS=	
 LIBOBJDIR=	Python/
 LIBOBJS=	 ${LIBOBJDIR}dup2$U.o
@@ -586,7 +586,9 @@ clinic: check-clean-src $(srcdir)/Modules/_blake2/blake2s_impl.c
 
 # Build the interpreter
 $(BUILDPYTHON):	Programs/python.o $(LIBRARY_DEPS)
-	$(LINKCC) $(PY_CORE_LDFLAGS) $(LINKFORSHARED) -o $@ Programs/python.o $(BLDLIBRARY) $(LIBS) $(MODLIBS) $(SYSLIBS)
+	# 这里强制生成静态 python 可执行文件，避免目标系统还没完整动态加载器时无法启动。
+	# Python 先以“单文件可执行 + 标准库目录”的方式落地，后续再逐步补共享扩展支持。
+	$(LINKCC) $(PY_CORE_LDFLAGS) -static $(LINKFORSHARED) -o $@ Programs/python.o $(BLDLIBRARY) $(MODLIBS) $(SYSLIBS) -lc
 
 platform: $(BUILDPYTHON) pybuilddir.txt
 	$(RUNSHARED) $(PYTHON_FOR_BUILD) -c 'import sys ; from sysconfig import get_platform ; print("%s-%d.%d" % (get_platform(), *sys.version_info[:2]))' >platform
@@ -812,6 +814,9 @@ Modules/grpmodule.o: $(srcdir)/Modules/grpmodule.c $(srcdir)/Modules/posixmodule
 Modules/pwdmodule.o: $(srcdir)/Modules/pwdmodule.c $(srcdir)/Modules/posixmodule.h
 
 Modules/signalmodule.o: $(srcdir)/Modules/signalmodule.c $(srcdir)/Modules/posixmodule.h
+
+Python/dynload_stub.o: $(srcdir)/Python/dynload_stub.c Makefile
+	$(CC) -c $(PY_CORE_CFLAGS) -o $@ $(srcdir)/Python/dynload_stub.c
 
 Python/dynload_shlib.o: $(srcdir)/Python/dynload_shlib.c Makefile
 	$(CC) -c $(PY_CORE_CFLAGS) \

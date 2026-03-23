@@ -121,5 +121,6 @@ void mmu_init(void);
 int enable_mmu(void);
 int page_map_init(void);
 int mmu_secondary_init(void);
+int mmu_map_low_alias(uint64_t va_start, uint64_t pa_start, uint64_t size, uint64_t prot);
 
 #endif

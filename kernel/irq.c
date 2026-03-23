@@ -1,4 +1,6 @@
 #include "irq.h"
+#include "mm/mm.h"
+#include "mmu.h"
 #include "sched.h"
 #include "softirq.h"
 #include "syscall.h"
@@ -21,6 +23,21 @@ static const char * const bad_mode_handler[] =
 static inline bool gic_irq_is_special_id(uint32_t irqnr)
 {
     return irqnr >= 1020U;
+}
+
+static uint32_t sync_fault_inst_safe(uint64_t pc)
+{
+    /*
+     * 异常日志本身也要可恢复：只在已知映射窗口里取指令字，
+     * 避免“打印 fault 信息”再次触发数据异常。
+     */
+    if ((pc >= PAGE_OFFSET && pc < (PAGE_OFFSET + TOTAL_MEMORY)) ||
+        (pc >= KIMAGE_VADDR && pc < (KIMAGE_VADDR + TOTAL_MEMORY)))
+    {
+        return *(uint32_t *)pc;
+    }
+
+    return 0;
 }
 
 static void dump_backtrace(pt_regs_t *regs)
@@ -89,6 +106,11 @@ void do_sync(void *stack, uint32_t esr)
 {
 	pt_regs_t* regs = (pt_regs_t*)stack;
     struct task_struct *curr;
+    bool likely_user_pc;
+    bool low_user_pc;
+    uint64_t bt_lr0;
+    uint64_t bt_lr1;
+    uint64_t fp;
 	uint32_t ec;
 	
 	disable_irq();
@@ -107,19 +129,41 @@ void do_sync(void *stack, uint32_t esr)
 	}
 
     curr = task_current();
-    if (curr && curr->has_exec_image)
+    likely_user_pc = regs->s_pc >= PAGE_OFFSET && regs->s_pc < KIMAGE_VADDR;
+    low_user_pc = regs->s_pc < PAGE_OFFSET;
+    if (curr && !curr->is_idle &&
+        (curr->has_exec_image || likely_user_pc || low_user_pc || curr->pid > 0))
     {
+        bt_lr0 = 0;
+        bt_lr1 = 0;
+        fp = regs->s_fp;
+        if (fp >= regs->s_sp && fp + 16UL <= regs->s_sp + 0x4000UL)
+        {
+            uint64_t prev_fp = ((uint64_t *)fp)[0];
+            bt_lr0 = ((uint64_t *)fp)[1];
+            if (prev_fp > fp &&
+                prev_fp + 16UL <= regs->s_sp + 0x4000UL)
+            {
+                bt_lr1 = ((uint64_t *)prev_fp)[1];
+            }
+        }
         /*
          * 用户态 ELF 任务异常时，优先回收当前任务。
          * 由上层 supervisor 负责重启 shell，避免整个系统卡死在异常循环里。
          */
         printk("[irq\ttrace]: exec task fault pid=%d comm=%s ec=0x%x far_el1=%#lx\n",
                curr->pid, curr->comm, ec, read_sysreg(far_el1));
+        printk("[irq\ttrace]: fault-task state pid=%d exec=%u pc=%#lx lowpc=%u linearmap=%u\n",
+               curr->pid, curr->has_exec_image ? 1 : 0, regs->s_pc,
+               low_user_pc ? 1U : 0U, likely_user_pc ? 1U : 0U);
+        printk("[irq\ttrace]: fault-reg x0=%#lx x1=%#lx x2=%#lx x8=%#lx lr=%#lx sp=%#lx\n",
+               regs->s_reg[0], regs->s_reg[1], regs->s_reg[2], regs->s_reg[8], regs->s_lr, regs->s_sp);
+        printk("[irq trace] fp=%lx bt0=%lx bt1=%lx\n", regs->s_fp, bt_lr0, bt_lr1);
         show_ptregs(regs);
         dump_backtrace(regs);
         printk("[irq\ttrace]: fault pc=%#lx inst=%08x\n",
                regs->s_pc,
-               *(uint32_t *)regs->s_pc);
+               sync_fault_inst_safe(regs->s_pc));
         task_exit();
     }
 
@@ -127,7 +171,7 @@ void do_sync(void *stack, uint32_t esr)
     dump_backtrace(regs);
     printk("[irq\ttrace]: fault pc=%#lx inst=%08x\n",
 	       regs->s_pc,
-	       *(uint32_t *)regs->s_pc);
+	       sync_fault_inst_safe(regs->s_pc));
     printk("[irq\ttrace]: stage=%u iar=%#x aiar=%#x irq=%u eoir=%#x hppir=%u ahppir=%u ctlr=%#x\n",
            irq_debug_stage,
            irq_debug_iar,

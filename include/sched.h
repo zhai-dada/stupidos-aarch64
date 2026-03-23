@@ -11,7 +11,7 @@
 #define TASK_CWD_LEN        256
 #define TASK_HEAP_PAGES     2048
 #define TASK_HEAP_ORDER     11
-#define TASK_MAX_MMAPS      8
+#define TASK_MAX_MMAPS      8192
 
 typedef void (*task_entry_t)(void *arg);
 typedef void (*task_cleanup_t)(void *arg);

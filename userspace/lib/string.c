@@ -8,15 +8,26 @@ size_t u_strlen(const int8_t *str)
 size_t u_strnlen(const int8_t *str, size_t max_len)
 {
     size_t len;
+    uint64_t addr;
 
     len = 0;
+    addr = (uint64_t)str;
     /*
      * 用户态和内核当前还共享同一套地址空间。
      * 一旦字符串指针被污染成 0x1c 这类低地址，继续逐字节读只会直接进异常。
      * 这里先做最小防御：空指针和低地址指针一律视为无效字符串。
      */
-    if (!str || (uint64_t)str < 0x1000UL || !max_len)
+    if (!str ||
+        addr < 0x1000UL ||
+        addr == 0xffffffffUL ||
+        addr == (uint64_t)-1 ||
+        (addr >= 0x80000000UL && addr < 0xffff000000000000UL) ||
+        !max_len)
     {
+        /*
+         * Python 兼容层里有些探测路径会把 -1 当作“错误哨兵”流到字符串 API。
+         * 这里直接返回 0，防止用户态因非法地址解引用而崩溃。
+         */
         return 0;
     }
 

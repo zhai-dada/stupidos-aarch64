@@ -67,6 +67,18 @@ my_getpagesize(void)
 #define my_getpagesize getpagesize
 #endif
 
+#ifndef my_getallocationgranularity
+static int
+my_getallocationgranularity(void)
+{
+    /*
+     * stupidos 先把分配粒度退化为页面大小。
+     * 这样 mmap 模块至少能编译通过，后续再接真实平台粒度值。
+     */
+    return my_getpagesize();
+}
+#endif
+
 #endif /* UNIX */
 
 #include <string.h>

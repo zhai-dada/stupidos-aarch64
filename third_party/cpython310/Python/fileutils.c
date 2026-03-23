@@ -3,6 +3,7 @@
 #include "pycore_runtime.h"       // _PyRuntime
 #include "osdefs.h"               // SEP
 #include <locale.h>
+#include <stdint.h>
 
 #ifdef MS_WINDOWS
 #  include <malloc.h>
@@ -44,6 +45,19 @@ int _Py_open_cloexec_works = -1;
 // mbstowcs() and mbrtowc() errors
 static const size_t DECODE_ERROR = ((size_t)-1);
 static const size_t INCOMPLETE_CHARACTER = (size_t)-2;
+
+static int
+_Py_stupidos_bad_cstr(const char *p)
+{
+    uintptr_t v = (uintptr_t)p;
+
+    return (p == NULL ||
+            v == (uintptr_t)-1 ||
+            v == (uintptr_t)0xffffffffU ||
+            v < (uintptr_t)0x1000U ||
+            (v >= (uintptr_t)0x80000000ULL &&
+             v < (uintptr_t)0xffff000000000000ULL));
+}
 
 
 static int
@@ -384,6 +398,19 @@ static int
 decode_ascii(const char *arg, wchar_t **wstr, size_t *wlen,
              const char **reason, _Py_error_handler errors)
 {
+    if (_Py_stupidos_bad_cstr(arg)) {
+        if (wstr != NULL) {
+            *wstr = NULL;
+        }
+        if (wlen != NULL) {
+            *wlen = 0;
+        }
+        if (reason != NULL) {
+            *reason = "invalid locale input pointer";
+        }
+        return -2;
+    }
+
     wchar_t *res;
     unsigned char *in;
     wchar_t *out;
@@ -436,6 +463,19 @@ static int
 decode_current_locale(const char* arg, wchar_t **wstr, size_t *wlen,
                       const char **reason, _Py_error_handler errors)
 {
+    if (_Py_stupidos_bad_cstr(arg)) {
+        if (wstr != NULL) {
+            *wstr = NULL;
+        }
+        if (wlen != NULL) {
+            *wlen = 0;
+        }
+        if (reason != NULL) {
+            *reason = "invalid locale input pointer";
+        }
+        return -2;
+    }
+
     wchar_t *res;
     size_t argsize;
     size_t count;
@@ -584,6 +624,14 @@ _Py_DecodeLocaleEx(const char* arg, wchar_t **wstr, size_t *wlen,
                    const char **reason,
                    int current_locale, _Py_error_handler errors)
 {
+    if (_Py_stupidos_bad_cstr(arg)) {
+        /*
+         * stupidos 兼容层在部分探测路径下会把错误哨兵值传入这里。
+         * 先降级为空字符串，避免启动阶段直接因非法指针崩溃。
+         */
+        arg = "";
+    }
+
     if (current_locale) {
 #ifdef _Py_FORCE_UTF8_LOCALE
         return _Py_DecodeUTF8Ex(arg, strlen(arg), wstr, wlen, reason,

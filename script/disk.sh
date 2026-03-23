@@ -12,6 +12,8 @@ P2_OFFSET=$((P2_START * SECTOR_SIZE))
 TMP_ROOT="$(mktemp -d)"
 TMP_FAT="$(mktemp -d)"
 P1_OFFSET=$((P1_START * SECTOR_SIZE))
+PYTHON_BIN="${PYTHON_BIN:-}"
+PYTHON_LIB_DIR="${PYTHON_LIB_DIR:-}"
 
 cleanup() {
     rm -rf "$TMP_ROOT"
@@ -32,6 +34,40 @@ printf "mount point for fat32\n" > "$TMP_ROOT/boot/README"
 if [ -n "${USER_BINS_DIR:-}" ] && [ -d "$USER_BINS_DIR" ]; then
     find "$USER_BINS_DIR" -maxdepth 1 -type f -exec cp {} "$TMP_ROOT/bin/" \;
     find "$TMP_ROOT/bin" -maxdepth 1 -type f -exec chmod 755 {} \;
+    if [ -f "$TMP_ROOT/bin/python3" ] && [ ! -f "$TMP_ROOT/bin/python" ]; then
+        cp "$TMP_ROOT/bin/python3" "$TMP_ROOT/bin/python"
+        chmod 755 "$TMP_ROOT/bin/python"
+    fi
+fi
+
+if [ -n "$PYTHON_BIN" ] && [ -f "$PYTHON_BIN" ]; then
+    # 先把 Python 作为真正的目标系统可执行文件装进 rootfs。
+    # 这里同时放到 /bin 和 /usr/local/bin，兼容 shell 的 PATH 搜索和未来的标准布局。
+    mkdir -p "$TMP_ROOT/bin" \
+        "$TMP_ROOT/usr/local/bin" \
+        "$TMP_ROOT/usr/local/lib/python3.10"
+    cp "$PYTHON_BIN" "$TMP_ROOT/bin/python"
+    cp "$PYTHON_BIN" "$TMP_ROOT/bin/python3"
+    cp "$PYTHON_BIN" "$TMP_ROOT/usr/local/bin/python3.10"
+    cp "$PYTHON_BIN" "$TMP_ROOT/usr/local/bin/python3"
+    cp "$PYTHON_BIN" "$TMP_ROOT/usr/local/bin/python"
+    chmod 755 "$TMP_ROOT/bin/python" \
+        "$TMP_ROOT/bin/python3" \
+        "$TMP_ROOT/usr/local/bin/python3.10" \
+        "$TMP_ROOT/usr/local/bin/python3" \
+        "$TMP_ROOT/usr/local/bin/python"
+fi
+
+if [ -n "$PYTHON_LIB_DIR" ] && [ -d "$PYTHON_LIB_DIR" ]; then
+    # 标准库目录直接复制到 /usr/local/lib/python3.10。
+    # Python 启动和最基本的 import 需要这里的纯 Python 模块。
+    mkdir -p "$TMP_ROOT/usr/local/lib/python3.10"
+    cp -a "$PYTHON_LIB_DIR"/. "$TMP_ROOT/usr/local/lib/python3.10/"
+    find "$TMP_ROOT/usr/local/lib/python3.10" -type d -name "__pycache__" -prune -exec rm -rf {} +
+    rm -rf "$TMP_ROOT/usr/local/lib/python3.10/test" \
+        "$TMP_ROOT/usr/local/lib/python3.10/idlelib" \
+        "$TMP_ROOT/usr/local/lib/python3.10/tkinter" \
+        "$TMP_ROOT/usr/local/lib/python3.10/lib2to3" 2>/dev/null || true
 fi
 
 printf "hello from fat32 boot volume\n" > "$TMP_FAT/README.TXT"

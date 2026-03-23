@@ -124,6 +124,153 @@ static int64_t sys_task_mmap_alloc(struct task_struct *task, uint64_t size)
     return (int64_t)(uint64_t)addr;
 }
 
+static bool sys_range_inside(uint64_t addr, size_t len, uint64_t start, uint64_t end)
+{
+    uint64_t last;
+
+    if (!start || end <= start)
+    {
+        return false;
+    }
+
+    if (addr < start || addr >= end)
+    {
+        return false;
+    }
+
+    if (!len)
+    {
+        return true;
+    }
+
+    if (len - 1 > end - 1 - addr)
+    {
+        return false;
+    }
+
+    last = addr + (uint64_t)len - 1ULL;
+    return last < end;
+}
+
+static bool sys_user_mem_valid(const void *user_ptr, size_t len)
+{
+    struct task_struct *task;
+    uint64_t addr;
+    uint64_t stack_base;
+    uint32_t i;
+
+    if (!user_ptr)
+    {
+        return false;
+    }
+
+    addr = (uint64_t)user_ptr;
+    if (len > 0 && addr + (uint64_t)len < addr)
+    {
+        return false;
+    }
+
+    task = task_current();
+    if (!task || !task->has_exec_image)
+    {
+        return false;
+    }
+
+    stack_base = (uint64_t)&task->stack[0];
+
+    if (sys_range_inside(addr, len, task->exec_base, task->exec_end) ||
+        sys_range_inside(addr, len, task->heap_base, task->heap_end) ||
+        sys_range_inside(addr, len, stack_base, stack_base + TASK_STACK_SIZE))
+    {
+        return true;
+    }
+
+    for (i = 0; i < TASK_MAX_MMAPS; i++)
+    {
+        if (!task->mmaps[i].used)
+        {
+            continue;
+        }
+
+        if (sys_range_inside(addr, len, task->mmaps[i].addr, task->mmaps[i].addr + task->mmaps[i].size))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static int64_t sys_copy_from_user(void *dst, const void *user_src, size_t len)
+{
+    if (!len)
+    {
+        return 0;
+    }
+
+    if (!dst || !sys_user_mem_valid(user_src, len))
+    {
+        return -EFAULT;
+    }
+
+    memcpy((int8_t *)dst, (int8_t *)user_src, len);
+    return 0;
+}
+
+static int64_t sys_copy_to_user(void *user_dst, const void *src, size_t len)
+{
+    if (!len)
+    {
+        return 0;
+    }
+
+    if (!src || !sys_user_mem_valid(user_dst, len))
+    {
+        return -EFAULT;
+    }
+
+    memcpy((int8_t *)user_dst, (int8_t *)src, len);
+    return 0;
+}
+
+static int64_t sys_copy_path_from_user(int8_t *dst, size_t dst_len, const int8_t *user_path)
+{
+    size_t n;
+
+    if (!dst || !dst_len)
+    {
+        return -EINVAL;
+    }
+
+    if (!user_path)
+    {
+        return -EINVAL;
+    }
+
+    /*
+     * 关键防护：路径字符串必须来自当前用户任务自己的内存区域。
+     * 这样可以避免内核在 vfs_* 的字符串扫描里直接踩到坏地址。
+     */
+    if (!sys_user_mem_valid(user_path, dst_len))
+    {
+        return -EFAULT;
+    }
+
+    n = 0;
+    while (n < dst_len && user_path[n] != '\0')
+    {
+        n++;
+    }
+
+    if (!n || n >= dst_len)
+    {
+        return -ENAMETOOLONG;
+    }
+
+    memcpy((int8_t *)dst, (int8_t *)user_path, n + 1);
+    return 0;
+}
+
 static int64_t sys_read(int64_t fd, int64_t buf, int64_t len)
 {
     uint8_t *bytes;
@@ -135,6 +282,11 @@ static int64_t sys_read(int64_t fd, int64_t buf, int64_t len)
         if (len <= 0)
         {
             return 0;
+        }
+
+        if (!sys_user_mem_valid((const void *)buf, (size_t)len))
+        {
+            return -EFAULT;
         }
 
         bytes = (uint8_t *)buf;
@@ -183,6 +335,11 @@ static int64_t sys_read(int64_t fd, int64_t buf, int64_t len)
 
     if (fd >= 3)
     {
+        if (!sys_user_mem_valid((const void *)buf, (size_t)len))
+        {
+            return -EFAULT;
+        }
+
         return vfs_read((int)(fd - 3), (void *)buf, (size_t)len);
     }
 
@@ -193,8 +350,18 @@ static int64_t sys_write(int64_t fd, int64_t buf, int64_t len)
 {
     const uint8_t *bytes;
 
+    if (len < 0)
+    {
+        return -EINVAL;
+    }
+
     if (fd == 1 || fd == 2)
     {
+        if (!sys_user_mem_valid((const void *)buf, (size_t)len))
+        {
+            return -EFAULT;
+        }
+
         bytes = (const uint8_t *)buf;
         tty_write_bytes(bytes, (size_t)len);
         return len;
@@ -202,6 +369,11 @@ static int64_t sys_write(int64_t fd, int64_t buf, int64_t len)
 
     if (fd >= 3)
     {
+        if (!sys_user_mem_valid((const void *)buf, (size_t)len))
+        {
+            return -EFAULT;
+        }
+
         return vfs_write((int)(fd - 3), (const void *)buf, (size_t)len);
     }
 
@@ -210,9 +382,17 @@ static int64_t sys_write(int64_t fd, int64_t buf, int64_t len)
 
 static int64_t sys_open(int64_t path, int64_t flags)
 {
+    int8_t kpath[VFS_PATH_MAX];
     int fd;
+    int64_t ret;
 
-    fd = vfs_open((const int8_t *)path, (int)flags);
+    ret = sys_copy_path_from_user(kpath, sizeof(kpath), (const int8_t *)path);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    fd = vfs_open(kpath, (int)flags);
     if (fd < 0)
     {
         return fd;
@@ -274,7 +454,23 @@ static int64_t sys_exit(int64_t code)
 
 static int64_t sys_readdir(int64_t path, int64_t index, int64_t out)
 {
-    return vfs_readdir((const int8_t *)path, (uint32_t)index, (struct vfs_dirent *)out);
+    int8_t kpath[VFS_PATH_MAX];
+    struct vfs_dirent ent;
+    int64_t ret;
+
+    ret = sys_copy_path_from_user(kpath, sizeof(kpath), (const int8_t *)path);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    ret = vfs_readdir(kpath, (uint32_t)index, &ent);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    return sys_copy_to_user((void *)out, &ent, sizeof(ent));
 }
 
 static int64_t sys_nettest(void)
@@ -397,7 +593,16 @@ static int64_t sys_netcfg(int64_t ipv4, int64_t netmask, int64_t gateway)
 
 static int64_t sys_chdir(int64_t path)
 {
-    return vfs_chdir((const int8_t *)path);
+    int8_t kpath[VFS_PATH_MAX];
+    int64_t ret;
+
+    ret = sys_copy_path_from_user(kpath, sizeof(kpath), (const int8_t *)path);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    return vfs_chdir(kpath);
 }
 
 static int64_t sys_getcwd(int64_t buf, int64_t len)
@@ -443,43 +648,79 @@ static int64_t sys_getcwd(int64_t buf, int64_t len)
         return -ERANGE;
     }
 
+    if (!sys_user_mem_valid((const void *)buf, cwd_len))
+    {
+        return -EFAULT;
+    }
+
     memcpy((int8_t *)buf, (int8_t *)cwd, cwd_len);
     return (int64_t)(cwd_len - 1);
 }
 
 static int64_t sys_stat(int64_t path, int64_t out)
 {
-    return vfs_stat((const int8_t *)path, (struct vfs_stat *)out);
+    int8_t kpath[VFS_PATH_MAX];
+    struct vfs_stat st;
+    int64_t ret;
+
+    ret = sys_copy_path_from_user(kpath, sizeof(kpath), (const int8_t *)path);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    ret = vfs_stat(kpath, &st);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    return sys_copy_to_user((void *)out, &st, sizeof(st));
 }
 
 static int64_t sys_fstat(int64_t fd, int64_t out)
 {
-    return vfs_fstat((int)fd, (struct vfs_stat *)out);
+    struct vfs_stat st;
+    int64_t kfd;
+    int64_t ret;
+
+    if (fd < 0)
+    {
+        return -EBADF;
+    }
+
+    kfd = (fd >= 3) ? (fd - 3) : fd;
+    ret = vfs_fstat((int)kfd, &st);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    return sys_copy_to_user((void *)out, &st, sizeof(st));
 }
 
 static int64_t sys_uname(int64_t out)
 {
-    struct stupidos_utsname *uts;
+    struct stupidos_utsname uts;
 
     if (!out)
     {
         return -EINVAL;
     }
 
-    uts = (struct stupidos_utsname *)out;
-    memset((int8_t *)uts, 0, sizeof(*uts));
-    memcpy((int8_t *)uts->sysname, (int8_t *)"Stupidos", sizeof("Stupidos"));
-    memcpy((int8_t *)uts->nodename, (int8_t *)"stupidos", sizeof("stupidos"));
-    memcpy((int8_t *)uts->release, (int8_t *)"0.1", sizeof("0.1"));
-    memcpy((int8_t *)uts->version, (int8_t *)"stupidos-aarch64", sizeof("stupidos-aarch64"));
-    memcpy((int8_t *)uts->machine, (int8_t *)"aarch64", sizeof("aarch64"));
-    memcpy((int8_t *)uts->domainname, (int8_t *)"localdomain", sizeof("localdomain"));
-    return 0;
+    memset((int8_t *)&uts, 0, sizeof(uts));
+    memcpy((int8_t *)uts.sysname, (int8_t *)"Stupidos", sizeof("Stupidos"));
+    memcpy((int8_t *)uts.nodename, (int8_t *)"stupidos", sizeof("stupidos"));
+    memcpy((int8_t *)uts.release, (int8_t *)"0.1", sizeof("0.1"));
+    memcpy((int8_t *)uts.version, (int8_t *)"stupidos-aarch64", sizeof("stupidos-aarch64"));
+    memcpy((int8_t *)uts.machine, (int8_t *)"aarch64", sizeof("aarch64"));
+    memcpy((int8_t *)uts.domainname, (int8_t *)"localdomain", sizeof("localdomain"));
+    return sys_copy_to_user((void *)out, &uts, sizeof(uts));
 }
 
 static int64_t sys_gettimeofday(int64_t out)
 {
-    struct stupidos_timeval *tv;
+    struct stupidos_timeval tv;
     uint64_t usec;
 
     if (!out)
@@ -487,11 +728,10 @@ static int64_t sys_gettimeofday(int64_t out)
         return -EINVAL;
     }
 
-    tv = (struct stupidos_timeval *)out;
     usec = sys_monotonic_usec();
-    tv->tv_sec = (int64_t)(usec / 1000000ULL);
-    tv->tv_usec = (int64_t)(usec % 1000000ULL);
-    return 0;
+    tv.tv_sec = (int64_t)(usec / 1000000ULL);
+    tv.tv_usec = (int64_t)(usec % 1000000ULL);
+    return sys_copy_to_user((void *)out, &tv, sizeof(tv));
 }
 
 static int64_t sys_isatty(int64_t fd)
@@ -552,6 +792,8 @@ static int64_t sys_mmap(int64_t addr, int64_t len, int64_t prot, int64_t flags, 
 {
     struct task_struct *task;
     int64_t mapped;
+    uint32_t used_slots;
+    uint32_t i;
 
     (void)addr;
     (void)prot;
@@ -571,6 +813,20 @@ static int64_t sys_mmap(int64_t addr, int64_t len, int64_t prot, int64_t flags, 
     }
 
     mapped = sys_task_mmap_alloc(task, (uint64_t)len);
+    if (mapped < 0 && mapped >= -4095)
+    {
+        used_slots = 0;
+        for (i = 0; i < TASK_MAX_MMAPS; i++)
+        {
+            if (task->mmaps[i].used)
+            {
+                used_slots++;
+            }
+        }
+
+        printk("[syscall\tfault]: mmap fail pid=%d len=%ld ret=%ld used=%u/%u heap=%#lx..%#lx\n",
+               task->pid, len, mapped, used_slots, TASK_MAX_MMAPS, task->heap_base, task->heap_end);
+    }
     return mapped;
 }
 
@@ -618,7 +874,7 @@ static int64_t sys_mprotect(int64_t addr, int64_t len, int64_t prot)
 
 static int64_t sys_clock_gettime(int64_t clockid, int64_t out)
 {
-    struct stupidos_timespec *ts;
+    struct stupidos_timespec ts;
     uint64_t usec;
 
     (void)clockid;
@@ -628,16 +884,16 @@ static int64_t sys_clock_gettime(int64_t clockid, int64_t out)
         return -EINVAL;
     }
 
-    ts = (struct stupidos_timespec *)out;
     usec = sys_monotonic_usec();
-    ts->tv_sec = (int64_t)(usec / 1000000ULL);
-    ts->tv_nsec = (int64_t)((usec % 1000000ULL) * 1000ULL);
-    return 0;
+    ts.tv_sec = (int64_t)(usec / 1000000ULL);
+    ts.tv_nsec = (int64_t)((usec % 1000000ULL) * 1000ULL);
+    return sys_copy_to_user((void *)out, &ts, sizeof(ts));
 }
 
 static int64_t sys_nanosleep(int64_t req, int64_t rem)
 {
-    const struct stupidos_timespec *ts;
+    struct stupidos_timespec req_ts;
+    struct stupidos_timespec rem_ts;
     uint64_t ms;
 
     if (!req)
@@ -645,19 +901,25 @@ static int64_t sys_nanosleep(int64_t req, int64_t rem)
         return -EINVAL;
     }
 
-    ts = (const struct stupidos_timespec *)req;
-    if (ts->tv_sec < 0 || ts->tv_nsec < 0)
+    if (sys_copy_from_user(&req_ts, (const void *)req, sizeof(req_ts)) < 0)
+    {
+        return -EFAULT;
+    }
+
+    if (req_ts.tv_sec < 0 || req_ts.tv_nsec < 0)
     {
         return -EINVAL;
     }
 
-    ms = (uint64_t)ts->tv_sec * 1000ULL + ((uint64_t)ts->tv_nsec + 999999ULL) / 1000000ULL;
+    ms = (uint64_t)req_ts.tv_sec * 1000ULL + ((uint64_t)req_ts.tv_nsec + 999999ULL) / 1000000ULL;
     if (rem)
     {
-        struct stupidos_timespec *remain = (struct stupidos_timespec *)rem;
-
-        remain->tv_sec = 0;
-        remain->tv_nsec = 0;
+        rem_ts.tv_sec = 0;
+        rem_ts.tv_nsec = 0;
+        if (sys_copy_to_user((void *)rem, &rem_ts, sizeof(rem_ts)) < 0)
+        {
+            return -EFAULT;
+        }
     }
 
     sched_sleep_ms((uint32_t)ms);
@@ -686,6 +948,7 @@ static int64_t sys_getegid(void)
 
 static int64_t sys_access(int64_t path, int64_t mode)
 {
+    int8_t kpath[VFS_PATH_MAX];
     struct vfs_stat st;
     int ret;
 
@@ -695,7 +958,13 @@ static int64_t sys_access(int64_t path, int64_t mode)
         return -EINVAL;
     }
 
-    ret = vfs_stat((const int8_t *)path, &st);
+    ret = sys_copy_path_from_user(kpath, sizeof(kpath), (const int8_t *)path);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    ret = vfs_stat(kpath, &st);
     if (ret < 0)
     {
         return ret;
@@ -712,9 +981,26 @@ static int64_t sys_openat(int64_t dirfd, int64_t path, int64_t flags)
 
 static int64_t sys_fstatat(int64_t dirfd, int64_t path, int64_t out, int64_t flags)
 {
+    int8_t kpath[VFS_PATH_MAX];
+    struct vfs_stat st;
+    int64_t ret;
+
     (void)dirfd;
     (void)flags;
-    return vfs_stat((const int8_t *)path, (struct vfs_stat *)out);
+
+    ret = sys_copy_path_from_user(kpath, sizeof(kpath), (const int8_t *)path);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    ret = vfs_stat(kpath, &st);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    return sys_copy_to_user((void *)out, &st, sizeof(st));
 }
 
 static int64_t sys_readlink(int64_t path, int64_t buf, int64_t len)
@@ -754,6 +1040,7 @@ static int64_t sys_dup(int64_t oldfd)
 static int64_t sys_readv(int64_t fd, int64_t iov, int64_t iovcnt)
 {
     const struct stupidos_iovec *vec;
+    size_t vec_bytes;
     ssize_t total;
     int64_t i;
     ssize_t n;
@@ -761,6 +1048,17 @@ static int64_t sys_readv(int64_t fd, int64_t iov, int64_t iovcnt)
     if (!iov || iovcnt < 0)
     {
         return -EINVAL;
+    }
+
+    if ((uint64_t)iovcnt > ((uint64_t)-1 / sizeof(*vec)))
+    {
+        return -EINVAL;
+    }
+
+    vec_bytes = (size_t)iovcnt * sizeof(*vec);
+    if (!sys_user_mem_valid((const void *)iov, vec_bytes))
+    {
+        return -EFAULT;
     }
 
     vec = (const struct stupidos_iovec *)iov;
@@ -790,6 +1088,7 @@ static int64_t sys_readv(int64_t fd, int64_t iov, int64_t iovcnt)
 static int64_t sys_writev(int64_t fd, int64_t iov, int64_t iovcnt)
 {
     const struct stupidos_iovec *vec;
+    size_t vec_bytes;
     ssize_t total;
     int64_t i;
     ssize_t n;
@@ -797,6 +1096,17 @@ static int64_t sys_writev(int64_t fd, int64_t iov, int64_t iovcnt)
     if (!iov || iovcnt < 0)
     {
         return -EINVAL;
+    }
+
+    if ((uint64_t)iovcnt > ((uint64_t)-1 / sizeof(*vec)))
+    {
+        return -EINVAL;
+    }
+
+    vec_bytes = (size_t)iovcnt * sizeof(*vec);
+    if (!sys_user_mem_valid((const void *)iov, vec_bytes))
+    {
+        return -EFAULT;
     }
 
     vec = (const struct stupidos_iovec *)iov;
@@ -916,6 +1226,11 @@ static int64_t sys_getrandom(int64_t buf, int64_t len, int64_t flags)
         return -EINVAL;
     }
 
+    if (!sys_user_mem_valid((const void *)buf, (size_t)len))
+    {
+        return -EFAULT;
+    }
+
     (void)flags;
     sys_fill_random((void *)buf, (size_t)len);
     return len;
@@ -933,6 +1248,10 @@ static int64_t sys_set_tid_address(int64_t tidptr)
 
     if (tidptr)
     {
+        if (!sys_user_mem_valid((const void *)tidptr, sizeof(int32_t)))
+        {
+            return -EFAULT;
+        }
         *(int32_t *)tidptr = task->pid;
     }
 
@@ -964,10 +1283,16 @@ static int64_t sys_rt_sigprocmask(int64_t how, int64_t set, int64_t oldset, int6
 
 static int64_t sys_sigaltstack(int64_t ss, int64_t old_ss)
 {
+    uint8_t zero[32];
+
     (void)ss;
     if (old_ss)
     {
-        memset((int8_t *)old_ss, 0, 32);
+        memset((int8_t *)zero, 0, sizeof(zero));
+        if (sys_copy_to_user((void *)old_ss, zero, sizeof(zero)) < 0)
+        {
+            return -EFAULT;
+        }
     }
     return 0;
 }
@@ -993,6 +1318,11 @@ static int64_t sys_futex(int64_t uaddr, int64_t op, int64_t val, int64_t timeout
     }
 
     addr = (uint64_t)uaddr;
+    if (!sys_user_mem_valid((const void *)addr, sizeof(uint32_t)))
+    {
+        return -EFAULT;
+    }
+
     futex_op = (uint32_t)op & ~STUPIDOS_FUTEX_PRIVATE_FLAG;
     u32 = (uint32_t *)addr;
     curr = task_current();
@@ -1079,27 +1409,58 @@ static int64_t sys_futex(int64_t uaddr, int64_t op, int64_t val, int64_t timeout
 
 static int64_t sys_pread64(int64_t fd, int64_t buf, int64_t len, int64_t off)
 {
+    int64_t kfd;
+
     if (len < 0 || off < 0)
     {
         return -EINVAL;
     }
 
-    return vfs_pread((int)fd, (void *)buf, (size_t)len, (uint64_t)off);
+    if (fd < 3)
+    {
+        return -EBADF;
+    }
+
+    if (!sys_user_mem_valid((const void *)buf, (size_t)len))
+    {
+        return -EFAULT;
+    }
+
+    kfd = fd - 3;
+    return vfs_pread((int)kfd, (void *)buf, (size_t)len, (uint64_t)off);
 }
 
 static int64_t sys_pwrite64(int64_t fd, int64_t buf, int64_t len, int64_t off)
 {
+    int64_t kfd;
+
     if (len < 0 || off < 0)
     {
         return -EINVAL;
     }
 
-    return vfs_pwrite((int)fd, (const void *)buf, (size_t)len, (uint64_t)off);
+    if (fd < 3)
+    {
+        return -EBADF;
+    }
+
+    if (!sys_user_mem_valid((const void *)buf, (size_t)len))
+    {
+        return -EFAULT;
+    }
+
+    kfd = fd - 3;
+    return vfs_pwrite((int)kfd, (const void *)buf, (size_t)len, (uint64_t)off);
 }
 
 static int64_t sys_fcntl(int64_t fd, int64_t cmd, int64_t arg)
 {
-    return vfs_fcntl((int)fd, (int)cmd, (uint64_t)arg);
+    if (fd < 3)
+    {
+        return -EBADF;
+    }
+
+    return vfs_fcntl((int)(fd - 3), (int)cmd, (uint64_t)arg);
 }
 
 static int64_t sys_sched_getaffinity(int64_t pid, int64_t cpusetsize, int64_t mask)
@@ -1124,6 +1485,11 @@ static int64_t sys_sched_getaffinity(int64_t pid, int64_t cpusetsize, int64_t ma
     }
 
     bytes = (uint8_t *)mask;
+    if (!sys_user_mem_valid(bytes, (size_t)cpusetsize))
+    {
+        return -EFAULT;
+    }
+
     memset((int8_t *)bytes, 0, (size_t)cpusetsize);
     for (i = 0; i < cpu_count; i++)
     {
@@ -1134,21 +1500,20 @@ static int64_t sys_sched_getaffinity(int64_t pid, int64_t cpusetsize, int64_t ma
 
 static int64_t sys_sysinfo(int64_t info)
 {
-    struct stupidos_sysinfo *si;
+    struct stupidos_sysinfo si;
 
     if (!info)
     {
         return -EINVAL;
     }
 
-    si = (struct stupidos_sysinfo *)info;
-    memset((int8_t *)si, 0, sizeof(*si));
-    si->uptime = (int64_t)(jiffies / STUPIDOS_TIMER_HZ);
-    si->totalram = (uint64_t)page_alloc_total_pages() * PAGE_SIZE;
-    si->freeram = (uint64_t)page_alloc_free_pages() * PAGE_SIZE;
-    si->mem_unit = 1;
-    si->procs = 1;
-    return 0;
+    memset((int8_t *)&si, 0, sizeof(si));
+    si.uptime = (int64_t)(jiffies / STUPIDOS_TIMER_HZ);
+    si.totalram = (uint64_t)page_alloc_total_pages() * PAGE_SIZE;
+    si.freeram = (uint64_t)page_alloc_free_pages() * PAGE_SIZE;
+    si.mem_unit = 1;
+    si.procs = 1;
+    return sys_copy_to_user((void *)info, &si, sizeof(si));
 }
 
 static int64_t sys_prlimit64(int64_t pid, int64_t resource, int64_t new_limit, int64_t old_limit)
@@ -1167,9 +1532,15 @@ static int64_t sys_prlimit64(int64_t pid, int64_t resource, int64_t new_limit, i
 
     if (old_limit)
     {
+        struct stupidos_rlimit tmp;
+
         old_rlim = (struct stupidos_rlimit *)old_limit;
-        old_rlim->rlim_cur = 0xffffffffffffffffULL;
-        old_rlim->rlim_max = 0xffffffffffffffffULL;
+        tmp.rlim_cur = 0xffffffffffffffffULL;
+        tmp.rlim_max = 0xffffffffffffffffULL;
+        if (sys_copy_to_user(old_rlim, &tmp, sizeof(tmp)) < 0)
+        {
+            return -EFAULT;
+        }
     }
 
     return 0;
