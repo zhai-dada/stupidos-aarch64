@@ -4,7 +4,12 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#if defined(__TINYC__)
+typedef long ssize_t;
+typedef int pid_t;
+#else
 #include <sys/types.h>
+#endif
 
 /*
  * 用户态公共头：
@@ -74,6 +79,14 @@
 #define SYS_SCHED_GETAFFINITY 54
 #define SYS_SYSINFO     55
 #define SYS_PRLIMIT64   56
+#define SYS_GETDENTS64  57
+#define SYS_MKDIR       58
+#define SYS_RMDIR       59
+#define SYS_UNLINK      60
+#define SYS_RENAME      61
+#define SYS_TRUNCATE    62
+#define SYS_FTRUNCATE   63
+#define SYS_UTIMENSAT   64
 
 #define STUPIDOS_PATH_MAX       256
 
@@ -188,6 +201,15 @@ struct stupidos_utsname
     int8_t domainname[32];
 };
 
+struct stupidos_linux_dirent64
+{
+    uint64_t d_ino;
+    int64_t d_off;
+    uint16_t d_reclen;
+    uint8_t d_type;
+    int8_t d_name[];
+};
+
 ssize_t u_read(int fd, void *buf, size_t len);
 ssize_t u_write(int fd, const void *buf, size_t len);
 int u_open(const int8_t *path, int flags);
@@ -244,6 +266,14 @@ int u_fcntl(int fd, int cmd, uint64_t arg);
 int u_sched_getaffinity(int pid, size_t cpusetsize, void *mask);
 int u_sysinfo(struct stupidos_sysinfo *info);
 int u_prlimit64(int pid, int resource, const struct stupidos_rlimit *new_limit, struct stupidos_rlimit *old_limit);
+int u_getdents64(int fd, struct stupidos_linux_dirent64 *dirp, unsigned int count);
+int u_mkdir(const int8_t *path, uint32_t mode);
+int u_rmdir(const int8_t *path);
+int u_unlink(const int8_t *path);
+int u_rename(const int8_t *old_path, const int8_t *new_path);
+int u_truncate(const int8_t *path, uint64_t length);
+int u_ftruncate(int fd, uint64_t length);
+int u_utimensat(int dirfd, const int8_t *path, const struct stupidos_timespec *times, int flags);
 void u_exit(int code) __attribute__((noreturn));
 
 size_t u_strlen(const int8_t *str);

@@ -10,6 +10,7 @@
 #include "lib/libmem.h"
 #include "mm/mm.h"
 #include "mm/page_alloc.h"
+#include "mmu.h"
 #include "sched.h"
 #include "spinlock.h"
 #include "tty.h"
@@ -32,6 +33,7 @@ static uint64_t sys_monotonic_usec(void)
 }
 
 static uint64_t sys_random_state = 0x9e3779b97f4a7c15ULL;
+static uint32_t sys_getrandom_trace_count;
 
 struct futex_waiter
 {
@@ -157,6 +159,9 @@ static bool sys_user_mem_valid(const void *user_ptr, size_t len)
     struct task_struct *task;
     uint64_t addr;
     uint64_t stack_base;
+    uint64_t stack_phys;
+    uint64_t stack_linear;
+    uint64_t stack_kimage;
     uint32_t i;
 
     if (!user_ptr)
@@ -177,10 +182,27 @@ static bool sys_user_mem_valid(const void *user_ptr, size_t len)
     }
 
     stack_base = (uint64_t)&task->stack[0];
+    stack_phys = kernel_virt_to_phys(stack_base);
+    stack_linear = linear_phys_to_virt(stack_phys);
+    stack_kimage = kimage_phys_to_virt(stack_phys);
 
     if (sys_range_inside(addr, len, task->exec_base, task->exec_end) ||
+        /*
+         * Python 等静态用户态程序目前仍可能保留少量低地址绝对引用。
+         * exec 层会给这段低地址做 alias 映射，这里也要把该范围视为合法
+         * 用户地址，否则 getrandom/read/write 这类 syscall 会误判 EFAULT。
+         */
+        sys_range_inside(addr, len, task->exec_alias_base, task->exec_alias_end) ||
         sys_range_inside(addr, len, task->heap_base, task->heap_end) ||
-        sys_range_inside(addr, len, stack_base, stack_base + TASK_STACK_SIZE))
+        /*
+         * 栈地址兼容修复（中文）：
+         * task->stack 在调度器里常以“低地址别名”保存，
+         * 但用户态实际运行时 SP 可能落在 KIMAGE 高地址别名。
+         * 这里只认低地址会把合法 stdin/read/write 缓冲误判为 EFAULT。
+         */
+        sys_range_inside(addr, len, stack_base, stack_base + TASK_STACK_SIZE) ||
+        sys_range_inside(addr, len, stack_linear, stack_linear + TASK_STACK_SIZE) ||
+        sys_range_inside(addr, len, stack_kimage, stack_kimage + TASK_STACK_SIZE))
     {
         return true;
     }
@@ -236,6 +258,7 @@ static int64_t sys_copy_to_user(void *user_dst, const void *src, size_t len)
 static int64_t sys_copy_path_from_user(int8_t *dst, size_t dst_len, const int8_t *user_path)
 {
     size_t n;
+    int8_t ch;
 
     if (!dst || !dst_len)
     {
@@ -248,27 +271,34 @@ static int64_t sys_copy_path_from_user(int8_t *dst, size_t dst_len, const int8_t
     }
 
     /*
-     * 关键防护：路径字符串必须来自当前用户任务自己的内存区域。
-     * 这样可以避免内核在 vfs_* 的字符串扫描里直接踩到坏地址。
+     * 关键修复（中文）：
+     * 旧实现直接要求 `user_path` 起始处连续 `dst_len` 字节都可访问，
+     * 对短字符串/argv 边界很不友好，容易把合法路径误判为 EFAULT。
+     *
+     * 新实现改为“按字节探测+拷贝，直到遇到 '\\0'”：
+     * - 每次只验证当前 1 字节可访问
+     * - 既保留防护，也避免 `ls /bin` 这类短路径被误杀
      */
-    if (!sys_user_mem_valid(user_path, dst_len))
-    {
-        return -EFAULT;
-    }
-
     n = 0;
-    while (n < dst_len && user_path[n] != '\0')
+    while (n + 1 < dst_len)
     {
+        if (!sys_user_mem_valid((const void *)(user_path + n), 1))
+        {
+            return -EFAULT;
+        }
+
+        ch = user_path[n];
+        dst[n] = ch;
+        if (ch == '\0')
+        {
+            return 0;
+        }
+
         n++;
     }
 
-    if (!n || n >= dst_len)
-    {
-        return -ENAMETOOLONG;
-    }
-
-    memcpy((int8_t *)dst, (int8_t *)user_path, n + 1);
-    return 0;
+    dst[dst_len - 1] = '\0';
+    return -ENAMETOOLONG;
 }
 
 static int64_t sys_read(int64_t fd, int64_t buf, int64_t len)
@@ -276,17 +306,13 @@ static int64_t sys_read(int64_t fd, int64_t buf, int64_t len)
     uint8_t *bytes;
     int64_t i;
     int32_t ch;
+    uint64_t wait_daif;
 
     if (fd == 0)
     {
         if (len <= 0)
         {
             return 0;
-        }
-
-        if (!sys_user_mem_valid((const void *)buf, (size_t)len))
-        {
-            return -EFAULT;
         }
 
         bytes = (uint8_t *)buf;
@@ -308,6 +334,15 @@ static int64_t sys_read(int64_t fd, int64_t buf, int64_t len)
             ch = tty_try_getc();
             if (ch >= 0)
             {
+                /*
+                 * 按字节校验用户缓冲（中文）：
+                 * 避免一次性校验整段 len 导致“跨边界误判 EFAULT”，
+                 * 进而出现“输入有回显但命令不执行”的假死体验。
+                 */
+                if (!sys_user_mem_valid((const void *)(bytes + i), 1))
+                {
+                    return (i > 0) ? i : -EFAULT;
+                }
                 bytes[i++] = (uint8_t)ch;
                 if (ch == '\n' || ch == '\r')
                 {
@@ -325,9 +360,10 @@ static int64_t sys_read(int64_t fd, int64_t buf, int64_t len)
              * 这里不要在读到半行后就返回，避免把 shell 重新拖回
              * “每个字符一次 read/syscall”的低效路径。
              */
+            wait_daif = read_daif();
             enable_irq();
             wfe();
-            disable_irq();
+            write_daif(wait_daif);
         }
 
         return i;
@@ -514,9 +550,70 @@ static int64_t sys_netping(int64_t target_ip, int64_t seq, int64_t timeout_ms)
 
 static int64_t sys_waitpid(int64_t pid)
 {
+    struct task_struct *self;
     struct task_struct *task;
+    bool has_child;
+    uint32_t idx;
 
-    if (pid < 0)
+    self = task_current();
+    if (!self)
+    {
+        return -ESRCH;
+    }
+
+    /*
+     * 兼容语义补齐（中文）：
+     * - waitpid(-1): 等待“任意一个子进程”
+     * - waitpid(pid): 等待指定子进程
+     *
+     * 当前仍是最小实现：不引入僵尸队列，只用 task 状态轮询 + wfe/sev。
+     */
+    if (pid == -1)
+    {
+        for (;;)
+        {
+            has_child = false;
+
+            /*
+             * 关键优化（中文）：
+             * 旧实现按 PID 范围线性探测，PID 变大后会把 waitpid 开销放大到
+             * 每次几万次查找，直接拖慢前台 shell 交互。
+             *
+             * 这里改成按调度器 task 槽位扫描（固定 CONFIG_MAX_TASKS），
+             * 开销稳定且与历史 PID 大小无关。
+             */
+            for (idx = 0; idx < task_slot_count(); idx++)
+            {
+                task = task_slot_get(idx);
+                if (!task)
+                {
+                    continue;
+                }
+
+                if (task->ppid != self->pid)
+                {
+                    continue;
+                }
+
+                has_child = true;
+                if (task->state == TASK_DEAD)
+                {
+                    return task->pid;
+                }
+            }
+
+            if (!has_child)
+            {
+                return -ECHILD;
+            }
+
+            enable_irq();
+            wfe();
+            disable_irq();
+        }
+    }
+
+    if (pid < -1)
     {
         return -EINVAL;
     }
@@ -527,29 +624,24 @@ static int64_t sys_waitpid(int64_t pid)
         return -ESRCH;
     }
 
-    if (task == task_current())
+    if (task == self)
     {
         return -EINVAL;
     }
 
-    /*
-     * 最小 waitpid：
-     * - shell 在前台执行 ELF 时，阻塞等子任务真正退出
-     * - 不引入复杂的子进程表和僵尸回收，先把交互顺序修正过来
-     */
+    if (task->ppid != self->pid)
+    {
+        return -ECHILD;
+    }
+
     while (task->state != TASK_DEAD)
     {
         enable_irq();
-        /*
-         * 这里不能再用 wfi。
-         * waitpid 等的是“子任务状态变化”这种软件事件，不是硬中断；
-         * 用 wfe + task_exit() 里的 sev()，子进程一退出父进程就能立刻醒。
-         */
         wfe();
         disable_irq();
     }
 
-    return 0;
+    return task->pid;
 }
 
 static int64_t sys_sleep(int64_t ms)
@@ -975,7 +1067,15 @@ static int64_t sys_access(int64_t path, int64_t mode)
 
 static int64_t sys_openat(int64_t dirfd, int64_t path, int64_t flags)
 {
-    (void)dirfd;
+    /*
+     * 当前 VFS 还没有“按目录 fd 做相对路径解析”的能力。
+     * 先兼容最常见的 AT_FDCWD（-100）语义，其他 dirfd 返回 ENOTSUP。
+     */
+    if (dirfd != -100)
+    {
+        return -ENOTSUP;
+    }
+
     return sys_open(path, flags);
 }
 
@@ -985,8 +1085,15 @@ static int64_t sys_fstatat(int64_t dirfd, int64_t path, int64_t out, int64_t fla
     struct vfs_stat st;
     int64_t ret;
 
-    (void)dirfd;
-    (void)flags;
+    if (flags != 0 && flags != 0x100 /* AT_SYMLINK_NOFOLLOW */)
+    {
+        return -EINVAL;
+    }
+
+    if (dirfd != -100)
+    {
+        return -ENOTSUP;
+    }
 
     ret = sys_copy_path_from_user(kpath, sizeof(kpath), (const int8_t *)path);
     if (ret < 0)
@@ -1005,17 +1112,283 @@ static int64_t sys_fstatat(int64_t dirfd, int64_t path, int64_t out, int64_t fla
 
 static int64_t sys_readlink(int64_t path, int64_t buf, int64_t len)
 {
-    (void)path;
-    (void)buf;
-    (void)len;
-    return -EINVAL;
+    int8_t kpath[VFS_PATH_MAX];
+    int8_t target[VFS_PATH_MAX];
+    const int8_t *cwd;
+    struct task_struct *task;
+    size_t n;
+    int64_t ret;
+
+    if (!path || !buf || len <= 0)
+    {
+        return -EINVAL;
+    }
+
+    ret = sys_copy_path_from_user(kpath, sizeof(kpath), (const int8_t *)path);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    memset(target, 0, sizeof(target));
+    if (strcmp((const char *)kpath, "/proc/self/exe") == 0)
+    {
+        size_t base_len;
+        size_t comm_len;
+
+        task = task_current();
+        if (!task || task->comm[0] == '\0')
+        {
+            return -ENOENT;
+        }
+
+        base_len = 5U;
+        comm_len = strlen(task->comm);
+        if (base_len + comm_len >= sizeof(target))
+        {
+            comm_len = sizeof(target) - base_len - 1U;
+        }
+
+        memcpy((int8_t *)target, (int8_t *)"/bin/", base_len);
+        memcpy((int8_t *)&target[base_len], (int8_t *)task->comm, comm_len);
+        target[base_len + comm_len] = '\0';
+    }
+    else if (strcmp((const char *)kpath, "/proc/self/cwd") == 0)
+    {
+        size_t cwd_len;
+
+        cwd = task_cwd();
+        if (!cwd || cwd[0] == '\0')
+        {
+            cwd = (const int8_t *)"/";
+        }
+
+        cwd_len = strlen((int8_t *)cwd);
+        if (cwd_len >= sizeof(target))
+        {
+            cwd_len = sizeof(target) - 1U;
+        }
+        memcpy((int8_t *)target, (int8_t *)cwd, cwd_len);
+        target[cwd_len] = '\0';
+    }
+    else
+    {
+        return -ENOENT;
+    }
+
+    n = strlen((int8_t *)target);
+    if (n > (size_t)len)
+    {
+        n = (size_t)len;
+    }
+
+    if (!sys_user_mem_valid((const void *)buf, n))
+    {
+        return -EFAULT;
+    }
+
+    memcpy((void *)buf, target, n);
+    return (int64_t)n;
+}
+
+static int64_t sys_mkdir(int64_t path, int64_t mode)
+{
+    int8_t kpath[VFS_PATH_MAX];
+    int64_t ret;
+
+    ret = sys_copy_path_from_user(kpath, sizeof(kpath), (const int8_t *)path);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    return vfs_mkdir(kpath, (uint16_t)(VFS_S_IFDIR | (mode & 0777)));
+}
+
+static int64_t sys_rmdir(int64_t path)
+{
+    int8_t kpath[VFS_PATH_MAX];
+    int64_t ret;
+
+    ret = sys_copy_path_from_user(kpath, sizeof(kpath), (const int8_t *)path);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    return vfs_unlink(kpath, true);
+}
+
+static int64_t sys_unlink(int64_t path)
+{
+    int8_t kpath[VFS_PATH_MAX];
+    int64_t ret;
+
+    ret = sys_copy_path_from_user(kpath, sizeof(kpath), (const int8_t *)path);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    return vfs_unlink(kpath, false);
+}
+
+static int64_t sys_rename(int64_t old_path, int64_t new_path)
+{
+    int8_t old_kpath[VFS_PATH_MAX];
+    int8_t new_kpath[VFS_PATH_MAX];
+    int64_t ret;
+
+    ret = sys_copy_path_from_user(old_kpath, sizeof(old_kpath), (const int8_t *)old_path);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    ret = sys_copy_path_from_user(new_kpath, sizeof(new_kpath), (const int8_t *)new_path);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    return vfs_rename(old_kpath, new_kpath);
+}
+
+static int64_t sys_truncate(int64_t path, int64_t length)
+{
+    int8_t kpath[VFS_PATH_MAX];
+    int64_t ret;
+
+    if (length < 0)
+    {
+        return -EINVAL;
+    }
+
+    ret = sys_copy_path_from_user(kpath, sizeof(kpath), (const int8_t *)path);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    return vfs_truncate(kpath, (uint64_t)length);
+}
+
+static int64_t sys_ftruncate(int64_t fd, int64_t length)
+{
+    if (length < 0)
+    {
+        return -EINVAL;
+    }
+
+    if (fd < 3)
+    {
+        return -EINVAL;
+    }
+
+    return vfs_ftruncate((int)(fd - 3), (uint64_t)length);
+}
+
+static int64_t sys_utimensat(int64_t dirfd, int64_t path, int64_t times, int64_t flags)
+{
+    int8_t kpath[VFS_PATH_MAX];
+    struct vfs_timespec ts[2];
+    struct vfs_timespec *atime;
+    struct vfs_timespec *mtime;
+    int64_t ret;
+
+    if (dirfd != -100)
+    {
+        return -ENOTSUP;
+    }
+
+    if (flags != 0 && flags != 0x100 /* AT_SYMLINK_NOFOLLOW */)
+    {
+        return -EINVAL;
+    }
+
+    ret = sys_copy_path_from_user(kpath, sizeof(kpath), (const int8_t *)path);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    atime = 0;
+    mtime = 0;
+    if (times)
+    {
+        if (!sys_user_mem_valid((const void *)times, sizeof(ts)))
+        {
+            return -EFAULT;
+        }
+
+        memcpy((int8_t *)ts, (int8_t *)times, sizeof(ts));
+        atime = &ts[0];
+        mtime = &ts[1];
+    }
+
+    return vfs_utimens(kpath, atime, mtime);
 }
 
 static int64_t sys_ioctl(int64_t fd, int64_t request, int64_t argp)
 {
-    (void)fd;
-    (void)request;
-    (void)argp;
+    /*
+     * 先补一组最常见的终端 ioctl，方便用户态工具链/解释器探测 TTY。
+     * 目前只做“可运行”语义，不实现完整 termios 配置。
+     */
+    if (fd >= 0 && fd <= 2)
+    {
+        /* TCGETS */
+        if ((uint64_t)request == 0x5401ULL)
+        {
+            uint8_t termios_blob[44];
+
+            if (!argp)
+            {
+                return -EINVAL;
+            }
+
+            memset((int8_t *)termios_blob, 0, sizeof(termios_blob));
+            return sys_copy_to_user((void *)argp, termios_blob, sizeof(termios_blob));
+        }
+
+        /* TIOCGWINSZ */
+        if ((uint64_t)request == 0x5413ULL)
+        {
+            struct
+            {
+                uint16_t rows;
+                uint16_t cols;
+                uint16_t xpixel;
+                uint16_t ypixel;
+            } ws;
+
+            if (!argp)
+            {
+                return -EINVAL;
+            }
+
+            ws.rows = 40;
+            ws.cols = 120;
+            ws.xpixel = 0;
+            ws.ypixel = 0;
+            return sys_copy_to_user((void *)argp, &ws, sizeof(ws));
+        }
+
+        /* FIONREAD */
+        if ((uint64_t)request == 0x541BULL)
+        {
+            int32_t pending;
+
+            if (!argp)
+            {
+                return -EINVAL;
+            }
+
+            pending = 0;
+            return sys_copy_to_user((void *)argp, &pending, sizeof(pending));
+        }
+    }
+
     return -ENOTTY;
 }
 
@@ -1221,13 +1594,37 @@ static int64_t sys_exit_group(int64_t code)
 
 static int64_t sys_getrandom(int64_t buf, int64_t len, int64_t flags)
 {
+    struct task_struct *task;
+    uint64_t stack_base;
+    bool trace_this_call;
+
+    trace_this_call = sys_getrandom_trace_count < 4U;
     if (!buf || len < 0)
     {
+        if (trace_this_call)
+        {
+            printk("[syscall\tgetrandom]: invalid pid=%d buf=%#lx len=%ld flags=%#lx\n",
+                   task_current() ? task_current()->pid : -1,
+                   (uint64_t)buf, (long)len, (uint64_t)flags);
+            sys_getrandom_trace_count++;
+        }
         return -EINVAL;
     }
 
+    task = task_current();
+    stack_base = task ? (uint64_t)&task->stack[0] : 0;
     if (!sys_user_mem_valid((const void *)buf, (size_t)len))
     {
+        printk("[syscall\tgetrandom]: EFAULT pid=%d buf=%#lx len=%ld exec=[%#lx,%#lx) alias=[%#lx,%#lx) heap=[%#lx,%#lx) stack=[%#lx,%#lx)\n",
+               task ? task->pid : -1, (uint64_t)buf, (long)len,
+               task ? task->exec_base : 0, task ? task->exec_end : 0,
+               task ? task->exec_alias_base : 0, task ? task->exec_alias_end : 0,
+               task ? task->heap_base : 0, task ? task->heap_end : 0,
+               stack_base, stack_base ? (stack_base + TASK_STACK_SIZE) : 0);
+        if (trace_this_call)
+        {
+            sys_getrandom_trace_count++;
+        }
         return -EFAULT;
     }
 
@@ -1546,6 +1943,26 @@ static int64_t sys_prlimit64(int64_t pid, int64_t resource, int64_t new_limit, i
     return 0;
 }
 
+static int64_t sys_getdents64(int64_t fd, int64_t dirp, int64_t count)
+{
+    if (fd < 3)
+    {
+        return -EBADF;
+    }
+
+    if (!dirp || count <= 0)
+    {
+        return -EINVAL;
+    }
+
+    if (!sys_user_mem_valid((const void *)dirp, (size_t)count))
+    {
+        return -EFAULT;
+    }
+
+    return vfs_getdents64((int)(fd - 3), (void *)dirp, (size_t)count);
+}
+
 void syscall_init(void)
 {
     printk("[syscall\tinit]: syscall ABI ready\n");
@@ -1674,6 +2091,23 @@ int64_t syscall_dispatch(pt_regs_t *regs)
         return sys_sysinfo((int64_t)regs->s_reg[0]);
     case SYS_PRLIMIT64:
         return sys_prlimit64((int64_t)regs->s_reg[0], (int64_t)regs->s_reg[1], (int64_t)regs->s_reg[2], (int64_t)regs->s_reg[3]);
+    case SYS_GETDENTS64:
+        return sys_getdents64((int64_t)regs->s_reg[0], (int64_t)regs->s_reg[1], (int64_t)regs->s_reg[2]);
+    case SYS_MKDIR:
+        return sys_mkdir((int64_t)regs->s_reg[0], (int64_t)regs->s_reg[1]);
+    case SYS_RMDIR:
+        return sys_rmdir((int64_t)regs->s_reg[0]);
+    case SYS_UNLINK:
+        return sys_unlink((int64_t)regs->s_reg[0]);
+    case SYS_RENAME:
+        return sys_rename((int64_t)regs->s_reg[0], (int64_t)regs->s_reg[1]);
+    case SYS_TRUNCATE:
+        return sys_truncate((int64_t)regs->s_reg[0], (int64_t)regs->s_reg[1]);
+    case SYS_FTRUNCATE:
+        return sys_ftruncate((int64_t)regs->s_reg[0], (int64_t)regs->s_reg[1]);
+    case SYS_UTIMENSAT:
+        return sys_utimensat((int64_t)regs->s_reg[0], (int64_t)regs->s_reg[1],
+                             (int64_t)regs->s_reg[2], (int64_t)regs->s_reg[3]);
     default:
         return -ENOSYS;
     }

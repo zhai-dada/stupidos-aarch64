@@ -18,6 +18,7 @@
 #include "fdt.h"
 #include "fs/ext4.h"
 #include "fs/fat32.h"
+#include "fs/ramfs.h"
 #include "fs/vfs.h"
 #include "net/net.h"
 #include "pci.h"
@@ -207,6 +208,14 @@ static __attribute__((noreturn)) void kernel_main_high(void)
     }
 
     page_alloc_init();
+    if (ramfs_mount((const int8_t *)"/tmp"))
+    {
+        printk("[ramfs\tinit]: mount /tmp failed\n");
+    }
+    else
+    {
+        printk("[ramfs\tinit]: mounted at /tmp (writable)\n");
+    }
     syscall_init();
     pci_init();
     net_init();

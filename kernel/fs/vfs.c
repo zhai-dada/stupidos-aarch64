@@ -45,6 +45,21 @@ static bool vfs_is_reg(struct vfs_inode *inode)
     return (inode->mode & VFS_S_IFMT) == VFS_S_IFREG;
 }
 
+static uint8_t vfs_dtype_from_mode(uint16_t mode)
+{
+    switch (mode & VFS_S_IFMT)
+    {
+    case VFS_S_IFDIR:
+        return 4; /* DT_DIR */
+    case VFS_S_IFCHR:
+        return 2; /* DT_CHR */
+    case VFS_S_IFREG:
+        return 8; /* DT_REG */
+    default:
+        return 0; /* DT_UNKNOWN */
+    }
+}
+
 static bool vfs_is_valid_dirent(const struct vfs_dirent *dirent)
 {
     return dirent && dirent->name[0] != '\0';
@@ -413,6 +428,72 @@ static int vfs_lookup_path(const int8_t *path, struct vfs_inode *out)
     return vfs_lookup_path_from(&mnt->root, subpath, out);
 }
 
+static int vfs_split_parent_path(const int8_t *path,
+                                 int8_t *parent_out, size_t parent_len,
+                                 int8_t *name_out, size_t name_len)
+{
+    int8_t resolved[VFS_PATH_MAX];
+    size_t len;
+    size_t pos;
+    size_t name_size;
+
+    if (!path || !parent_out || !name_out || parent_len < 2 || name_len < 2)
+    {
+        return -EINVAL;
+    }
+
+    if (vfs_canonicalize_path(path, resolved, sizeof(resolved)))
+    {
+        return -EINVAL;
+    }
+
+    len = strlen((int8_t *)resolved);
+    if (len <= 1)
+    {
+        return -EINVAL;
+    }
+
+    pos = len - 1;
+    while (pos > 0 && resolved[pos] != '/')
+    {
+        pos--;
+    }
+
+    if (resolved[pos] != '/')
+    {
+        return -EINVAL;
+    }
+
+    name_size = len - pos - 1;
+    if (name_size == 0 || name_size + 1 > name_len)
+    {
+        return -EINVAL;
+    }
+
+    if (pos == 0)
+    {
+        if (parent_len < 2)
+        {
+            return -ENAMETOOLONG;
+        }
+        parent_out[0] = '/';
+        parent_out[1] = '\0';
+    }
+    else
+    {
+        if (pos + 1 > parent_len)
+        {
+            return -ENAMETOOLONG;
+        }
+        memcpy(parent_out, resolved, pos);
+        parent_out[pos] = '\0';
+    }
+
+    memcpy(name_out, &resolved[pos + 1], name_size);
+    name_out[name_size] = '\0';
+    return 0;
+}
+
 int vfs_mount(const int8_t *path, struct vfs_superblock *sb, struct vfs_inode *root)
 {
     int mount_id;
@@ -524,19 +605,68 @@ int vfs_readdir(const int8_t *path, uint32_t index, struct vfs_dirent *out)
 
 int vfs_open(const int8_t *path, int flags)
 {
+    struct vfs_inode parent;
     struct vfs_inode inode;
+    int8_t parent_path[VFS_PATH_MAX];
+    int8_t name[VFS_NAME_MAX + 1];
     int ret;
     int fd;
 
     ret = vfs_lookup_path(path, &inode);
     if (ret)
     {
-        return ret;
+        if (!(flags & VFS_O_CREAT) || ret != -ENOENT)
+        {
+            return ret;
+        }
+
+        ret = vfs_split_parent_path(path, parent_path, sizeof(parent_path), name, sizeof(name));
+        if (ret)
+        {
+            return ret;
+        }
+
+        ret = vfs_lookup_path(parent_path, &parent);
+        if (ret)
+        {
+            return ret;
+        }
+
+        if (!vfs_is_dir(&parent))
+        {
+            return -ENOTDIR;
+        }
+
+        if (!parent.ops || !parent.ops->create)
+        {
+            return -EROFS;
+        }
+
+        ret = parent.ops->create(&parent, name, (uint16_t)(VFS_S_IFREG | 0644), &inode);
+        if (ret)
+        {
+            return ret;
+        }
     }
 
     if (!vfs_is_reg(&inode))
     {
         return -EISDIR;
+    }
+
+    if (flags & VFS_O_TRUNC)
+    {
+        if (!inode.ops || !inode.ops->truncate)
+        {
+            return -EROFS;
+        }
+
+        ret = inode.ops->truncate(&inode, 0);
+        if (ret)
+        {
+            return ret;
+        }
+        inode.size = 0;
     }
 
     for (fd = 0; fd < VFS_MAX_FILES; fd++)
@@ -545,7 +675,7 @@ int vfs_open(const int8_t *path, int flags)
         {
             vfs_state.files[fd].used = true;
             vfs_state.files[fd].flags = flags;
-            vfs_state.files[fd].pos = 0;
+            vfs_state.files[fd].pos = (flags & VFS_O_APPEND) ? inode.size : 0;
             vfs_state.files[fd].inode = inode;
             return fd;
         }
@@ -658,6 +788,11 @@ ssize_t vfs_write(int fd, const void *buf, size_t len)
     if (!file->inode.ops || !file->inode.ops->write)
     {
         return -ENOSYS;
+    }
+
+    if (file->flags & VFS_O_APPEND)
+    {
+        file->pos = file->inode.size;
     }
 
     ret = file->inode.ops->write(&file->inode, file->pos, buf, len);
@@ -880,4 +1015,286 @@ int vfs_fcntl(int fd, int cmd, uint64_t arg)
     default:
         return -ENOTTY;
     }
+}
+
+int vfs_getdents64(int fd, void *buf, size_t len)
+{
+    struct vfs_file *file;
+    uint8_t *out;
+    size_t used;
+    uint32_t index;
+
+    if (!buf || len == 0)
+    {
+        return -EINVAL;
+    }
+
+    if (fd < 0 || fd >= VFS_MAX_FILES)
+    {
+        return -EBADF;
+    }
+
+    file = &vfs_state.files[fd];
+    if (!file->used)
+    {
+        return -EBADF;
+    }
+
+    if (!vfs_is_dir(&file->inode))
+    {
+        return -ENOTDIR;
+    }
+
+    if (!file->inode.ops || !file->inode.ops->readdir)
+    {
+        return -ENOTSUP;
+    }
+
+    out = (uint8_t *)buf;
+    used = 0;
+    index = (uint32_t)file->pos;
+    while (used < len)
+    {
+        struct vfs_dirent ent;
+        struct vfs_linux_dirent64 *dst;
+        size_t name_len;
+        size_t reclen;
+        int ret;
+
+        ret = file->inode.ops->readdir(&file->inode, index, &ent);
+        if (ret < 0)
+        {
+            if (ret == -ENOENT)
+            {
+                break;
+            }
+            return used ? (int)used : ret;
+        }
+
+        name_len = strlen(ent.name);
+        /*
+         * Linux dirent64 兼容布局：
+         *   ino(8) + off(8) + reclen(2) + type(1) + name + '\0'
+         * 再按 8 字节对齐，便于用户态按标准步进解析。
+         */
+        reclen = sizeof(uint64_t) + sizeof(int64_t) + sizeof(uint16_t) + sizeof(uint8_t) + name_len + 1U;
+        reclen = (reclen + 7U) & ~7U;
+        if (used + reclen > len)
+        {
+            break;
+        }
+
+        dst = (struct vfs_linux_dirent64 *)(void *)(out + used);
+        memset((int8_t *)dst, 0, reclen);
+        dst->d_ino = ent.ino;
+        dst->d_off = (int64_t)(index + 1U);
+        dst->d_reclen = (uint16_t)reclen;
+        dst->d_type = vfs_dtype_from_mode(ent.mode);
+        memcpy(dst->d_name, ent.name, name_len);
+        dst->d_name[name_len] = '\0';
+
+        used += reclen;
+        index++;
+    }
+
+    file->pos = index;
+    return (int)used;
+}
+
+int vfs_mkdir(const int8_t *path, uint16_t mode)
+{
+    struct vfs_inode parent;
+    struct vfs_inode created;
+    struct vfs_inode existing;
+    int8_t parent_path[VFS_PATH_MAX];
+    int8_t name[VFS_NAME_MAX + 1];
+    int ret;
+
+    ret = vfs_lookup_path(path, &existing);
+    if (ret == 0)
+    {
+        return -EEXIST;
+    }
+    if (ret != -ENOENT)
+    {
+        return ret;
+    }
+
+    ret = vfs_split_parent_path(path, parent_path, sizeof(parent_path), name, sizeof(name));
+    if (ret)
+    {
+        return ret;
+    }
+
+    ret = vfs_lookup_path(parent_path, &parent);
+    if (ret)
+    {
+        return ret;
+    }
+
+    if (!vfs_is_dir(&parent))
+    {
+        return -ENOTDIR;
+    }
+
+    if (!parent.ops || !parent.ops->mkdir)
+    {
+        return -EROFS;
+    }
+
+    ret = parent.ops->mkdir(&parent, name, mode, &created);
+    return ret;
+}
+
+int vfs_unlink(const int8_t *path, bool dir_only)
+{
+    struct vfs_inode parent;
+    int8_t parent_path[VFS_PATH_MAX];
+    int8_t name[VFS_NAME_MAX + 1];
+    int ret;
+
+    ret = vfs_split_parent_path(path, parent_path, sizeof(parent_path), name, sizeof(name));
+    if (ret)
+    {
+        return ret;
+    }
+
+    ret = vfs_lookup_path(parent_path, &parent);
+    if (ret)
+    {
+        return ret;
+    }
+
+    if (!vfs_is_dir(&parent))
+    {
+        return -ENOTDIR;
+    }
+
+    if (!parent.ops || !parent.ops->unlink)
+    {
+        return -EROFS;
+    }
+
+    return parent.ops->unlink(&parent, name, dir_only);
+}
+
+int vfs_rename(const int8_t *old_path, const int8_t *new_path)
+{
+    struct vfs_inode old_parent;
+    struct vfs_inode new_parent;
+    int8_t old_parent_path[VFS_PATH_MAX];
+    int8_t new_parent_path[VFS_PATH_MAX];
+    int8_t old_name[VFS_NAME_MAX + 1];
+    int8_t new_name[VFS_NAME_MAX + 1];
+    int ret;
+
+    ret = vfs_split_parent_path(old_path, old_parent_path, sizeof(old_parent_path), old_name, sizeof(old_name));
+    if (ret)
+    {
+        return ret;
+    }
+
+    ret = vfs_split_parent_path(new_path, new_parent_path, sizeof(new_parent_path), new_name, sizeof(new_name));
+    if (ret)
+    {
+        return ret;
+    }
+
+    ret = vfs_lookup_path(old_parent_path, &old_parent);
+    if (ret)
+    {
+        return ret;
+    }
+
+    ret = vfs_lookup_path(new_parent_path, &new_parent);
+    if (ret)
+    {
+        return ret;
+    }
+
+    if (old_parent.sb != new_parent.sb)
+    {
+        return -EXDEV;
+    }
+
+    if (!old_parent.ops || !old_parent.ops->rename)
+    {
+        return -EROFS;
+    }
+
+    return old_parent.ops->rename(&old_parent, old_name, &new_parent, new_name);
+}
+
+int vfs_truncate(const int8_t *path, uint64_t size)
+{
+    struct vfs_inode inode;
+    int ret;
+
+    ret = vfs_lookup_path(path, &inode);
+    if (ret)
+    {
+        return ret;
+    }
+
+    if (!vfs_is_reg(&inode))
+    {
+        return -EISDIR;
+    }
+
+    if (!inode.ops || !inode.ops->truncate)
+    {
+        return -EROFS;
+    }
+
+    return inode.ops->truncate(&inode, size);
+}
+
+int vfs_ftruncate(int fd, uint64_t size)
+{
+    struct vfs_file *file;
+    int ret;
+
+    if (fd < 0 || fd >= VFS_MAX_FILES || !vfs_state.files[fd].used)
+    {
+        return -EBADF;
+    }
+
+    file = &vfs_state.files[fd];
+    if (!file->inode.ops || !file->inode.ops->truncate)
+    {
+        return -EROFS;
+    }
+
+    ret = file->inode.ops->truncate(&file->inode, size);
+    if (ret)
+    {
+        return ret;
+    }
+
+    file->inode.size = size;
+    if (file->pos > size)
+    {
+        file->pos = size;
+    }
+
+    return 0;
+}
+
+int vfs_utimens(const int8_t *path, const struct vfs_timespec *atime, const struct vfs_timespec *mtime)
+{
+    struct vfs_inode inode;
+    int ret;
+
+    ret = vfs_lookup_path(path, &inode);
+    if (ret)
+    {
+        return ret;
+    }
+
+    if (!inode.ops || !inode.ops->utimens)
+    {
+        return -EROFS;
+    }
+
+    return inode.ops->utimens(&inode, atime, mtime);
 }

@@ -11,6 +11,9 @@
 #define VFS_O_RDONLY        0x1
 #define VFS_O_WRONLY        0x2
 #define VFS_O_RDWR          (VFS_O_RDONLY | VFS_O_WRONLY)
+#define VFS_O_CREAT         0x0100
+#define VFS_O_TRUNC         0x0200
+#define VFS_O_APPEND        0x0400
 
 #define VFS_SEEK_SET        0
 #define VFS_SEEK_CUR        1
@@ -42,12 +45,25 @@ struct vfs_inode;
 struct vfs_superblock;
 struct vfs_dirent;
 
+struct vfs_timespec
+{
+    int64_t tv_sec;
+    int64_t tv_nsec;
+};
+
 struct vfs_inode_ops
 {
     int (*lookup)(struct vfs_inode *dir, const int8_t *name, struct vfs_inode *out);
     int (*readdir)(struct vfs_inode *dir, uint32_t index, struct vfs_dirent *out);
     ssize_t (*read)(struct vfs_inode *inode, uint64_t offset, void *buf, size_t len);
     ssize_t (*write)(struct vfs_inode *inode, uint64_t offset, const void *buf, size_t len);
+    int (*create)(struct vfs_inode *dir, const int8_t *name, uint16_t mode, struct vfs_inode *out);
+    int (*mkdir)(struct vfs_inode *dir, const int8_t *name, uint16_t mode, struct vfs_inode *out);
+    int (*unlink)(struct vfs_inode *dir, const int8_t *name, bool dir_only);
+    int (*rename)(struct vfs_inode *old_dir, const int8_t *old_name,
+                  struct vfs_inode *new_dir, const int8_t *new_name);
+    int (*truncate)(struct vfs_inode *inode, uint64_t size);
+    int (*utimens)(struct vfs_inode *inode, const struct vfs_timespec *atime, const struct vfs_timespec *mtime);
 };
 
 struct vfs_dirent
@@ -69,6 +85,15 @@ struct vfs_stat
     uint64_t blocks;
     uint32_t blksize;
     uint32_t reserved;
+};
+
+struct vfs_linux_dirent64
+{
+    uint64_t d_ino;
+    int64_t d_off;
+    uint16_t d_reclen;
+    uint8_t d_type;
+    int8_t d_name[];
 };
 
 struct vfs_inode
@@ -111,5 +136,12 @@ int vfs_close(int fd);
 int vfs_dup(int fd);
 int vfs_dup2(int oldfd, int newfd);
 int vfs_fcntl(int fd, int cmd, uint64_t arg);
+int vfs_getdents64(int fd, void *buf, size_t len);
+int vfs_mkdir(const int8_t *path, uint16_t mode);
+int vfs_unlink(const int8_t *path, bool dir_only);
+int vfs_rename(const int8_t *old_path, const int8_t *new_path);
+int vfs_truncate(const int8_t *path, uint64_t size);
+int vfs_ftruncate(int fd, uint64_t size);
+int vfs_utimens(const int8_t *path, const struct vfs_timespec *atime, const struct vfs_timespec *mtime);
 
 #endif

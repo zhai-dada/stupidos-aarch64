@@ -13,20 +13,30 @@ USER_DIR        :=  userspace
 USER_INC_DIR    :=  $(USER_DIR)/include
 USER_LD_SCRIPT  :=  $(USER_DIR)/user.ld
 USER_BIN_DIR    :=  $(BUILD_DIR)/$(USER_DIR)/bin
+TCC_SRC_DIR     :=  third_party/tinycc
 PYTHON_BUILD_DIR := third_party/cpython310-build
 PYTHON_LIBPY    :=  $(PYTHON_BUILD_DIR)/libpython3.10.a
 PYTHON_LIB_DIR  :=  third_party/cpython310/Lib
 PYTHON_INC_DIR  :=  third_party/cpython310/Include
-USER_PROGRAMS   :=  hello ls cat ping sleep netcfg sh python3
+ENABLE_PYTHON   ?=  0
+USER_PROGRAMS   :=  hello ls cat echo mkdir rm mv touch ping sleep netcfg sh tcc mkprobe
+ifeq ($(ENABLE_PYTHON),1)
+USER_PROGRAMS   += python3
+endif
+
+# 防止默认目标被自动依赖文件中的“首个对象规则”抢走。
+.DEFAULT_GOAL := all
 
 # Toolchain
 CC              :=  $(CROSS_COMPILE)gcc
 AS              :=  $(CROSS_COMPILE)as
 LD              :=  $(CROSS_COMPILE)ld
+AR              :=  $(CROSS_COMPILE)ar
 OBJCOPY         :=  $(CROSS_COMPILE)objcopy
 OBJDUMP         :=  $(CROSS_COMPILE)objdump
 DEBUGFILE		:= debug.s
 GDB_SCRIPT      := $(BUILD_DIR)/stupidos-debug.gdb
+USER_LIBGCC     := $(shell $(CC) -print-libgcc-file-name)
 
 QEMU           :=  qemu-system-aarch64
 NET_MODE       ?=  user
@@ -48,7 +58,10 @@ CFLAGS          :=  -g -Wall -fno-builtin -Iinclude -O0 -march=armv8-a+nofp
 ASFLAGS         :=  -g -Iinclude
 LDFLAGS         :=  -nostdlib
 DEPFLAGS        :=  -MMD -MP
-USER_CFLAGS     :=  -g -Wall -fno-builtin -ffreestanding -fno-stack-protector -I$(USER_INC_DIR) -Iinclude -I$(PYTHON_INC_DIR) -I$(PYTHON_BUILD_DIR) -O0 -march=armv8-a+fp+simd
+USER_CFLAGS     :=  -g -Wall -fno-builtin -ffreestanding -fno-stack-protector -I$(USER_INC_DIR) -Iinclude -O0 -march=armv8-a+fp+simd
+ifeq ($(ENABLE_PYTHON),1)
+USER_CFLAGS     +=  -I$(PYTHON_INC_DIR) -I$(PYTHON_BUILD_DIR)
+endif
 USER_ASFLAGS    :=  -g -Iinclude -I$(USER_INC_DIR)
 
 # Linker script
@@ -71,7 +84,15 @@ DEPS           :=  $(C_OBJS:.o=.d) $(FONT_OBJS:.o=.d)
 USER_LIB_OBJS  :=  $(patsubst $(USER_DIR)/%.c,$(BUILD_DIR)/$(USER_DIR)/%.o,$(USER_LIB_C_SRCS))
 USER_BIN_OBJS  :=  $(patsubst $(USER_DIR)/%.c,$(BUILD_DIR)/$(USER_DIR)/%.o,$(USER_BIN_C_SRCS))
 USER_CRT_OBJ   :=  $(patsubst $(USER_DIR)/%.S,$(BUILD_DIR)/$(USER_DIR)/%.o,$(USER_S_SRCS))
+USER_CRT0_OBJ  :=  $(BUILD_DIR)/$(USER_DIR)/crt0.o
+USER_RUNTIME_OBJS := $(filter-out $(USER_CRT0_OBJ),$(USER_CRT_OBJ)) $(USER_LIB_OBJS)
+USER_RUNTIME_LIB := $(BUILD_DIR)/$(USER_DIR)/lib/libstupidos.a
 USER_BINS      :=  $(addprefix $(USER_BIN_DIR)/,$(USER_PROGRAMS))
+TCC_REAL_OBJ   :=  $(BUILD_DIR)/third_party/tinycc/tcc-real.o
+TCC_REAL_BIN   :=  $(USER_BIN_DIR)/tcc.real
+USER_EXTRA_BINS := $(TCC_REAL_BIN)
+USER_BINS_ALL  :=  $(USER_BINS) $(USER_EXTRA_BINS)
+TCC_REAL_CFLAGS := $(USER_CFLAGS) -I$(TCC_SRC_DIR) -I$(TCC_SRC_DIR)/include -DTCC_USING_DOUBLE_FOR_LDOUBLE=1 -DCONFIG_TCC_SEMLOCK=0
 DEPS           +=  $(USER_LIB_OBJS:.o=.d) $(USER_BIN_OBJS:.o=.d) $(USER_CRT_OBJ:.o=.d)
 
 -include $(DEPS)
@@ -86,7 +107,7 @@ KIMAGE_OFFSET  :=  0xffff7fffd0000000
 .PHONY: all
 .SECONDARY: $(KERNEL_KIMAGE_ELF) $(GDB_SCRIPT) $(USER_CRT_OBJ)
 all: $(KERNEL_BIN)
-all: $(USER_BINS)
+all: $(USER_BINS_ALL)
 
 # ============================================
 # Build rules
@@ -113,14 +134,29 @@ $(BUILD_DIR)/$(USER_DIR)/%.o: $(USER_DIR)/%.S
 
 $(USER_BIN_DIR)/%: $(BUILD_DIR)/$(USER_DIR)/bin/%.o $(USER_LIB_OBJS) $(USER_CRT_OBJ) $(USER_LD_SCRIPT)
 	@mkdir -p $(dir $@)
-	$(LD) -nostdlib -z max-page-size=0x1000 $(USER_CRT_OBJ) $(USER_LIB_OBJS) $< -o $@ -T $(USER_LD_SCRIPT)
+	$(LD) -nostdlib -z max-page-size=0x1000 $(USER_CRT_OBJ) $(USER_LIB_OBJS) $< $(USER_LIBGCC) -o $@ -T $(USER_LD_SCRIPT)
 
 $(USER_BIN_DIR)/python3: $(BUILD_DIR)/$(USER_DIR)/bin/python3.o $(USER_LIB_OBJS) $(USER_CRT_OBJ) $(USER_LD_SCRIPT) $(PYTHON_LIBPY)
 	@mkdir -p $(dir $@)
-	$(LD) -nostdlib -z max-page-size=0x1000 $(USER_CRT_OBJ) $(USER_LIB_OBJS) $< $(PYTHON_LIBPY) -o $@ -T $(USER_LD_SCRIPT)
+	$(LD) -nostdlib -z max-page-size=0x1000 $(USER_CRT_OBJ) $(USER_LIB_OBJS) $< $(PYTHON_LIBPY) $(USER_LIBGCC) -o $@ -T $(USER_LD_SCRIPT)
+
+$(USER_RUNTIME_LIB): $(USER_RUNTIME_OBJS)
+	@mkdir -p $(dir $@)
+	$(AR) rcs $@ $(USER_RUNTIME_OBJS)
 
 $(PYTHON_LIBPY):
 	@$(MAKE) -C $(PYTHON_BUILD_DIR) -j2 V=1 libpython3.10.a
+
+$(TCC_SRC_DIR)/config.h: $(TCC_SRC_DIR)/configure $(TCC_SRC_DIR)/VERSION
+	@cd $(TCC_SRC_DIR) && ./configure --cpu=arm64 --cc=$(CC) --config-bcheck=no --config-backtrace=no --config-static=no --config-predefs=no >/dev/null
+
+$(TCC_REAL_OBJ): $(TCC_SRC_DIR)/tcc.c $(TCC_SRC_DIR)/config.h
+	@mkdir -p $(dir $@)
+	$(CC) $(TCC_REAL_CFLAGS) -c $< -o $@
+
+$(TCC_REAL_BIN): $(TCC_REAL_OBJ) $(USER_LIB_OBJS) $(USER_CRT_OBJ) $(USER_LD_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD) -nostdlib -z max-page-size=0x1000 $(USER_CRT_OBJ) $(USER_LIB_OBJS) $(TCC_REAL_OBJ) $(USER_LIBGCC) -o $@ -T $(USER_LD_SCRIPT)
 
 $(FONT_GEN_SRC): $(FONT_TTF) tools/gen_font.py
 	@mkdir -p $(dir $@)
@@ -174,17 +210,33 @@ $(GDB_SCRIPT): $(KERNEL_ELF) $(KERNEL_KIMAGE_ELF)
 # Disk image management
 # ============================================
 
-$(DISK_IMG): $(USER_BINS) script/disk.sh script/Makefile script/fdisk.args
+$(DISK_IMG): $(USER_BINS_ALL) $(USER_RUNTIME_LIB) script/disk.sh script/Makefile script/fdisk.args
 	@echo "Creating disk image..."
 	@rm -f $(DISK_IMG)
 	@$(MAKE) -C script \
 		USER_BINS_DIR="$(abspath $(USER_BIN_DIR))" \
+		USER_BINS_LIST="$(abspath $(USER_BINS_ALL))" \
+		USER_INC_DIR="$(abspath $(USER_INC_DIR))" \
+		USER_RUNTIME_LIB="$(abspath $(USER_RUNTIME_LIB))" \
+		USER_CRT0_OBJ="$(abspath $(USER_CRT0_OBJ))" \
+		USER_LIBGCC="$(abspath $(USER_LIBGCC))" \
 		PYTHON_BIN="$(abspath $(USER_BIN_DIR)/python3)" \
-		PYTHON_LIB_DIR="$(abspath $(PYTHON_LIB_DIR))"
+		PYTHON_LIB_DIR="$(abspath $(PYTHON_LIB_DIR))" \
+		TCC_SRC_DIR="$(abspath $(TCC_SRC_DIR))"
 	@mv script/disk.img $(DISK_IMG)
 
 .PHONY: disk
 disk: $(DISK_IMG)
+
+.PHONY: tcc-fetch
+tcc-fetch:
+	@mkdir -p third_party
+	@if [ -d "$(TCC_SRC_DIR)/.git" ] || [ -f "$(TCC_SRC_DIR)/configure" ]; then \
+		echo "tinycc source already exists at $(TCC_SRC_DIR)"; \
+	else \
+		echo "Fetching tinycc source..."; \
+		git clone --depth=1 https://github.com/TinyCC/tinycc.git "$(TCC_SRC_DIR)"; \
+	fi
 
 .PHONY: mount-disk
 mount-disk:

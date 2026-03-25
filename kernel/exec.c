@@ -18,6 +18,9 @@ struct exec_image
     uint32_t image_order;
     int argc;
     int (*entry)(int argc, char **argv);
+    bool has_alias;
+    uint64_t alias_base;
+    uint64_t alias_end;
     int8_t path[VFS_PATH_MAX];
     int8_t arg_buf[EXEC_ARG_BUF_SIZE];
     char *argv[EXEC_MAX_ARGS + 1];
@@ -53,6 +56,40 @@ static uint32_t exec_order_for_size(uint64_t size)
     }
 
     return order;
+}
+
+static void exec_sync_icache(void *base, uint64_t size)
+{
+    uint64_t start;
+    uint64_t end;
+    uint64_t addr;
+
+    if (!base || !size)
+    {
+        return;
+    }
+
+    /*
+     * AArch64 关键点（中文）：
+     * 内核用 memcpy 把 ELF 指令写到新页后，I-Cache 不会自动和 D-Cache 保持一致。
+     * 如果不做显式同步，CPU 可能继续执行该物理页上“旧任务残留”的指令行，
+     * 表现为用户程序随机跳转、偶发指令异常（本项目里正好命中 mkdir/ls 路径）。
+     */
+    start = (uint64_t)base & ~63ULL;
+    end = ((uint64_t)base + size + 63ULL) & ~63ULL;
+
+    for (addr = start; addr < end; addr += 64ULL)
+    {
+        asm volatile("dc cvau, %0" : : "r"(addr) : "memory");
+    }
+    dsb(ish);
+
+    for (addr = start; addr < end; addr += 64ULL)
+    {
+        asm volatile("ic ivau, %0" : : "r"(addr) : "memory");
+    }
+    dsb(ish);
+    isb();
 }
 
 static const int8_t *exec_task_name_from_path(const int8_t *path)
@@ -112,7 +149,12 @@ static void exec_task_main(void *arg)
 {
     struct exec_image *image;
     struct task_struct *task;
-    uint64_t stack_top;
+    uint64_t stack_low;
+    uint64_t live_sp;
+    uint64_t user_sp;
+    char *argv_user[EXEC_MAX_ARGS + 1];
+    char **argv_ptr;
+    int i;
 
     image = (struct exec_image *)arg;
     if (!image || !image->entry)
@@ -133,16 +175,68 @@ static void exec_task_main(void *arg)
      */
     task->exec_base = (uint64_t)image->image_base;
     task->exec_end = (uint64_t)image->image_base + ((uint64_t)PAGE_SIZE << image->image_order);
+    task->exec_alias_base = image->has_alias ? image->alias_base : 0;
+    task->exec_alias_end = image->has_alias ? image->alias_end : 0;
     task->has_exec_image = true;
 
     task_set_cleanup(exec_cleanup, image);
-    stack_top = (uint64_t)&task->stack[TASK_STACK_SIZE];
+    stack_low = (uint64_t)&task->stack[0];
+    asm volatile("mov %0, sp" : "=r"(live_sp) : : "memory");
+
+    /*
+     * 关键修复（中文）：
+     * 不能从 stack_top 往下直接写 argv。
+     *
+     * exec_task_main() 自己正在这个 task 栈上运行，当前活动栈帧就位于
+     * [live_sp, stack_top) 区间。若把参数字符串塞到这块区域，会把当前
+     * 栈帧（包括保存的 fp/lr）踩坏，随后在 exec_enter/异常回溯里表现为
+     * 返回地址随机污染（之前观测到 lr 高位被 '/bin/..' 字节覆盖）。
+     *
+     * 正确做法是：从“当前 live_sp 再往下预留一段保护带”开始打包 argv，
+     * 确保整个参数块都落在 live_sp 以下，完全避开活动调用栈。
+     */
+    if (live_sp < stack_low + 512U)
+    {
+        task_exit();
+    }
+
+    user_sp = live_sp - 256U;
+    for (i = image->argc - 1; i >= 0; i--)
+    {
+        size_t len;
+
+        len = strlen((int8_t *)image->argv[i]) + 1U;
+        if (user_sp < stack_low + len + 64U)
+        {
+            task_exit();
+        }
+
+        user_sp -= len;
+        memcpy((int8_t *)user_sp, (int8_t *)image->argv[i], len);
+        argv_user[i] = (char *)user_sp;
+    }
+    argv_user[image->argc] = 0;
+
+    user_sp &= ~0xfULL;
+    if (user_sp < stack_low + ((uint64_t)(image->argc + 1) * sizeof(char *)) + 16U)
+    {
+        task_exit();
+    }
+
+    user_sp -= (uint64_t)(image->argc + 1) * sizeof(char *);
+    argv_ptr = (char **)user_sp;
+    for (i = 0; i < image->argc; i++)
+    {
+        argv_ptr[i] = argv_user[i];
+    }
+    argv_ptr[image->argc] = 0;
+
     /*
      * 不再把 ELF 入口当成普通 C 函数直接调用。
      * 这里通过汇编跳板切到当前 task 的干净栈顶，并把 x30 固定成
      * exec_return_from_entry()，避免返回地址继续依赖旧的 C 栈帧布局。
      */
-    exec_enter(image->entry, image->argc, image->argv, stack_top, exec_return_from_entry);
+    exec_enter(image->entry, image->argc, argv_ptr, user_sp, exec_return_from_entry);
     __builtin_unreachable();
 }
 
@@ -174,6 +268,7 @@ int exec_program(const int8_t *path, int argc, const int8_t *argv[])
     {
         return -EINVAL;
     }
+
 
     fd = vfs_open(path, VFS_O_RDONLY);
     if (fd < 0)
@@ -314,17 +409,30 @@ int exec_program(const int8_t *path, int argc, const int8_t *argv[])
         }
     }
 
-    if (min_vaddr < PAGE_OFFSET &&
-        (!strcmp((int8_t *)path, (int8_t *)"/bin/python3") ||
-         !strcmp((int8_t *)path, (int8_t *)"/bin/python")))
+    /*
+     * 关键修复（中文）：
+     * ELF 指令段写入后，必须在“最终执行地址”对应的页上做 I-Cache 同步。
+     * 之前把同步放在了镜像分配前，既没有真实地址也没有真实大小，等于没同步。
+     * 这里统一在段拷贝完成后同步整个装载区，避免执行到旧指令行。
+     */
+    exec_sync_icache(image->image_base, (uint64_t)PAGE_SIZE << image_order);
+
+    if (min_vaddr < PAGE_OFFSET)
     {
         uint64_t alias_va;
         uint64_t alias_size;
         uint64_t alias_pa;
 
         /*
-         * Python 静态链接产物里存在少量“绝对低地址”引用。
-         * 这里给它补一个低地址 alias 窗口，让这些引用能落到同一份镜像内容。
+         * 通用低地址 alias 兼容（中文）：
+         * 部分较大静态程序（如 tinycc）在全局函数指针/跳转表里会保留绝对低地址引用，
+         * 仅靠 load_base 重定位代码段并不足以覆盖这类数据引用。
+         *
+         * 这里把 [min_vaddr, max_vaddr) 同一份物理镜像再映射到原始低地址，
+         * 让“绝对地址访问”和“高地址入口执行”同时成立。
+         *
+         * 注意：当前内核尚未做进程独立页表，此 alias 属于全局映射。
+         * 后续演进到 per-process mm 时，需要把这里迁移到进程私有地址空间。
          */
         alias_va = PAGE_ALIGN_DOWN(min_vaddr);
         alias_size = exec_align_up(max_vaddr - alias_va, PAGE_SIZE);
@@ -334,6 +442,9 @@ int exec_program(const int8_t *path, int argc, const int8_t *argv[])
             exec_cleanup(image);
             return -ENOMEM;
         }
+        image->has_alias = true;
+        image->alias_base = alias_va;
+        image->alias_end = alias_va + alias_size;
     }
 
     image->argc = argc;
@@ -376,6 +487,8 @@ int exec_program(const int8_t *path, int argc, const int8_t *argv[])
          */
         task->exec_base = (uint64_t)image->image_base;
         task->exec_end = (uint64_t)image->image_base + ((uint64_t)PAGE_SIZE << image->image_order);
+        task->exec_alias_base = image->has_alias ? image->alias_base : 0;
+        task->exec_alias_end = image->has_alias ? image->alias_end : 0;
         task->has_exec_image = true;
     }
 

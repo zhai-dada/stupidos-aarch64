@@ -12,11 +12,23 @@
 #include <dirent.h>
 #include <langinfo.h>
 #include <sys/resource.h>
+#include <sys/sysinfo.h>
 #include <sys/times.h>
 #include <sys/syscall.h>
 #include <sys/select.h>
 #include <sys/time.h>
+#include <utime.h>
 #include <stdarg.h>
+#include <setjmp.h>
+#include <limits.h>
+
+/*
+ * 某些交叉工具链在 freestanding 配置下不会暴露 stat64/rlimit64 的 tag 定义。
+ * compat 层只透传这两个结构体指针，不依赖具体字段布局；
+ * 这里前置声明，避免函数原型被编译器当成“临时局部 struct”。
+ */
+struct stat64;
+struct rlimit64;
 
 /*
  * 这是给后续 CPython / 其他 POSIX 用户态程序准备的最小 libc 兼容层。
@@ -95,6 +107,60 @@ void u_lib_early_init(void)
 static bool u_sysret_is_error(int64_t value)
 {
     return value < 0 && value >= -4095;
+}
+
+static int u_sysret_int(int64_t value)
+{
+    if (u_sysret_is_error(value))
+    {
+        errno = (int)(-value);
+        return -1;
+    }
+    return (int)value;
+}
+
+static ssize_t u_sysret_ssize(int64_t value)
+{
+    if (u_sysret_is_error(value))
+    {
+        errno = (int)(-value);
+        return -1;
+    }
+    return (ssize_t)value;
+}
+
+static off_t u_sysret_off(int64_t value)
+{
+    if (u_sysret_is_error(value))
+    {
+        errno = (int)(-value);
+        return (off_t)-1;
+    }
+    return (off_t)value;
+}
+
+static int u_errno_rofs(void)
+{
+    /*
+     * 语义选择（中文）：
+     * 这批接口属于“会修改文件系统元数据/目录结构”的操作。
+     * 当前内核 VFS 还没有完整的 create/unlink/rename/chmod 管线，
+     * 用 EROFS 比 ENOSYS 更贴近真实场景，也更利于上层工具优雅降级。
+     */
+    errno = EROFS;
+    return -1;
+}
+
+static int u_errno_notsup(void)
+{
+    errno = ENOTSUP;
+    return -1;
+}
+
+static ssize_t u_errno_notsup_ssize(void)
+{
+    errno = ENOTSUP;
+    return -1;
 }
 
 static uint64_t u_align_up(uint64_t value, uint64_t align)
@@ -1568,6 +1634,11 @@ int getppid(void)
     return u_getppid();
 }
 
+pid_t gettid(void)
+{
+    return (pid_t)u_sysret_int((int64_t)u_gettid());
+}
+
 int getuid(void)
 {
     return u_getuid();
@@ -1586,6 +1657,16 @@ int geteuid(void)
 int getegid(void)
 {
     return u_getegid();
+}
+
+int sched_getaffinity(pid_t pid, size_t cpusetsize, cpu_set_t *mask)
+{
+    return u_sysret_int((int64_t)u_sched_getaffinity((int)pid, cpusetsize, mask));
+}
+
+int sysinfo(struct sysinfo *info)
+{
+    return u_sysret_int((int64_t)u_sysinfo((struct stupidos_sysinfo *)info));
 }
 
 int setuid(uid_t uid)
@@ -1739,7 +1820,7 @@ clock_t times(struct tms *buffer)
 int gettimeofday(struct timeval *tv, void *tz)
 {
     (void)tz;
-    return u_gettimeofday((struct stupidos_timeval *)tv);
+    return u_sysret_int((int64_t)u_gettimeofday((struct stupidos_timeval *)tv));
 }
 
 int isatty(int fd)
@@ -1782,23 +1863,38 @@ int ttyname_r(int fd, char *buf, size_t buflen)
 
 int access(const char *path, int mode)
 {
-    return u_access((const int8_t *)path, mode);
+    return u_sysret_int((int64_t)u_access((const int8_t *)path, mode));
+}
+
+int faccessat(int dirfd, const char *path, int mode, int flags)
+{
+    if (flags != 0)
+    {
+        errno = ENOTSUP;
+        return -1;
+    }
+
+    if (dirfd != AT_FDCWD)
+    {
+        errno = ENOTSUP;
+        return -1;
+    }
+
+    return access(path, mode);
 }
 
 int chmod(const char *path, mode_t mode)
 {
     (void)path;
     (void)mode;
-    errno = ENOSYS;
-    return -1;
+    return u_errno_rofs();
 }
 
 int fchmod(int fd, mode_t mode)
 {
     (void)fd;
     (void)mode;
-    errno = ENOSYS;
-    return -1;
+    return u_errno_rofs();
 }
 
 int chown(const char *path, uid_t owner, gid_t group)
@@ -1806,8 +1902,7 @@ int chown(const char *path, uid_t owner, gid_t group)
     (void)path;
     (void)owner;
     (void)group;
-    errno = ENOSYS;
-    return -1;
+    return u_errno_rofs();
 }
 
 int fchown(int fd, uid_t owner, gid_t group)
@@ -1815,87 +1910,190 @@ int fchown(int fd, uid_t owner, gid_t group)
     (void)fd;
     (void)owner;
     (void)group;
-    errno = ENOSYS;
-    return -1;
+    return u_errno_rofs();
 }
 
 int link(const char *oldpath, const char *newpath)
 {
     (void)oldpath;
     (void)newpath;
-    errno = ENOSYS;
-    return -1;
+    return u_errno_rofs();
 }
 
 int symlink(const char *oldpath, const char *newpath)
 {
     (void)oldpath;
     (void)newpath;
-    errno = ENOSYS;
-    return -1;
+    return u_errno_rofs();
 }
 
 ssize_t readlink(const char *path, char *buf, size_t bufsiz)
 {
-    (void)path;
-    (void)buf;
-    (void)bufsiz;
-    errno = ENOSYS;
-    return -1;
+    return u_sysret_ssize((int64_t)u_readlink((const int8_t *)path, (int8_t *)buf, bufsiz));
+}
+
+ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz)
+{
+    if (dirfd != AT_FDCWD)
+    {
+        errno = ENOTSUP;
+        return -1;
+    }
+
+    return readlink(path, buf, bufsiz);
 }
 
 int mkdir(const char *path, mode_t mode)
 {
-    (void)path;
-    (void)mode;
-    errno = ENOSYS;
-    return -1;
+    return u_sysret_int((int64_t)u_mkdir((const int8_t *)path, (uint32_t)mode));
 }
 
 int rmdir(const char *path)
 {
-    (void)path;
-    errno = ENOSYS;
-    return -1;
+    return u_sysret_int((int64_t)u_rmdir((const int8_t *)path));
 }
 
 int unlink(const char *path)
 {
-    (void)path;
-    errno = ENOSYS;
-    return -1;
+    return u_sysret_int((int64_t)u_unlink((const int8_t *)path));
 }
 
 int rename(const char *oldpath, const char *newpath)
 {
-    (void)oldpath;
-    (void)newpath;
-    errno = ENOSYS;
-    return -1;
+    return u_sysret_int((int64_t)u_rename((const int8_t *)oldpath, (const int8_t *)newpath));
+}
+
+int mkdirat(int dirfd, const char *path, mode_t mode)
+{
+    if (dirfd != AT_FDCWD)
+    {
+        errno = ENOTSUP;
+        return -1;
+    }
+
+    return mkdir(path, mode);
+}
+
+int unlinkat(int dirfd, const char *path, int flags)
+{
+    if (dirfd != AT_FDCWD)
+    {
+        errno = ENOTSUP;
+        return -1;
+    }
+
+#ifdef AT_REMOVEDIR
+    if (flags & AT_REMOVEDIR)
+    {
+        return rmdir(path);
+    }
+#endif
+
+    return unlink(path);
+}
+
+int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath)
+{
+    if (olddirfd != AT_FDCWD || newdirfd != AT_FDCWD)
+    {
+        errno = ENOTSUP;
+        return -1;
+    }
+
+    return rename(oldpath, newpath);
+}
+
+int renameat2(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, unsigned int flags)
+{
+    if (flags != 0U)
+    {
+        errno = ENOTSUP;
+        return -1;
+    }
+
+    return renameat(olddirfd, oldpath, newdirfd, newpath);
+}
+
+int fchmodat(int dirfd, const char *path, mode_t mode, int flags)
+{
+    if (flags != 0 || dirfd != AT_FDCWD)
+    {
+        errno = ENOTSUP;
+        return -1;
+    }
+
+    return chmod(path, mode);
+}
+
+int fchownat(int dirfd, const char *path, uid_t owner, gid_t group, int flags)
+{
+    if (flags != 0 || dirfd != AT_FDCWD)
+    {
+        errno = ENOTSUP;
+        return -1;
+    }
+
+    return chown(path, owner, group);
+}
+
+int utimensat(int dirfd, const char *path, const struct timespec times[2], int flags)
+{
+    if (dirfd != AT_FDCWD)
+    {
+        errno = ENOTSUP;
+        return -1;
+    }
+
+    return u_sysret_int((int64_t)u_utimensat(dirfd, (const int8_t *)path,
+                                              (const struct stupidos_timespec *)times, flags));
 }
 
 int truncate(const char *path, off_t length)
 {
-    (void)path;
-    (void)length;
-    errno = ENOSYS;
-    return -1;
+    if (length < 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    return u_sysret_int((int64_t)u_truncate((const int8_t *)path, (uint64_t)length));
+}
+
+int truncate64(const char *path, off_t length)
+{
+    return truncate(path, length);
 }
 
 int ftruncate(int fd, off_t length)
 {
-    (void)fd;
-    (void)length;
-    errno = ENOSYS;
-    return -1;
+    if (length < 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    return u_sysret_int((int64_t)u_ftruncate(fd, (uint64_t)length));
+}
+
+int ftruncate64(int fd, off_t length)
+{
+    return ftruncate(fd, length);
 }
 
 int utime(const char *filename, const struct utimbuf *times)
 {
-    (void)filename;
-    (void)times;
-    errno = ENOSYS;
-    return -1;
+    struct timespec ts[2];
+
+    if (!times)
+    {
+        return utimensat(AT_FDCWD, filename, 0, 0);
+    }
+
+    ts[0].tv_sec = times->actime;
+    ts[0].tv_nsec = 0;
+    ts[1].tv_sec = times->modtime;
+    ts[1].tv_nsec = 0;
+    return utimensat(AT_FDCWD, filename, ts, 0);
 }
 
 ssize_t getxattr(const char *path, const char *name, void *value, size_t size)
@@ -1904,8 +2102,7 @@ ssize_t getxattr(const char *path, const char *name, void *value, size_t size)
     (void)name;
     (void)value;
     (void)size;
-    errno = ENOSYS;
-    return -1;
+    return u_errno_notsup_ssize();
 }
 
 ssize_t lgetxattr(const char *path, const char *name, void *value, size_t size)
@@ -1924,8 +2121,7 @@ ssize_t listxattr(const char *path, char *list, size_t size)
     (void)path;
     (void)list;
     (void)size;
-    errno = ENOSYS;
-    return -1;
+    return u_errno_notsup_ssize();
 }
 
 ssize_t llistxattr(const char *path, char *list, size_t size)
@@ -1946,8 +2142,7 @@ int setxattr(const char *path, const char *name, const void *value, size_t size,
     (void)value;
     (void)size;
     (void)flags;
-    errno = ENOSYS;
-    return -1;
+    return u_errno_notsup();
 }
 
 int lsetxattr(const char *path, const char *name, const void *value, size_t size, int flags)
@@ -1973,8 +2168,7 @@ int removexattr(const char *path, const char *name)
 {
     (void)path;
     (void)name;
-    errno = ENOSYS;
-    return -1;
+    return u_errno_notsup();
 }
 
 int lremovexattr(const char *path, const char *name)
@@ -2035,7 +2229,7 @@ int open(const char *path, int flags, ...)
         (void)mode;
     }
 
-    return u_open((const int8_t *)path, u_translate_open_flags(flags));
+    return u_sysret_int((int64_t)u_open((const int8_t *)path, u_translate_open_flags(flags)));
 }
 
 int open64(const char *path, int flags, ...)
@@ -2051,7 +2245,7 @@ int open64(const char *path, int flags, ...)
         (void)mode;
     }
 
-    return u_open((const int8_t *)path, u_translate_open_flags(flags));
+    return u_sysret_int((int64_t)u_open((const int8_t *)path, u_translate_open_flags(flags)));
 }
 
 int openat(int dirfd, const char *path, int flags, ...)
@@ -2067,62 +2261,84 @@ int openat(int dirfd, const char *path, int flags, ...)
         (void)mode;
     }
 
-    return u_openat(dirfd, (const int8_t *)path, u_translate_open_flags(flags));
+    return u_sysret_int((int64_t)u_openat(dirfd, (const int8_t *)path, u_translate_open_flags(flags)));
 }
 
 int close(int fd)
 {
-    return u_close(fd);
+    return u_sysret_int((int64_t)u_close(fd));
 }
 
 ssize_t read(int fd, void *buf, size_t len)
 {
-    return u_read(fd, buf, len);
+    return u_sysret_ssize((int64_t)u_read(fd, buf, len));
 }
 
 ssize_t write(int fd, const void *buf, size_t len)
 {
-    return u_write(fd, buf, len);
+    return u_sysret_ssize((int64_t)u_write(fd, buf, len));
 }
 
 off_t lseek(int fd, off_t offset, int whence)
 {
-    return (off_t)u_lseek(fd, offset, whence);
+    return u_sysret_off((int64_t)u_lseek(fd, offset, whence));
 }
 
 off_t lseek64(int fd, off_t offset, int whence)
 {
-    return (off_t)u_lseek(fd, offset, whence);
+    return u_sysret_off((int64_t)u_lseek(fd, offset, whence));
 }
 
 int stat(const char *path, struct stat *out)
 {
-    return u_stat((const int8_t *)path, (struct stupidos_stat *)out);
+    return u_sysret_int((int64_t)u_stat((const int8_t *)path, (struct stupidos_stat *)out));
 }
 
 int fstat(int fd, struct stat *out)
 {
-    return u_fstat(fd, (struct stupidos_stat *)out);
+    return u_sysret_int((int64_t)u_fstat(fd, (struct stupidos_stat *)out));
 }
 
 int stat64(const char *path, struct stat64 *out)
 {
-    return u_stat((const int8_t *)path, (struct stupidos_stat *)out);
+    return u_sysret_int((int64_t)u_stat((const int8_t *)path, (struct stupidos_stat *)out));
 }
 
 int fstat64(int fd, struct stat64 *out)
 {
-    return u_fstat(fd, (struct stupidos_stat *)out);
+    return u_sysret_int((int64_t)u_fstat(fd, (struct stupidos_stat *)out));
+}
+
+int fstatat(int dirfd, const char *path, struct stat *out, int flags)
+{
+    (void)flags;
+    return u_sysret_int((int64_t)u_fstatat(dirfd, (const int8_t *)path, (struct stupidos_stat *)out));
+}
+
+int fstatat64(int dirfd, const char *path, struct stat64 *out, int flags)
+{
+    (void)flags;
+    return u_sysret_int((int64_t)u_fstatat(dirfd, (const int8_t *)path, (struct stupidos_stat *)out));
+}
+
+int newfstatat(int dirfd, const char *path, struct stat *out, int flags)
+{
+    return fstatat(dirfd, path, out, flags);
+}
+
+int lstat(const char *path, struct stat *out)
+{
+    return fstatat(AT_FDCWD, path, out, AT_SYMLINK_NOFOLLOW);
 }
 
 ssize_t pread64(int fd, void *buf, size_t len, off_t off)
 {
-    return u_pread64(fd, buf, len, (uint64_t)off);
+    return u_sysret_ssize((int64_t)u_pread64(fd, buf, len, (uint64_t)off));
 }
 
 ssize_t pwrite64(int fd, const void *buf, size_t len, off_t off)
 {
-    return u_pwrite64(fd, buf, len, (uint64_t)off);
+    return u_sysret_ssize((int64_t)u_pwrite64(fd, buf, len, (uint64_t)off));
 }
 
 int lstat64(const char *path, struct stat64 *out)
@@ -2132,7 +2348,7 @@ int lstat64(const char *path, struct stat64 *out)
 
 int chdir(const char *path)
 {
-    return (int)u_chdir((const int8_t *)path);
+    return u_sysret_int((int64_t)u_chdir((const int8_t *)path));
 }
 
 int fchdir(int fd)
@@ -2156,16 +2372,51 @@ int chroot(const char *path)
 
 char *getcwd(char *buf, size_t len)
 {
-    if (u_getcwd((int8_t *)buf, len) < 0)
+    bool alloced;
+    size_t use_len;
+
+    alloced = false;
+    use_len = len;
+    if (!buf)
     {
+        /*
+         * 对齐 POSIX 常见用法：getcwd(NULL, 0) 由 libc 分配缓冲。
+         * 构建工具链/解释器常使用该模式探测当前路径。
+         */
+        if (use_len == 0)
+        {
+            use_len = STUPIDOS_PATH_MAX;
+        }
+
+        buf = (char *)malloc(use_len);
+        if (!buf)
+        {
+            errno = ENOMEM;
+            return 0;
+        }
+        alloced = true;
+    }
+    else if (use_len == 0)
+    {
+        errno = EINVAL;
         return 0;
     }
+
+    if (u_sysret_int((int64_t)u_getcwd((int8_t *)buf, use_len)) < 0)
+    {
+        if (alloced)
+        {
+            free(buf);
+        }
+        return 0;
+    }
+
     return buf;
 }
 
 int clock_gettime(clockid_t clockid, struct timespec *out)
 {
-    return u_clock_gettime((int)clockid, (struct stupidos_timespec *)out);
+    return u_sysret_int((int64_t)u_clock_gettime((int)clockid, (struct stupidos_timespec *)out));
 }
 
 int clock_getres(clockid_t clockid, struct timespec *out)
@@ -2189,7 +2440,7 @@ int clock_getres(clockid_t clockid, struct timespec *out)
 
 int nanosleep(const struct timespec *req, struct timespec *rem)
 {
-    return u_nanosleep((const struct stupidos_timespec *)req, (struct stupidos_timespec *)rem);
+    return u_sysret_int((int64_t)u_nanosleep((const struct stupidos_timespec *)req, (struct stupidos_timespec *)rem));
 }
 
 static int64_t u_days_from_civil(int64_t year, unsigned month, unsigned day)
@@ -2370,12 +2621,12 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off)
 
 int munmap(void *addr, size_t len)
 {
-    return u_munmap(addr, len);
+    return u_sysret_int((int64_t)u_munmap(addr, len));
 }
 
 int mprotect(void *addr, size_t len, int prot)
 {
-    return u_mprotect(addr, len, prot);
+    return u_sysret_int((int64_t)u_mprotect(addr, len, prot));
 }
 
 int fsync(int fd)
@@ -2511,6 +2762,94 @@ int pselect(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, cons
  */
 static void *u_pthread_tls_values[64];
 static unsigned char u_pthread_tls_used[64];
+struct u_pthread_mutex_slot
+{
+    pthread_mutex_t *key;
+    int used;
+    int locked;
+    unsigned long owner;
+    uint32_t recursion;
+};
+static struct u_pthread_mutex_slot u_pthread_mutex_slots[64];
+
+static struct u_pthread_mutex_slot *u_pthread_mutex_slot_get(pthread_mutex_t *mutex, int create)
+{
+    unsigned int i;
+    struct u_pthread_mutex_slot *free_slot = 0;
+
+    if (!mutex)
+    {
+        return 0;
+    }
+
+    for (i = 0; i < (unsigned int)(sizeof(u_pthread_mutex_slots) / sizeof(u_pthread_mutex_slots[0])); ++i)
+    {
+        struct u_pthread_mutex_slot *slot = &u_pthread_mutex_slots[i];
+
+        if (slot->used && slot->key == mutex)
+        {
+            return slot;
+        }
+        if (!slot->used && !free_slot)
+        {
+            free_slot = slot;
+        }
+    }
+
+    if (!create || !free_slot)
+    {
+        return 0;
+    }
+
+    free_slot->used = 1;
+    free_slot->key = mutex;
+    free_slot->locked = 0;
+    free_slot->owner = 0;
+    free_slot->recursion = 0;
+    return free_slot;
+}
+
+static int u_timespec_cmp(const struct timespec *lhs, const struct timespec *rhs)
+{
+    if (lhs->tv_sec < rhs->tv_sec)
+    {
+        return -1;
+    }
+    if (lhs->tv_sec > rhs->tv_sec)
+    {
+        return 1;
+    }
+    if (lhs->tv_nsec < rhs->tv_nsec)
+    {
+        return -1;
+    }
+    if (lhs->tv_nsec > rhs->tv_nsec)
+    {
+        return 1;
+    }
+    return 0;
+}
+
+static int u_clock_realtime_now(struct timespec *ts)
+{
+    struct timeval tv;
+
+    if (!ts)
+    {
+        return -1;
+    }
+    if (clock_gettime(CLOCK_REALTIME, ts) == 0)
+    {
+        return 0;
+    }
+    if (gettimeofday(&tv, 0) < 0)
+    {
+        return -1;
+    }
+    ts->tv_sec = tv.tv_sec;
+    ts->tv_nsec = (long)tv.tv_usec * 1000L;
+    return 0;
+}
 
 int pthread_attr_init(pthread_attr_t *attr)
 {
@@ -2559,35 +2898,151 @@ int pthread_condattr_setclock(pthread_condattr_t *attr, clockid_t clock_id)
 
 int pthread_mutex_init(pthread_mutex_t *mutex, const pthread_mutexattr_t *attr)
 {
+    struct u_pthread_mutex_slot *slot;
+
     (void)attr;
-    if (mutex)
+    if (!mutex)
     {
-        memset(mutex, 0, sizeof(*mutex));
+        return EINVAL;
     }
+    memset(mutex, 0, sizeof(*mutex));
+    slot = u_pthread_mutex_slot_get(mutex, 1);
+    if (!slot)
+    {
+        return ENOSPC;
+    }
+    slot->locked = 0;
+    slot->owner = 0;
+    slot->recursion = 0;
     return 0;
 }
 
 int pthread_mutex_destroy(pthread_mutex_t *mutex)
 {
-    (void)mutex;
+    struct u_pthread_mutex_slot *slot;
+
+    if (!mutex)
+    {
+        return EINVAL;
+    }
+    slot = u_pthread_mutex_slot_get(mutex, 0);
+    if (slot)
+    {
+        slot->used = 0;
+        slot->key = 0;
+        slot->locked = 0;
+        slot->owner = 0;
+        slot->recursion = 0;
+    }
     return 0;
 }
 
 int pthread_mutex_lock(pthread_mutex_t *mutex)
 {
-    (void)mutex;
+    struct u_pthread_mutex_slot *slot;
+    unsigned long me;
+
+    if (!mutex)
+    {
+        return EINVAL;
+    }
+    slot = u_pthread_mutex_slot_get(mutex, 1);
+    if (!slot)
+    {
+        return ENOSPC;
+    }
+    me = (unsigned long)pthread_self();
+
+    if (slot->locked && slot->owner == me)
+    {
+        /*
+         * 关键兼容（中文）：
+         * 在 stupidos 当前单线程模型里，默认 mutex 若遇到同线程重复加锁，
+         * 按 POSIX 严格语义会死锁，实际会把 CPython 启动链直接卡死。
+         * 这里先做“可重入计数”语义，优先保证解释器可运行。
+         */
+        slot->recursion++;
+        return 0;
+    }
+
+    /*
+     * stupidos 单线程兼容语义：
+     * - 如果已经上锁，这里短暂让出 CPU，等待解锁。
+     * - 在当前阶段它主要服务 CPython 内部锁，不追求完整抢占公平。
+     */
+    while (slot->locked)
+    {
+        struct timespec ts;
+        ts.tv_sec = 0;
+        ts.tv_nsec = 1000000L;
+        (void)nanosleep(&ts, 0);
+    }
+    slot->locked = 1;
+    slot->owner = me;
+    slot->recursion = 1;
     return 0;
 }
 
 int pthread_mutex_trylock(pthread_mutex_t *mutex)
 {
-    (void)mutex;
+    struct u_pthread_mutex_slot *slot;
+    unsigned long me;
+
+    if (!mutex)
+    {
+        return EINVAL;
+    }
+    slot = u_pthread_mutex_slot_get(mutex, 1);
+    if (!slot)
+    {
+        return ENOSPC;
+    }
+    me = (unsigned long)pthread_self();
+
+    if (slot->locked && slot->owner == me)
+    {
+        slot->recursion++;
+        return 0;
+    }
+
+    if (slot->locked)
+    {
+        return EBUSY;
+    }
+    slot->locked = 1;
+    slot->owner = me;
+    slot->recursion = 1;
     return 0;
 }
 
 int pthread_mutex_unlock(pthread_mutex_t *mutex)
 {
-    (void)mutex;
+    struct u_pthread_mutex_slot *slot;
+    unsigned long me;
+
+    if (!mutex)
+    {
+        return EINVAL;
+    }
+    slot = u_pthread_mutex_slot_get(mutex, 0);
+    if (!slot || !slot->locked)
+    {
+        return EPERM;
+    }
+    me = (unsigned long)pthread_self();
+    if (slot->owner != 0 && slot->owner != me)
+    {
+        return EPERM;
+    }
+    if (slot->recursion > 1)
+    {
+        slot->recursion--;
+        return 0;
+    }
+
+    slot->locked = 0;
+    slot->owner = 0;
+    slot->recursion = 0;
     return 0;
 }
 
@@ -2609,17 +3064,94 @@ int pthread_cond_destroy(pthread_cond_t *cond)
 
 int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex)
 {
+    struct timespec ts;
+    int ret;
+
     (void)cond;
-    (void)mutex;
+    if (!mutex)
+    {
+        return EINVAL;
+    }
+    ret = pthread_mutex_unlock(mutex);
+    if (ret != 0)
+    {
+        return ret;
+    }
+    ts.tv_sec = 0;
+    ts.tv_nsec = 1000000L;
+    (void)nanosleep(&ts, 0);
+    ret = pthread_mutex_lock(mutex);
+    if (ret != 0)
+    {
+        return ret;
+    }
     return 0;
 }
 
 int pthread_cond_timedwait(pthread_cond_t *cond, pthread_mutex_t *mutex, const struct timespec *abs_timeout)
 {
+    int ret;
+
     (void)cond;
-    (void)mutex;
-    (void)abs_timeout;
-    return 0;
+    if (!mutex || !abs_timeout)
+    {
+        return EINVAL;
+    }
+
+    ret = pthread_mutex_unlock(mutex);
+    if (ret != 0)
+    {
+        return ret;
+    }
+
+    /*
+     * 关键修复：
+     * CPython 的 pthread 锁实现依赖 timedwait 超时返回 ETIMEDOUT。
+     * 之前固定返回 0 会让等待循环误以为被唤醒，最终在 import/bootstrap
+     * 阶段进入无穷循环卡死。
+     */
+    for (;;)
+    {
+        struct timespec now;
+        struct timespec slice;
+        long long remain_ns;
+
+        if (u_clock_realtime_now(&now) < 0)
+        {
+            ret = EINVAL;
+            break;
+        }
+        if (u_timespec_cmp(&now, abs_timeout) >= 0)
+        {
+            ret = ETIMEDOUT;
+            break;
+        }
+
+        remain_ns = (long long)(abs_timeout->tv_sec - now.tv_sec) * 1000000000LL
+                  + (long long)(abs_timeout->tv_nsec - now.tv_nsec);
+        if (remain_ns <= 0)
+        {
+            ret = ETIMEDOUT;
+            break;
+        }
+
+        if (remain_ns > 1000000LL)
+        {
+            remain_ns = 1000000LL;
+        }
+        slice.tv_sec = 0;
+        slice.tv_nsec = (long)remain_ns;
+        (void)nanosleep(&slice, 0);
+    }
+
+    {
+        int lock_ret = pthread_mutex_lock(mutex);
+        if (lock_ret != 0)
+        {
+            return lock_ret;
+        }
+    }
+    return ret;
 }
 
 int pthread_cond_signal(pthread_cond_t *cond)
@@ -2737,24 +3269,41 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_
 
 int dup(int oldfd)
 {
-    return u_dup(oldfd);
+    return u_sysret_int((int64_t)u_dup(oldfd));
 }
 
 #ifndef STUPIDOS_MINIMAL_OS
 int dup2(int oldfd, int newfd)
 {
-    return u_dup2(oldfd, newfd);
+    return u_sysret_int((int64_t)u_dup2(oldfd, newfd));
 }
 #endif
 
+int dup3(int oldfd, int newfd, int flags)
+{
+    if (oldfd == newfd)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (flags & ~O_CLOEXEC)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    return dup2(oldfd, newfd);
+}
+
 ssize_t pread(int fd, void *buf, size_t len, off_t off)
 {
-    return u_pread64(fd, buf, len, (uint64_t)off);
+    return u_sysret_ssize((int64_t)u_pread64(fd, buf, len, (uint64_t)off));
 }
 
 ssize_t pwrite(int fd, const void *buf, size_t len, off_t off)
 {
-    return u_pwrite64(fd, buf, len, (uint64_t)off);
+    return u_sysret_ssize((int64_t)u_pwrite64(fd, buf, len, (uint64_t)off));
 }
 
 int fcntl(int fd, int cmd, ...)
@@ -2762,10 +3311,19 @@ int fcntl(int fd, int cmd, ...)
     unsigned long arg = 0;
     va_list ap;
 
-    va_start(ap, cmd);
-    arg = va_arg(ap, unsigned long);
-    va_end(ap);
-    return u_fcntl(fd, cmd, arg);
+    switch (cmd)
+    {
+    case F_GETFD:
+    case F_GETFL:
+        break;
+    default:
+        va_start(ap, cmd);
+        arg = va_arg(ap, unsigned long);
+        va_end(ap);
+        break;
+    }
+
+    return u_sysret_int((int64_t)u_fcntl(fd, cmd, arg));
 }
 
 int fcntl64(int fd, int cmd, ...)
@@ -2773,28 +3331,39 @@ int fcntl64(int fd, int cmd, ...)
     unsigned long arg = 0;
     va_list ap;
 
-    va_start(ap, cmd);
-    arg = va_arg(ap, unsigned long);
-    va_end(ap);
-    return u_fcntl(fd, cmd, arg);
+    switch (cmd)
+    {
+    case F_GETFD:
+    case F_GETFL:
+        break;
+    default:
+        va_start(ap, cmd);
+        arg = va_arg(ap, unsigned long);
+        va_end(ap);
+        break;
+    }
+
+    return u_sysret_int((int64_t)u_fcntl(fd, cmd, arg));
 }
 
 int ioctl(int fd, unsigned long request, void *argp)
 {
-    return u_ioctl(fd, request, argp);
+    return u_sysret_int((int64_t)u_ioctl(fd, request, argp));
 }
 
 int pipe(int fds[2])
 {
     (void)fds;
-    return -ENOSYS;
+    errno = ENOSYS;
+    return -1;
 }
 
 int pipe2(int fds[2], int flags)
 {
     (void)fds;
     (void)flags;
-    return -ENOSYS;
+    errno = ENOSYS;
+    return -1;
 }
 
 int openpty(int *amaster, int *aslave, char *name, void *termp, void *winp)
@@ -2806,6 +3375,16 @@ int openpty(int *amaster, int *aslave, char *name, void *termp, void *winp)
     (void)winp;
     errno = ENOSYS;
     return -1;
+}
+
+int getdents64(unsigned int fd, struct dirent64 *dirp, unsigned int count)
+{
+    return u_sysret_int((int64_t)u_getdents64((int)fd, (struct stupidos_linux_dirent64 *)dirp, count));
+}
+
+int getdents(unsigned int fd, struct dirent *dirp, unsigned int count)
+{
+    return getdents64(fd, (struct dirent64 *)dirp, count);
 }
 
 int pause(void)
@@ -2820,22 +3399,22 @@ int pause(void)
 
 int getrlimit(int resource, struct rlimit *rlim)
 {
-    return u_prlimit64(0, resource, 0, (struct stupidos_rlimit *)rlim);
+    return u_sysret_int((int64_t)u_prlimit64(0, resource, 0, (struct stupidos_rlimit *)rlim));
 }
 
 int setrlimit(int resource, const struct rlimit *rlim)
 {
-    return u_prlimit64(0, resource, (const struct stupidos_rlimit *)rlim, 0);
+    return u_sysret_int((int64_t)u_prlimit64(0, resource, (const struct stupidos_rlimit *)rlim, 0));
 }
 
 int getrlimit64(int resource, struct rlimit64 *rlim)
 {
-    return u_prlimit64(0, resource, 0, (struct stupidos_rlimit *)rlim);
+    return u_sysret_int((int64_t)u_prlimit64(0, resource, 0, (struct stupidos_rlimit *)rlim));
 }
 
 int setrlimit64(int resource, const struct rlimit64 *rlim)
 {
-    return u_prlimit64(0, resource, (const struct stupidos_rlimit *)rlim, 0);
+    return u_sysret_int((int64_t)u_prlimit64(0, resource, (const struct stupidos_rlimit *)rlim, 0));
 }
 
 long sysconf(int name)
@@ -2941,17 +3520,17 @@ size_t confstr(int name, char *buf, size_t len)
 
 int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 {
-    return u_rt_sigaction(signum, act, oldact, sizeof(sigset_t));
+    return u_sysret_int((int64_t)u_rt_sigaction(signum, act, oldact, sizeof(sigset_t)));
 }
 
 int sigprocmask(int how, const sigset_t *set, sigset_t *oldset)
 {
-    return u_rt_sigprocmask(how, set, oldset, sizeof(sigset_t));
+    return u_sysret_int((int64_t)u_rt_sigprocmask(how, set, oldset, sizeof(sigset_t)));
 }
 
 int sigaltstack(const stack_t *ss, stack_t *old_ss)
 {
-    return u_sigaltstack(ss, old_ss);
+    return u_sysret_int((int64_t)u_sigaltstack(ss, old_ss));
 }
 
 int sigemptyset(sigset_t *set)
@@ -3075,11 +3654,15 @@ pid_t fork(void)
     return -1;
 }
 
+pid_t vfork(void)
+{
+    return fork();
+}
+
 pid_t waitpid(pid_t pid, int *status, int options)
 {
     int64_t ret;
 
-    (void)status;
     (void)options;
     ret = u_waitpid((int32_t)pid);
     if (ret < 0)
@@ -3093,14 +3676,18 @@ pid_t waitpid(pid_t pid, int *status, int options)
         *status = 0;
     }
 
-    return (pid_t)pid;
+    return (pid_t)ret;
 }
 
 pid_t wait(int *status)
 {
-    (void)status;
-    errno = ENOSYS;
-    return -1;
+    return waitpid(-1, status, 0);
+}
+
+pid_t wait4(pid_t pid, int *status, int options, void *rusage)
+{
+    (void)rusage;
+    return waitpid(pid, status, options);
 }
 
 void exit(int code)
@@ -3118,11 +3705,343 @@ void abort(void)
     u_exit(134);
 }
 
+/*
+ * exec 兼容层（中文）：
+ * 当前内核提供的是“spawn 新任务 + waitpid”的组合，而不是完整的
+ * 进程地址空间替换语义。这里把 exec* 做成“成功后等待子任务结束并退出自己”，
+ * 尽量接近“成功不返回”的行为，先支撑工具链迁移。
+ */
+#define U_EXEC_MAX_ARGS 16
+
+static int u_exec_build_argv(const char *path, char *const argv[], const int8_t **out_argv, int *out_argc)
+{
+    int argc;
+
+    if (!path || !out_argv || !out_argc)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    argc = 0;
+    if (argv && argv[0])
+    {
+        while (argv[argc])
+        {
+            if (argc >= U_EXEC_MAX_ARGS)
+            {
+                errno = E2BIG;
+                return -1;
+            }
+
+            out_argv[argc] = (const int8_t *)argv[argc];
+            argc++;
+        }
+    }
+    else
+    {
+        out_argv[0] = (const int8_t *)path;
+        argc = 1;
+    }
+
+    if (argc <= 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    *out_argc = argc;
+    return 0;
+}
+
+static int u_exec_spawn_only(const char *path, char *const argv[])
+{
+    const int8_t *kargv[U_EXEC_MAX_ARGS];
+    int argc;
+    int64_t ret;
+
+    if (u_exec_build_argv(path, argv, kargv, &argc) < 0)
+    {
+        return -1;
+    }
+
+    ret = (int64_t)u_exec((const int8_t *)path, argc, kargv);
+    if (u_sysret_is_error(ret))
+    {
+        errno = (int)(-ret);
+        return -1;
+    }
+
+    return (int)ret;
+}
+
+static int u_exec_replace(const char *path, char *const argv[])
+{
+    int pid;
+    int status;
+
+    pid = u_exec_spawn_only(path, argv);
+    if (pid < 0)
+    {
+        return -1;
+    }
+
+    if (waitpid((pid_t)pid, &status, 0) < 0)
+    {
+        return -1;
+    }
+
+    u_exit(0);
+    __builtin_unreachable();
+}
+
+static int u_exec_search_path_replace(const char *file, char *const argv[])
+{
+    const char *path_env;
+    char candidate[STUPIDOS_PATH_MAX];
+    const char *p;
+
+    if (!file || file[0] == '\0')
+    {
+        errno = ENOENT;
+        return -1;
+    }
+
+    if (strchr(file, '/'))
+    {
+        return u_exec_replace(file, argv);
+    }
+
+    path_env = getenv("PATH");
+    if (!path_env || path_env[0] == '\0')
+    {
+        path_env = "/bin:/usr/bin";
+    }
+
+    p = path_env;
+    while (*p)
+    {
+        const char *seg = p;
+        size_t seg_len;
+        size_t file_len;
+        size_t total;
+        int err;
+
+        while (*p && *p != ':')
+        {
+            p++;
+        }
+        seg_len = (size_t)(p - seg);
+        file_len = strlen(file);
+
+        if (seg_len == 0)
+        {
+            seg = ".";
+            seg_len = 1;
+        }
+
+        total = seg_len + 1 + file_len;
+        if (total + 1 <= sizeof(candidate))
+        {
+            memcpy(candidate, seg, seg_len);
+            candidate[seg_len] = '/';
+            memcpy(candidate + seg_len + 1, file, file_len);
+            candidate[total] = '\0';
+
+            if (u_exec_replace(candidate, argv) == 0)
+            {
+                return 0;
+            }
+
+            err = errno;
+            if (err != ENOENT && err != ENOTDIR)
+            {
+                return -1;
+            }
+        }
+
+        if (*p == ':')
+        {
+            p++;
+        }
+    }
+
+    errno = ENOENT;
+    return -1;
+}
+
 int system(const char *command)
 {
-    (void)command;
-    errno = ENOSYS;
-    return -1;
+    char *const argv_sh[] = { (char *)"sh", (char *)"-c", (char *)command, 0 };
+    char *const argv_direct[] = { (char *)command, 0 };
+    int pid;
+
+    if (!command)
+    {
+        return 1;
+    }
+
+    if (command[0] == '\0')
+    {
+        return 0;
+    }
+
+    /*
+     * 兼容优先：先尝试 /bin/sh -c，
+     * 若当前 shell 还不支持 -c，再回退成“直接执行单个程序路径”。
+     */
+    pid = u_exec_spawn_only("/bin/sh", argv_sh);
+    if (pid < 0)
+    {
+        pid = u_exec_spawn_only(command, argv_direct);
+        if (pid < 0)
+        {
+            return -1;
+        }
+    }
+
+    if (waitpid((pid_t)pid, 0, 0) < 0)
+    {
+        return -1;
+    }
+
+    return 0;
+}
+
+int execv(const char *path, char *const argv[])
+{
+    (void)environ;
+    if (!path)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    return u_exec_replace(path, argv);
+}
+
+int execve(const char *path, char *const argv[], char *const envp[])
+{
+    if (!path)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    (void)envp;
+    return u_exec_replace(path, argv);
+}
+
+int execvp(const char *file, char *const argv[])
+{
+    return u_exec_search_path_replace(file, argv);
+}
+
+int execveat(int dirfd, const char *path, char *const argv[], char *const envp[], int flags)
+{
+    if (flags != 0)
+    {
+        errno = ENOTSUP;
+        return -1;
+    }
+
+    if (dirfd != AT_FDCWD)
+    {
+        errno = ENOTSUP;
+        return -1;
+    }
+
+    return execve(path, argv, envp);
+}
+
+static int u_exec_build_varargs(const char *arg0, va_list ap, char *argv_buf[], size_t argv_cap, char *const **out_argv, char *const **out_envp, int has_envp)
+{
+    size_t argc;
+    char *arg;
+
+    if (!argv_buf || argv_cap < 2 || !out_argv)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    argc = 0;
+    arg = (char *)arg0;
+    while (arg)
+    {
+        if (argc + 1 >= argv_cap)
+        {
+            errno = E2BIG;
+            return -1;
+        }
+
+        argv_buf[argc++] = arg;
+        arg = va_arg(ap, char *);
+    }
+    argv_buf[argc] = 0;
+    *out_argv = argv_buf;
+
+    if (has_envp && out_envp)
+    {
+        *out_envp = va_arg(ap, char *const *);
+    }
+
+    return 0;
+}
+
+int execl(const char *path, const char *arg, ...)
+{
+    va_list ap;
+    char *argv_buf[U_EXEC_MAX_ARGS + 1];
+    char *const *argv_list;
+
+    va_start(ap, arg);
+    if (u_exec_build_varargs(arg, ap, argv_buf, U_EXEC_MAX_ARGS + 1U, &argv_list, 0, 0) < 0)
+    {
+        va_end(ap);
+        return -1;
+    }
+    va_end(ap);
+    return execv(path, (char *const *)argv_list);
+}
+
+int execlp(const char *file, const char *arg, ...)
+{
+    va_list ap;
+    char *argv_buf[U_EXEC_MAX_ARGS + 1];
+    char *const *argv_list;
+
+    va_start(ap, arg);
+    if (u_exec_build_varargs(arg, ap, argv_buf, U_EXEC_MAX_ARGS + 1U, &argv_list, 0, 0) < 0)
+    {
+        va_end(ap);
+        return -1;
+    }
+    va_end(ap);
+    return execvp(file, (char *const *)argv_list);
+}
+
+int execle(const char *path, const char *arg, ...)
+{
+    va_list ap;
+    char *argv_buf[U_EXEC_MAX_ARGS + 1];
+    char *const *argv_list;
+    char *const *envp;
+
+    envp = 0;
+    va_start(ap, arg);
+    if (u_exec_build_varargs(arg, ap, argv_buf, U_EXEC_MAX_ARGS + 1U, &argv_list, &envp, 1) < 0)
+    {
+        va_end(ap);
+        return -1;
+    }
+    va_end(ap);
+    return execve(path, (char *const *)argv_list, (char *const *)envp);
+}
+
+int execvpe(const char *file, char *const argv[], char *const envp[])
+{
+    (void)envp;
+    return execvp(file, argv);
 }
 
 long syscall(long number, ...)
@@ -3143,9 +4062,430 @@ long syscall(long number, ...)
      */
     switch (number)
     {
+#ifdef SYS_read
+    case SYS_read:
+    {
+        int fd = va_arg(ap, int);
+        void *buf = va_arg(ap, void *);
+        size_t len = va_arg(ap, size_t);
+        ret = (long)u_read(fd, buf, len);
+        if (ret < 0)
+        {
+            errno = (int)(-ret);
+            ret = -1;
+        }
+        break;
+    }
+#endif
+#ifdef SYS_write
+    case SYS_write:
+    {
+        int fd = va_arg(ap, int);
+        const void *buf = va_arg(ap, const void *);
+        size_t len = va_arg(ap, size_t);
+        ret = (long)u_write(fd, buf, len);
+        if (ret < 0)
+        {
+            errno = (int)(-ret);
+            ret = -1;
+        }
+        break;
+    }
+#endif
+#ifdef SYS_openat
+    case SYS_openat:
+    {
+        int dirfd = va_arg(ap, int);
+        const char *path = va_arg(ap, const char *);
+        int flags = va_arg(ap, int);
+        int mode = 0;
+        if (flags & O_CREAT)
+        {
+            mode = va_arg(ap, int);
+        }
+        (void)mode;
+        ret = (long)u_openat(dirfd, (const int8_t *)path, u_translate_open_flags(flags));
+        if (ret < 0)
+        {
+            errno = (int)(-ret);
+            ret = -1;
+        }
+        break;
+    }
+#endif
+#ifdef SYS_close
+    case SYS_close:
+    {
+        int fd = va_arg(ap, int);
+        ret = (long)u_close(fd);
+        if (ret < 0)
+        {
+            errno = (int)(-ret);
+            ret = -1;
+        }
+        break;
+    }
+#endif
+#ifdef SYS_lseek
+    case SYS_lseek:
+    {
+        int fd = va_arg(ap, int);
+        off_t off = va_arg(ap, off_t);
+        int whence = va_arg(ap, int);
+        ret = (long)u_lseek(fd, off, whence);
+        if (ret < 0)
+        {
+            errno = (int)(-ret);
+            ret = -1;
+        }
+        break;
+    }
+#endif
+#ifdef SYS_fcntl
+    case SYS_fcntl:
+    {
+        int fd = va_arg(ap, int);
+        int cmd = va_arg(ap, int);
+        unsigned long arg = va_arg(ap, unsigned long);
+        ret = (long)u_fcntl(fd, cmd, arg);
+        if (ret < 0)
+        {
+            errno = (int)(-ret);
+            ret = -1;
+        }
+        break;
+    }
+#endif
+#ifdef SYS_ioctl
+    case SYS_ioctl:
+    {
+        int fd = va_arg(ap, int);
+        unsigned long req = va_arg(ap, unsigned long);
+        void *argp = va_arg(ap, void *);
+        ret = (long)u_ioctl(fd, req, argp);
+        if (ret < 0)
+        {
+            errno = (int)(-ret);
+            ret = -1;
+        }
+        break;
+    }
+#endif
+#ifdef SYS_mmap
+    case SYS_mmap:
+    {
+        void *addr = va_arg(ap, void *);
+        size_t len = va_arg(ap, size_t);
+        int prot = va_arg(ap, int);
+        int flags = va_arg(ap, int);
+        int fd = va_arg(ap, int);
+        off_t off = va_arg(ap, off_t);
+        ret = (long)u_mmap(addr, len, prot, flags, fd, off);
+        if (ret < 0)
+        {
+            errno = (int)(-ret);
+            ret = -1;
+        }
+        break;
+    }
+#endif
+#ifdef SYS_munmap
+    case SYS_munmap:
+    {
+        void *addr = va_arg(ap, void *);
+        size_t len = va_arg(ap, size_t);
+        ret = (long)u_munmap(addr, len);
+        if (ret < 0)
+        {
+            errno = (int)(-ret);
+            ret = -1;
+        }
+        break;
+    }
+#endif
+#ifdef SYS_mprotect
+    case SYS_mprotect:
+    {
+        void *addr = va_arg(ap, void *);
+        size_t len = va_arg(ap, size_t);
+        int prot = va_arg(ap, int);
+        ret = (long)u_mprotect(addr, len, prot);
+        if (ret < 0)
+        {
+            errno = (int)(-ret);
+            ret = -1;
+        }
+        break;
+    }
+#endif
+#ifdef SYS_brk
+    case SYS_brk:
+    {
+        void *addr = va_arg(ap, void *);
+        ret = (long)(uintptr_t)u_brk(addr);
+        if (ret < 0)
+        {
+            errno = (int)(-ret);
+            ret = -1;
+        }
+        break;
+    }
+#endif
+#ifdef SYS_clock_gettime
+    case SYS_clock_gettime:
+    {
+        int clockid = va_arg(ap, int);
+        struct timespec *ts = va_arg(ap, struct timespec *);
+        ret = (long)u_clock_gettime(clockid, (struct stupidos_timespec *)ts);
+        if (ret < 0)
+        {
+            errno = (int)(-ret);
+            ret = -1;
+        }
+        break;
+    }
+#endif
+#ifdef SYS_nanosleep
+    case SYS_nanosleep:
+    {
+        const struct timespec *req = va_arg(ap, const struct timespec *);
+        struct timespec *rem = va_arg(ap, struct timespec *);
+        ret = (long)u_nanosleep((const struct stupidos_timespec *)req, (struct stupidos_timespec *)rem);
+        if (ret < 0)
+        {
+            errno = (int)(-ret);
+            ret = -1;
+        }
+        break;
+    }
+#endif
+#ifdef SYS_newfstatat
+    case SYS_newfstatat:
+    {
+        int dirfd = va_arg(ap, int);
+        const char *path = va_arg(ap, const char *);
+        struct stat *st = va_arg(ap, struct stat *);
+        int flags = va_arg(ap, int);
+        (void)flags;
+        ret = (long)u_fstatat(dirfd, (const int8_t *)path, (struct stupidos_stat *)st);
+        if (ret < 0)
+        {
+            errno = (int)(-ret);
+            ret = -1;
+        }
+        break;
+    }
+#endif
+#ifdef SYS_readlinkat
+    case SYS_readlinkat:
+    {
+        int dirfd = va_arg(ap, int);
+        const char *path = va_arg(ap, const char *);
+        char *buf = va_arg(ap, char *);
+        size_t len = va_arg(ap, size_t);
+        (void)dirfd;
+        ret = (long)u_readlink((const int8_t *)path, (int8_t *)buf, len);
+        if (ret < 0)
+        {
+            errno = (int)(-ret);
+            ret = -1;
+        }
+        break;
+    }
+#endif
+#ifdef SYS_mkdirat
+    case SYS_mkdirat:
+    {
+        int dirfd = va_arg(ap, int);
+        const char *path = va_arg(ap, const char *);
+        mode_t mode = (mode_t)va_arg(ap, int);
+        if (dirfd != AT_FDCWD)
+        {
+            errno = ENOTSUP;
+            ret = -1;
+            break;
+        }
+        ret = (long)mkdir(path, mode);
+        break;
+    }
+#endif
+#ifdef SYS_unlinkat
+    case SYS_unlinkat:
+    {
+        int dirfd = va_arg(ap, int);
+        const char *path = va_arg(ap, const char *);
+        int flags = va_arg(ap, int);
+        if (dirfd != AT_FDCWD)
+        {
+            errno = ENOTSUP;
+            ret = -1;
+            break;
+        }
+#ifdef AT_REMOVEDIR
+        if (flags & AT_REMOVEDIR)
+        {
+            ret = (long)rmdir(path);
+        }
+        else
+#endif
+        {
+            ret = (long)unlink(path);
+        }
+        break;
+    }
+#endif
+#ifdef SYS_renameat
+    case SYS_renameat:
+    {
+        int olddirfd = va_arg(ap, int);
+        const char *oldpath = va_arg(ap, const char *);
+        int newdirfd = va_arg(ap, int);
+        const char *newpath = va_arg(ap, const char *);
+        if (olddirfd != AT_FDCWD || newdirfd != AT_FDCWD)
+        {
+            errno = ENOTSUP;
+            ret = -1;
+            break;
+        }
+        ret = (long)rename(oldpath, newpath);
+        break;
+    }
+#endif
+#ifdef SYS_renameat2
+    case SYS_renameat2:
+    {
+        int olddirfd = va_arg(ap, int);
+        const char *oldpath = va_arg(ap, const char *);
+        int newdirfd = va_arg(ap, int);
+        const char *newpath = va_arg(ap, const char *);
+        unsigned int flags = va_arg(ap, unsigned int);
+        if (flags != 0U)
+        {
+            errno = ENOTSUP;
+            ret = -1;
+            break;
+        }
+        if (olddirfd != AT_FDCWD || newdirfd != AT_FDCWD)
+        {
+            errno = ENOTSUP;
+            ret = -1;
+            break;
+        }
+        ret = (long)rename(oldpath, newpath);
+        break;
+    }
+#endif
+#ifdef SYS_fchmodat
+    case SYS_fchmodat:
+    {
+        int dirfd = va_arg(ap, int);
+        const char *path = va_arg(ap, const char *);
+        mode_t mode = (mode_t)va_arg(ap, int);
+        int flags = va_arg(ap, int);
+        if (flags != 0 || dirfd != AT_FDCWD)
+        {
+            errno = ENOTSUP;
+            ret = -1;
+            break;
+        }
+        ret = (long)chmod(path, mode);
+        break;
+    }
+#endif
+#ifdef SYS_fchownat
+    case SYS_fchownat:
+    {
+        int dirfd = va_arg(ap, int);
+        const char *path = va_arg(ap, const char *);
+        uid_t owner = (uid_t)va_arg(ap, unsigned int);
+        gid_t group = (gid_t)va_arg(ap, unsigned int);
+        int flags = va_arg(ap, int);
+        if (flags != 0 || dirfd != AT_FDCWD)
+        {
+            errno = ENOTSUP;
+            ret = -1;
+            break;
+        }
+        ret = (long)chown(path, owner, group);
+        break;
+    }
+#endif
+#ifdef SYS_truncate
+    case SYS_truncate:
+    {
+        const char *path = va_arg(ap, const char *);
+        off_t len = va_arg(ap, off_t);
+        ret = (long)truncate(path, len);
+        break;
+    }
+#endif
+#ifdef SYS_ftruncate
+    case SYS_ftruncate:
+    {
+        int fd = va_arg(ap, int);
+        off_t len = va_arg(ap, off_t);
+        ret = (long)ftruncate(fd, len);
+        break;
+    }
+#endif
+#ifdef SYS_utimensat
+    case SYS_utimensat:
+    {
+        int dirfd = va_arg(ap, int);
+        const char *path = va_arg(ap, const char *);
+        const struct timespec *times = va_arg(ap, const struct timespec *);
+        int flags = va_arg(ap, int);
+        (void)times;
+        if (flags != 0 || dirfd != AT_FDCWD)
+        {
+            errno = ENOTSUP;
+            ret = -1;
+            break;
+        }
+        ret = (long)utime(path, 0);
+        break;
+    }
+#endif
+#ifdef SYS_sched_getaffinity
+    case SYS_sched_getaffinity:
+    {
+        int pid = va_arg(ap, int);
+        size_t cpusetsize = va_arg(ap, size_t);
+        void *mask = va_arg(ap, void *);
+        ret = (long)u_sched_getaffinity(pid, cpusetsize, mask);
+        if (ret < 0)
+        {
+            errno = (int)(-ret);
+            ret = -1;
+        }
+        break;
+    }
+#endif
+#ifdef SYS_prlimit64
+    case SYS_prlimit64:
+    {
+        int pid = va_arg(ap, int);
+        int resource = va_arg(ap, int);
+        const struct rlimit *new_limit = va_arg(ap, const struct rlimit *);
+        struct rlimit *old_limit = va_arg(ap, struct rlimit *);
+        ret = (long)u_prlimit64(pid, resource, (const struct stupidos_rlimit *)new_limit,
+                                (struct stupidos_rlimit *)old_limit);
+        if (ret < 0)
+        {
+            errno = (int)(-ret);
+            ret = -1;
+        }
+        break;
+    }
+#endif
 #ifdef SYS_gettid
     case SYS_gettid:
         ret = (long)u_gettid();
+        if (ret < 0)
+        {
+            errno = (int)(-ret);
+            ret = -1;
+        }
         break;
 #endif
 #ifdef SYS_getrandom
@@ -3165,9 +4505,93 @@ long syscall(long number, ...)
 #endif
 #ifdef SYS_getdents64
     case SYS_getdents64:
-        errno = ENOSYS;
-        ret = -1;
+    {
+        unsigned int fd = va_arg(ap, unsigned int);
+        struct dirent64 *dirp = va_arg(ap, struct dirent64 *);
+        unsigned int count = va_arg(ap, unsigned int);
+        ret = (long)u_getdents64((int)fd, (struct stupidos_linux_dirent64 *)dirp, count);
+        if (ret < 0)
+        {
+            errno = (int)(-ret);
+            ret = -1;
+        }
         break;
+    }
+#endif
+#ifdef SYS_faccessat
+    case SYS_faccessat:
+    {
+        int dirfd = va_arg(ap, int);
+        const char *path = va_arg(ap, const char *);
+        int mode = va_arg(ap, int);
+        int flags = va_arg(ap, int);
+        ret = (long)faccessat(dirfd, path, mode, flags);
+        break;
+    }
+#endif
+#ifdef SYS_faccessat2
+    case SYS_faccessat2:
+    {
+        int dirfd = va_arg(ap, int);
+        const char *path = va_arg(ap, const char *);
+        int mode = va_arg(ap, int);
+        int flags = va_arg(ap, int);
+        ret = (long)faccessat(dirfd, path, mode, flags);
+        break;
+    }
+#endif
+#ifdef SYS_dup3
+    case SYS_dup3:
+    {
+        int oldfd = va_arg(ap, int);
+        int newfd = va_arg(ap, int);
+        int flags = va_arg(ap, int);
+        ret = (long)dup3(oldfd, newfd, flags);
+        break;
+    }
+#endif
+#ifdef SYS_pipe2
+    case SYS_pipe2:
+    {
+        int *fds = va_arg(ap, int *);
+        int flags = va_arg(ap, int);
+        ret = (long)pipe2(fds, flags);
+        break;
+    }
+#endif
+#ifdef SYS_wait4
+    case SYS_wait4:
+    {
+        pid_t pid = (pid_t)va_arg(ap, int);
+        int *status = va_arg(ap, int *);
+        int options = va_arg(ap, int);
+        void *rusage = va_arg(ap, void *);
+        (void)rusage;
+        ret = (long)waitpid(pid, status, options);
+        break;
+    }
+#endif
+#ifdef SYS_execve
+    case SYS_execve:
+    {
+        const char *path = va_arg(ap, const char *);
+        char *const *argv = va_arg(ap, char *const *);
+        char *const *envp = va_arg(ap, char *const *);
+        ret = (long)execve(path, (char *const *)argv, (char *const *)envp);
+        break;
+    }
+#endif
+#ifdef SYS_execveat
+    case SYS_execveat:
+    {
+        int dirfd = va_arg(ap, int);
+        const char *path = va_arg(ap, const char *);
+        char *const *argv = va_arg(ap, char *const *);
+        char *const *envp = va_arg(ap, char *const *);
+        int flags = va_arg(ap, int);
+        ret = (long)execveat(dirfd, path, (char *const *)argv, (char *const *)envp, flags);
+        break;
+    }
 #endif
     default:
         errno = ENOSYS;
@@ -3266,7 +4690,7 @@ int pthread_sigmask(int how, const sigset_t *set, sigset_t *oldset)
     ret = sigprocmask(how, set, oldset);
     if (ret < 0)
     {
-        return -ret;
+        return errno;
     }
     return 0;
 }
@@ -3287,5 +4711,293 @@ int sigwait(const sigset_t *set, int *sig)
 
 int futex(uint32_t *uaddr, int op, uint32_t val, const struct timespec *timeout, uint32_t *uaddr2, uint32_t val3)
 {
-    return (int)u_futex(uaddr, op, val, timeout, uaddr2, val3);
+    return u_sysret_int((int64_t)u_futex(uaddr, op, val, timeout, uaddr2, val3));
+}
+
+char *strcat(char *dest, const char *src)
+{
+    size_t dlen;
+    size_t i;
+
+    if (!dest || !src)
+    {
+        return dest;
+    }
+
+    dlen = strlen(dest);
+    for (i = 0; src[i] != '\0'; i++)
+    {
+        dest[dlen + i] = src[i];
+    }
+    dest[dlen + i] = '\0';
+    return dest;
+}
+
+char *strpbrk(const char *s, const char *accept)
+{
+    size_t i;
+    size_t j;
+
+    if (!s || !accept)
+    {
+        return 0;
+    }
+
+    for (i = 0; s[i] != '\0'; i++)
+    {
+        for (j = 0; accept[j] != '\0'; j++)
+        {
+            if (s[i] == accept[j])
+            {
+                return (char *)(s + i);
+            }
+        }
+    }
+
+    return 0;
+}
+
+int remove(const char *pathname)
+{
+    if (!pathname)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    return unlink(pathname);
+}
+
+/*
+ * 简化 realpath：先检查路径可访问，再返回原路径副本。
+ * 对当前系统移植阶段（无符号链接、路径层级较浅）足够稳定，
+ * 后续若引入 symlink/.. 规范化，可在这里升级为完整实现。
+ */
+char *realpath(const char *path, char *resolved_path)
+{
+    size_t n;
+    char *out;
+
+    if (!path)
+    {
+        errno = EINVAL;
+        return 0;
+    }
+
+    if (access(path, F_OK) != 0)
+    {
+        return 0;
+    }
+
+    n = strnlen(path, STUPIDOS_PATH_MAX * 4U);
+    if (!resolved_path)
+    {
+        out = (char *)malloc(n + 1U);
+        if (!out)
+        {
+            errno = ENOMEM;
+            return 0;
+        }
+    }
+    else
+    {
+        out = resolved_path;
+    }
+
+    memcpy(out, path, n);
+    out[n] = '\0';
+    return out;
+}
+
+static int u_is_space_char(int ch)
+{
+    return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' || ch == '\v';
+}
+
+/*
+ * 最小浮点解析器：
+ * 支持 [+/-]digits[.digits][e[+/-]digits]，足够覆盖 tinycc 自己的词法需求。
+ */
+static double u_parse_fp(const char *nptr, char **endptr)
+{
+    const char *p;
+    int sign;
+    double val;
+    int has_digit;
+    int exp_sign;
+    int exp10;
+
+    p = nptr;
+    while (*p && u_is_space_char((unsigned char)*p))
+    {
+        p++;
+    }
+
+    sign = 1;
+    if (*p == '+')
+    {
+        p++;
+    }
+    else if (*p == '-')
+    {
+        sign = -1;
+        p++;
+    }
+
+    val = 0.0;
+    has_digit = 0;
+    while (*p >= '0' && *p <= '9')
+    {
+        val = val * 10.0 + (double)(*p - '0');
+        p++;
+        has_digit = 1;
+    }
+
+    if (*p == '.')
+    {
+        double place = 0.1;
+        p++;
+        while (*p >= '0' && *p <= '9')
+        {
+            val += (double)(*p - '0') * place;
+            place *= 0.1;
+            p++;
+            has_digit = 1;
+        }
+    }
+
+    if (!has_digit)
+    {
+        if (endptr)
+        {
+            *endptr = (char *)nptr;
+        }
+        return 0.0;
+    }
+
+    if (*p == 'e' || *p == 'E')
+    {
+        const char *ep = p + 1;
+        exp_sign = 1;
+        exp10 = 0;
+
+        if (*ep == '+')
+        {
+            ep++;
+        }
+        else if (*ep == '-')
+        {
+            exp_sign = -1;
+            ep++;
+        }
+
+        if (*ep >= '0' && *ep <= '9')
+        {
+            while (*ep >= '0' && *ep <= '9')
+            {
+                exp10 = exp10 * 10 + (*ep - '0');
+                ep++;
+            }
+            p = ep;
+        }
+
+        if (exp10 > 0)
+        {
+            while (exp10--)
+            {
+                if (exp_sign > 0)
+                {
+                    val *= 10.0;
+                }
+                else
+                {
+                    val *= 0.1;
+                }
+            }
+        }
+    }
+
+    if (endptr)
+    {
+        *endptr = (char *)p;
+    }
+
+    if (sign < 0)
+    {
+        val = -val;
+    }
+    return val;
+}
+
+double strtod(const char *nptr, char **endptr) { return u_parse_fp(nptr, endptr); }
+float strtof(const char *nptr, char **endptr) { return (float)u_parse_fp(nptr, endptr); }
+long double strtold(const char *nptr, char **endptr) { return (long double)u_parse_fp(nptr, endptr); }
+
+struct tm *localtime(const time_t *timep)
+{
+    static struct tm tm_buf;
+    return localtime_r(timep, &tm_buf);
+}
+
+FILE *freopen(const char *pathname, const char *mode, FILE *stream)
+{
+    (void)pathname;
+    (void)mode;
+    (void)stream;
+    errno = ENOSYS;
+    return 0;
+}
+
+void *__clear_cache(void *begin, void *end)
+{
+    (void)begin;
+    (void)end;
+    return 0;
+}
+
+static char u_dlerror_buf[64];
+
+void *dlopen(const char *file, int mode)
+{
+    (void)file;
+    (void)mode;
+    strcpy(u_dlerror_buf, "dlopen: not supported");
+    errno = ENOSYS;
+    return 0;
+}
+
+void *dlsym(void *handle, const char *symbol)
+{
+    (void)handle;
+    (void)symbol;
+    strcpy(u_dlerror_buf, "dlsym: not supported");
+    errno = ENOSYS;
+    return 0;
+}
+
+int dlclose(void *handle)
+{
+    (void)handle;
+    errno = ENOSYS;
+    return -1;
+}
+
+char *dlerror(void)
+{
+    if (u_dlerror_buf[0] == '\0')
+    {
+        return 0;
+    }
+    return u_dlerror_buf;
+}
+
+int _setjmp(jmp_buf env)
+{
+    return __builtin_setjmp(env);
+}
+
+void longjmp(jmp_buf env, int val)
+{
+    (void)val;
+    __builtin_longjmp(env, 1);
 }

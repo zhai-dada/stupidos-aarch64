@@ -2,8 +2,12 @@ ENTRY(_start)
 
 SECTIONS
 {
-    /* Starts at LOADER_ADDR. */
-    . = 0x40000000;
+    /*
+     * QEMU `-kernel` 在 virt 机型下默认把 Image 放到 0x40080000。
+     * 这里必须与真实装载地址一致，否则函数指针/异常向量等“绝对地址常量”
+     * 会和运行时实际地址错开 0x80000，最终表现为随机跳转和指令异常。
+     */
+    . = 0x40080000;
     __kernel_start = .;
     __text_start = .;
     .text :

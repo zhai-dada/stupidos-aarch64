@@ -57,6 +57,14 @@
 #define SYS_SCHED_GETAFFINITY 54
 #define SYS_SYSINFO    55
 #define SYS_PRLIMIT64   56
+#define SYS_GETDENTS64 57
+#define SYS_MKDIR      58
+#define SYS_RMDIR      59
+#define SYS_UNLINK     60
+#define SYS_RENAME     61
+#define SYS_TRUNCATE   62
+#define SYS_FTRUNCATE  63
+#define SYS_UTIMENSAT  64
 
 .section .text
 
@@ -401,6 +409,54 @@ FUNC_GLOBAL(u_prlimit64)
 	svc #0
 	ret
 FUNC_END(u_prlimit64)
+
+FUNC_GLOBAL(u_getdents64)
+	mov x8, #SYS_GETDENTS64
+	svc #0
+	ret
+FUNC_END(u_getdents64)
+
+FUNC_GLOBAL(u_mkdir)
+	mov x8, #SYS_MKDIR
+	svc #0
+	ret
+FUNC_END(u_mkdir)
+
+FUNC_GLOBAL(u_rmdir)
+	mov x8, #SYS_RMDIR
+	svc #0
+	ret
+FUNC_END(u_rmdir)
+
+FUNC_GLOBAL(u_unlink)
+	mov x8, #SYS_UNLINK
+	svc #0
+	ret
+FUNC_END(u_unlink)
+
+FUNC_GLOBAL(u_rename)
+	mov x8, #SYS_RENAME
+	svc #0
+	ret
+FUNC_END(u_rename)
+
+FUNC_GLOBAL(u_truncate)
+	mov x8, #SYS_TRUNCATE
+	svc #0
+	ret
+FUNC_END(u_truncate)
+
+FUNC_GLOBAL(u_ftruncate)
+	mov x8, #SYS_FTRUNCATE
+	svc #0
+	ret
+FUNC_END(u_ftruncate)
+
+FUNC_GLOBAL(u_utimensat)
+	mov x8, #SYS_UTIMENSAT
+	svc #0
+	ret
+FUNC_END(u_utimensat)
 
 FUNC_GLOBAL(u_exit)
 	mov x8, #SYS_EXIT

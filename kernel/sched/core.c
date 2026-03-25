@@ -195,6 +195,26 @@ struct task_struct *task_by_pid(int32_t pid)
     return 0;
 }
 
+struct task_struct *task_slot_get(uint32_t index)
+{
+    if (index >= CONFIG_MAX_TASKS)
+    {
+        return 0;
+    }
+
+    if (sched_state.tasks[index].state == TASK_UNUSED)
+    {
+        return 0;
+    }
+
+    return &sched_state.tasks[index];
+}
+
+uint32_t task_slot_count(void)
+{
+    return CONFIG_MAX_TASKS;
+}
+
 static bool task_is_runnable_on_cpu(const struct task_struct *task, uint32_t cpu)
 {
     if (task->cpu != cpu)
@@ -247,6 +267,14 @@ static bool task_has_valid_context(const struct task_struct *task)
     if (task->has_exec_image &&
         lr >= task->exec_base &&
         lr < task->exec_end)
+    {
+        return true;
+    }
+
+    if (task->has_exec_image &&
+        task->exec_alias_end > task->exec_alias_base &&
+        lr >= task->exec_alias_base &&
+        lr < task->exec_alias_end)
     {
         return true;
     }

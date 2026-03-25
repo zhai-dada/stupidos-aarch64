@@ -8,7 +8,12 @@ PHDRS
 
 SECTIONS
 {
-    . = 0x0;
+    /*
+     * 把 userspace ELF 的链接基址抬到非零页，避免 e_entry=0：
+     * - exec_task_main 会把空入口当成无效镜像直接退出
+     * - 低地址 alias 运行时也尽量避免把 NULL 页当可执行入口
+     */
+    . = 0x10000;
 
     .text :
     {

@@ -5,7 +5,12 @@
 #include "smp.h"
 
 #define TASK_COMM_LEN       16
-#define TASK_STACK_SIZE     16384
+/*
+ * 当前用户态 ELF 仍与内核态共用同一 task 栈（尚未切换到独立 EL0 栈）。
+ * VFS/exec/syscall 的调用链在 O0 下栈帧较深，16KB 容易在“成功路径”触发踩栈。
+ * 先把每任务栈提升到 64KB，优先保证稳定性，后续再演进成独立用户栈。
+ */
+#define TASK_STACK_SIZE     65536
 #define CONFIG_MAX_TASKS    16
 #define SCHED_LATENCY_TICKS 4
 #define TASK_CWD_LEN        256
@@ -64,6 +69,8 @@ struct task_struct
     void *cleanup_arg;
     uint64_t exec_base;
     uint64_t exec_end;
+    uint64_t exec_alias_base;
+    uint64_t exec_alias_end;
     bool has_exec_image;
     uint32_t heap_order;
     uint64_t heap_base;
@@ -109,6 +116,8 @@ void sched_show_tasks(void);
 void task_exit(void) __attribute__((noreturn));
 struct task_struct *task_current(void);
 struct task_struct *task_by_pid(int32_t pid);
+struct task_struct *task_slot_get(uint32_t index);
+uint32_t task_slot_count(void);
 void task_wake(struct task_struct *task);
 void task_set_cleanup(task_cleanup_t cleanup, void *arg);
 const int8_t *task_cwd(void);

@@ -161,8 +161,12 @@ void early_uart_init(void)
     /* Disable everything */
     *(uint32_t *)(PL011_UART0_BASE + UART_CR) = 0;
 
-    /* Configure TX to 8 bits, 1 stop bit, no parity, fifo disabled. */
-    *(uint32_t *)(PL011_UART0_BASE + UART_LCR_H) = UART_LCRH_WLEN_8;
+    /*
+     * 开启 FIFO（中文）：
+     * 之前 FEN=0 时，RX 基本只有 1 字节深度，输入稍快就容易丢字符；
+     * shell 看起来就像“按键没反应/只进了前几个字母”。
+     */
+    *(uint32_t *)(PL011_UART0_BASE + UART_LCR_H) = UART_LCRH_WLEN_8 | UART_LCRH_FEN;
 
     /* 真正的使能位在 CR 里，不是在 LCR_H 里。 */
     *(uint32_t *)(PL011_UART0_BASE + UART_CR) = UART_CR_UARTEN | UART_CR_TXE | UART_CR_RXE;
@@ -183,8 +187,11 @@ void uart_init(void)
     /* Disable everything */
     *(uint32_t *)(PL011_UART0_BASE + UART_CR) = 0;
 
-    /* Configure TX to 8 bits, 1 stop bit, no parity, fifo disabled. */
-    *(uint32_t *)(PL011_UART0_BASE + UART_LCR_H) = UART_LCRH_WLEN_8;
+    /*
+     * 同 early_uart_init，正式驱动阶段也保持 FIFO 打开，
+     * 把突发输入的抗抖能力做起来，减少串口字符丢失。
+     */
+    *(uint32_t *)(PL011_UART0_BASE + UART_LCR_H) = UART_LCRH_WLEN_8 | UART_LCRH_FEN;
 
     /* 清掉残留中断，避免启动后立刻吃到旧状态。 */
     *(uint32_t *)(PL011_UART0_BASE + UART_ICR) = 0x7ff;
@@ -253,8 +260,10 @@ int32_t uart_printf(int8_t* front, int8_t* back, const int8_t* fmt, ...)
 void uart_irq_handle(void)
 {
     uint32_t fr;
-    uint8_t ch;
+    uint8_t rx_batch[64];
+    size_t rx_count;
 
+    rx_count = 0;
     while (1)
     {
         fr = get32(PL011_UART0_BASE + UART_FR);
@@ -263,8 +272,22 @@ void uart_irq_handle(void)
             break;
         }
 
-        ch = (uint8_t)get32(PL011_UART0_BASE + UART_DR);
-        tty_feed_char(ch);
+        rx_batch[rx_count++] = (uint8_t)get32(PL011_UART0_BASE + UART_DR);
+        if (rx_count == sizeof(rx_batch))
+        {
+            /*
+             * 批量喂给 tty（中文）：
+             * 旧路径每个字节都要走一次关中断/加锁/回显，
+             * 在串口突发输入时会明显拉高中断处理时延。
+             */
+            tty_feed_bytes(rx_batch, rx_count);
+            rx_count = 0;
+        }
+    }
+
+    if (rx_count)
+    {
+        tty_feed_bytes(rx_batch, rx_count);
     }
 
     /* 清掉本次收包相关中断，避免 UART 继续挂着未处理状态。 */

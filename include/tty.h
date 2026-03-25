@@ -22,6 +22,7 @@ void tty_write(const int8_t *str);
 void tty_write_bytes(const void *buf, size_t len);
 int32_t tty_try_getc(void);
 int32_t tty_getc(void);
+void tty_feed_bytes(const uint8_t *buf, size_t len);
 void tty_feed_char(uint8_t ch);
 void tty_report_mouse_delta(int32_t dx, int32_t dy, uint32_t buttons);
 void tty_report_mouse_abs(int32_t x, int32_t y, uint32_t buttons);

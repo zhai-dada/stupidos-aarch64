@@ -124,7 +124,11 @@ void do_sync(void *stack, uint32_t esr)
 		 * 这里如果再手动 +4，就会跳过 userspace syscall stub 里的 `ret`，
 		 * 直接落到后续函数/数据区，表现为 shell 一执行 syscall 就跑飞。
 		 */
-        sched_maybe_resched();
+        /*
+         * SVC 返回路径暂不直接触发调度切换。
+         * 让抢占点统一留在 IRQ 退出与显式 yield/sleep，可避免在异常栈帧上切换带来的返回现场污染。
+         */
+        /* sched_maybe_resched(); */
 		return;
 	}
 
@@ -151,8 +155,9 @@ void do_sync(void *stack, uint32_t esr)
          * 用户态 ELF 任务异常时，优先回收当前任务。
          * 由上层 supervisor 负责重启 shell，避免整个系统卡死在异常循环里。
          */
-        printk("[irq\ttrace]: exec task fault pid=%d comm=%s ec=0x%x far_el1=%#lx\n",
-               curr->pid, curr->comm, ec, read_sysreg(far_el1));
+	        printk("[irq\ttrace]: exec task fault pid=%d comm=%s ec=0x%x far_el1=%#lx\n",
+	               curr->pid, curr->comm, ec, read_sysreg(far_el1));
+	        printk("[irq\ttrace]: esr=%#lx spsr=%#lx\n", (uint64_t)esr, regs->s_pstate);
         printk("[irq\ttrace]: fault-task state pid=%d exec=%u pc=%#lx lowpc=%u linearmap=%u\n",
                curr->pid, curr->has_exec_image ? 1 : 0, regs->s_pc,
                low_user_pc ? 1U : 0U, likely_user_pc ? 1U : 0U);

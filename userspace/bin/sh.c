@@ -2,7 +2,7 @@
 #include "errno.h"
 
 #define SH_LINE_MAX 256
-#define SH_MAX_ARGS  8
+#define SH_MAX_ARGS  16
 #define SH_READ_CHUNK 128
 #define SH_CWD_MAX STUPIDOS_PATH_MAX
 #define SH_PROMPT_MAX (SH_CWD_MAX + 32)
@@ -279,74 +279,101 @@ static int sh_read_line(int8_t *line, size_t max_len)
                     if (ch == '[')
                     {
                         esc_state = 2;
+                        continue;
                     }
-                    else
+
+                    /*
+                     * 关键修复（中文）：
+                     * 之前非 CSI 的 ESC 序列会无条件吞掉“下一个字节”，
+                     * 导致回车偶发被吃掉，表象就是“按 Enter 没反应”。
+                     *
+                     * 现在改成：
+                     * - 可打印字符按“非标准转义片段”丢弃；
+                     * - 控制字符（如 \\r/\\n/退格）继续走正常处理流程。
+                     */
+                    esc_state = 0;
+                    if (ch >= 0x20 && ch <= 0x7e)
                     {
-                        esc_state = 0;
+                        continue;
                     }
-                    continue;
                 }
 
                 if (esc_state == 2)
                 {
-                    esc_state = 0;
-                    if (ch == 'A' || ch == 'B')
+                    /*
+                     * CSI 参数字节（0x20..0x3f）继续消费，直到终止字节。
+                     */
+                    if (ch >= 0x20 && ch <= 0x3f)
                     {
-                        uint32_t history_count;
-                        const int8_t *src;
+                        continue;
+                    }
 
-                        history_count = sh_history_count;
-                        if (history_count == 0)
+                    if (ch >= 0x40 && ch <= 0x7e)
+                    {
+                        esc_state = 0;
+                        if (ch == 'A' || ch == 'B')
                         {
-                            continue;
-                        }
+                            uint32_t history_count;
+                            const int8_t *src;
 
-                        if (!esc_seq_active)
-                        {
-                            u_memset(saved_line, 0, sizeof(saved_line));
-                            u_memcpy(saved_line, line, len);
-                            saved_len = len;
-                            esc_seq_active = true;
-                            history_pos = (int32_t)history_count - 1;
-                            history_oldest = sh_history_oldest_index();
-                        }
-
-                        if (ch == 'A')
-                        {
-                            if (history_pos > history_oldest)
+                            history_count = sh_history_count;
+                            if (history_count == 0)
                             {
-                                history_pos--;
+                                continue;
                             }
-                        }
-                        else if (ch == 'B')
-                        {
-                            if (history_pos < (int32_t)history_count - 1)
+
+                            if (!esc_seq_active)
                             {
-                                history_pos++;
+                                u_memset(saved_line, 0, sizeof(saved_line));
+                                u_memcpy(saved_line, line, len);
+                                saved_len = len;
+                                esc_seq_active = true;
+                                history_pos = (int32_t)history_count - 1;
+                                history_oldest = sh_history_oldest_index();
+                            }
+
+                            if (ch == 'A')
+                            {
+                                if (history_pos > history_oldest)
+                                {
+                                    history_pos--;
+                                }
+                            }
+                            else if (ch == 'B')
+                            {
+                                if (history_pos < (int32_t)history_count - 1)
+                                {
+                                    history_pos++;
+                                }
+                                else
+                                {
+                                    history_pos = -1;
+                                }
+                            }
+
+                            u_memset(line, 0, max_len);
+                            if (history_pos >= 0)
+                            {
+                                src = sh_history[(uint32_t)history_pos % SH_HISTORY_MAX];
+                                u_memcpy(line, src, u_strnlen(src, max_len - 1));
+                                len = u_strnlen(src, max_len - 1);
                             }
                             else
                             {
-                                history_pos = -1;
+                                u_memcpy(line, saved_line, saved_len);
+                                len = saved_len;
                             }
-                        }
 
-                        u_memset(line, 0, max_len);
-                        if (history_pos >= 0)
-                        {
-                            src = sh_history[(uint32_t)history_pos % SH_HISTORY_MAX];
-                            u_memcpy(line, src, u_strnlen(src, max_len - 1));
-                            len = u_strnlen(src, max_len - 1);
+                            line[len] = '\0';
+                            sh_redraw_line(line);
                         }
-                        else
-                        {
-                            u_memcpy(line, saved_line, saved_len);
-                            len = saved_len;
-                        }
-
-                        line[len] = '\0';
-                        sh_redraw_line(line);
+                        continue;
                     }
-                    continue;
+
+                    /*
+                     * 异常序列：尽快退出 ESC 状态，避免后续普通输入被长期吞掉。
+                     */
+                    esc_state = 0;
                 }
             }
 
@@ -402,7 +429,7 @@ static void sh_help(void)
     sh_puts((const int8_t *)"  history         - show recent commands\r\n");
     sh_puts((const int8_t *)"  !!              - repeat last command\r\n");
     sh_puts((const int8_t *)"  clear           - clear the terminal screen\r\n");
-    sh_puts((const int8_t *)"  echo [args...]  - print arguments\r\n");
+    sh_puts((const int8_t *)"  echo [args...]  - execute /bin/echo\r\n");
     sh_puts((const int8_t *)"  stat [path]     - show file metadata\r\n");
     sh_puts((const int8_t *)"  uname           - show system identity\r\n");
     sh_puts((const int8_t *)"  time            - show current time\r\n");
@@ -569,38 +596,6 @@ static void sh_clear_screen(void)
      * shell 下一轮会重新打印 prompt，所以这里只做最小的终端清理。
      */
     (void)u_write(STUPIDOS_STDOUT_FILENO, (const int8_t *)"\x1b[2J\x1b[H", 7);
-}
-
-static void sh_echo(int argc, int8_t *argv[])
-{
-    int i;
-    bool newline;
-
-    newline = true;
-    i = 1;
-    if (argc > 1 && u_strcmp(argv[1], (const int8_t *)"-n") == 0)
-    {
-        newline = false;
-        i = 2;
-    }
-
-    for (; i < argc; i++)
-    {
-        if (argv[i])
-        {
-            sh_puts(argv[i]);
-        }
-
-        if (i + 1 < argc)
-        {
-            sh_puts((const int8_t *)" ");
-        }
-    }
-
-    if (newline)
-    {
-        sh_puts((const int8_t *)"\r\n");
-    }
 }
 
 static void sh_stat_cmd(const int8_t *path)
@@ -824,6 +819,16 @@ int main(void)
     (void)u_write(STUPIDOS_STDOUT_FILENO,
                   (const int8_t *)"\r\nstupidos userspace shell\r\n",
                   sizeof("\r\nstupidos userspace shell\r\n") - 1);
+
+    /*
+     * 默认工作目录切到可写的 /tmp（中文）：
+     * 当前根文件系统仍以只读能力为主，用户在 "/" 下直接 mkdir 会看到 EROFS。
+     * 这里先把默认 cwd 放到 /tmp，保证开箱即用的交互体验更接近 Linux 习惯。
+     */
+    if (u_chdir((const int8_t *)"/tmp") < 0)
+    {
+        (void)u_chdir((const int8_t *)"/");
+    }
     sh_refresh_cwd();
 
     while (1)
@@ -938,13 +943,6 @@ int main(void)
         if (u_strcmp(sh_cmd_buf, (const int8_t *)"clear") == 0)
         {
             sh_clear_screen();
-            sh_history_add(sh_line_buf);
-            continue;
-        }
-
-        if (u_strcmp(sh_cmd_buf, (const int8_t *)"echo") == 0)
-        {
-            sh_echo(argc, sh_argv_buf);
             sh_history_add(sh_line_buf);
             continue;
         }

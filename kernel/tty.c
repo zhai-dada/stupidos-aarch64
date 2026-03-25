@@ -11,6 +11,7 @@
  * UART IRQ 和 virtio-input IRQ 都会往这里塞字节，shell 只负责取字节。
  */
 #define TTY_RX_BUF_SIZE 512
+#define TTY_ACTIVE_POLL_SPINS 4096U
 
 static spinlock_t tty_lock = SPINLOCK_INIT;
 static uint8_t tty_rx_buf[TTY_RX_BUF_SIZE];
@@ -75,12 +76,28 @@ static size_t tty_ingest_char_locked(uint8_t ch, uint8_t *echo_buf)
      */
     if (tty_escape_state == 1)
     {
-        tty_escape_state = (stored_ch == '[') ? 2 : 0;
-        return 0;
+        if (stored_ch == '[')
+        {
+            tty_escape_state = 2;
+            return 0;
+        }
+
+        /*
+         * 不是标准 CSI 前缀时，不要吞掉下一个普通字符回显。
+         * 之前这里直接 return 0，会造成“字符进了命令缓冲但终端没显示”。
+         */
+        tty_escape_state = 0;
     }
     if (tty_escape_state == 2)
     {
-        tty_escape_state = 0;
+        /*
+         * CSI 序列以 0x40..0x7e 结尾，期间所有字节都不回显。
+         * 这样方向键/功能键不会在终端上留下 "[A"/"~" 等碎片。
+         */
+        if (stored_ch >= 0x40 && stored_ch <= 0x7e)
+        {
+            tty_escape_state = 0;
+        }
         return 0;
     }
     if (stored_ch == 0x1b)
@@ -189,17 +206,21 @@ void tty_write_bytes(const void *buf, size_t len)
 int32_t tty_try_getc(void)
 {
     uint8_t echo_buf[3];
+    uint8_t echo_accum[TTY_RX_BUF_SIZE];
     uint64_t daif;
     int32_t ch;
+    int32_t raw;
     size_t echo_len;
+    size_t echo_accum_len;
+    bool have_polled_input;
 
     daif = read_daif();
     disable_irq();
     spin_lock(&tty_lock);
     ch = tty_rx_pop();
-    spin_unlock(&tty_lock);
     if (ch >= 0)
     {
+        spin_unlock(&tty_lock);
         write_daif(daif);
         return ch;
     }
@@ -208,37 +229,92 @@ int32_t tty_try_getc(void)
      * 终端缓冲区里没有字符时，再顺手查一把 PL011 FIFO。
      * 这样串口输入和 virtio-input 输入都能走同一条 tty 入口。
      */
-    ch = uart_try_getc();
-    if (ch >= 0)
+    echo_accum_len = 0;
+    have_polled_input = false;
+    while (1)
     {
-        spin_lock(&tty_lock);
-        echo_len = tty_ingest_char_locked((uint8_t)ch, echo_buf);
-        ch = tty_rx_pop();
-        spin_unlock(&tty_lock);
-        if (echo_len)
+        raw = uart_try_getc();
+        if (raw < 0)
         {
-            tty_write_bytes(echo_buf, echo_len);
+            break;
         }
+
+        have_polled_input = true;
+        echo_len = tty_ingest_char_locked((uint8_t)raw, echo_buf);
+        if (echo_len && echo_accum_len + echo_len <= sizeof(echo_accum))
+        {
+            for (size_t i = 0; i < echo_len; i++)
+            {
+                echo_accum[echo_accum_len++] = echo_buf[i];
+            }
+        }
+    }
+
+    if (have_polled_input)
+    {
+        ch = tty_rx_pop();
+    }
+    spin_unlock(&tty_lock);
+    write_daif(daif);
+
+    if (echo_accum_len)
+    {
+        tty_write_bytes(echo_accum, echo_accum_len);
+    }
+    if (have_polled_input)
+    {
         sev();
     }
-    write_daif(daif);
+
     return ch;
 }
 
-void tty_feed_char(uint8_t ch)
+void tty_feed_bytes(const uint8_t *buf, size_t len)
 {
     uint64_t daif;
     uint8_t echo_buf[3];
+    uint8_t echo_accum[TTY_RX_BUF_SIZE];
     size_t echo_len;
+    size_t echo_accum_len;
+    size_t i;
+
+    if (!buf || !len)
+    {
+        return;
+    }
 
     daif = read_daif();
     disable_irq();
     spin_lock(&tty_lock);
-    echo_len = tty_ingest_char_locked(ch, echo_buf);
-    spin_unlock(&tty_lock);
-    if (echo_len)
+    echo_accum_len = 0;
+    for (i = 0; i < len; i++)
     {
-        tty_write_bytes(echo_buf, echo_len);
+        echo_len = tty_ingest_char_locked(buf[i], echo_buf);
+        if (!echo_len)
+        {
+            continue;
+        }
+
+        if (echo_accum_len + echo_len > sizeof(echo_accum))
+        {
+            break;
+        }
+
+        echo_accum[echo_accum_len++] = echo_buf[0];
+        if (echo_len > 1)
+        {
+            echo_accum[echo_accum_len++] = echo_buf[1];
+            if (echo_len > 2)
+            {
+                echo_accum[echo_accum_len++] = echo_buf[2];
+            }
+        }
+    }
+    spin_unlock(&tty_lock);
+    write_daif(daif);
+    if (echo_accum_len)
+    {
+        tty_write_bytes(echo_accum, echo_accum_len);
     }
 
     /*
@@ -246,12 +322,18 @@ void tty_feed_char(uint8_t ch)
      * 这样 sys_read()/tty_getc() 里用 wfe 时，不会卡到下一次 timer tick。
      */
     sev();
-    write_daif(daif);
+}
+
+void tty_feed_char(uint8_t ch)
+{
+    tty_feed_bytes(&ch, 1);
 }
 
 int32_t tty_getc(void)
 {
     int32_t ch;
+    uint32_t spins;
+    uint64_t wait_daif;
 
     while (1)
     {
@@ -266,12 +348,29 @@ int32_t tty_getc(void)
         }
 
         /*
+         * 混合等待策略：
+         * - 先做一小段主动轮询，覆盖“UART IRQ 临时异常但 FIFO 有字节”的情况；
+         * - 再退回 wfe，避免彻底忙等。
+         * 这样交互体验会更稳定，不会出现按键偶发卡顿到下一个时钟节拍才醒。
+         */
+        for (spins = 0; spins < TTY_ACTIVE_POLL_SPINS; spins++)
+        {
+            ch = tty_try_getc();
+            if (ch >= 0)
+            {
+                return ch;
+            }
+            nop();
+        }
+
+        /*
          * 备用 tty 读取路径也切到事件等待。
          * 输入 IRQ 在入队时会发 sev，这里用 wfe 可以更快被唤醒。
          */
+        wait_daif = read_daif();
         enable_irq();
         wfe();
-        disable_irq();
+        write_daif(wait_daif);
     }
 }
 

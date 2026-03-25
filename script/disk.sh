@@ -14,6 +14,12 @@ TMP_FAT="$(mktemp -d)"
 P1_OFFSET=$((P1_START * SECTOR_SIZE))
 PYTHON_BIN="${PYTHON_BIN:-}"
 PYTHON_LIB_DIR="${PYTHON_LIB_DIR:-}"
+TCC_SRC_DIR="${TCC_SRC_DIR:-}"
+USER_BINS_LIST="${USER_BINS_LIST:-}"
+USER_INC_DIR="${USER_INC_DIR:-}"
+USER_RUNTIME_LIB="${USER_RUNTIME_LIB:-}"
+USER_CRT0_OBJ="${USER_CRT0_OBJ:-}"
+USER_LIBGCC="${USER_LIBGCC:-}"
 
 cleanup() {
     rm -rf "$TMP_ROOT"
@@ -25,14 +31,61 @@ trap cleanup EXIT
 dd if=/dev/zero of="$DISK_IMG" bs=512M count=6 status=none
 cat fdisk.args | fdisk "$DISK_IMG" >/dev/null
 
-mkdir -p "$TMP_ROOT/etc" "$TMP_ROOT/boot" "$TMP_ROOT/bin"
+mkdir -p "$TMP_ROOT/etc" "$TMP_ROOT/boot" "$TMP_ROOT/bin" "$TMP_ROOT/usr/share/examples"
 printf "hello from ext4 root\n" > "$TMP_ROOT/hello.txt"
 printf "rewrite me via kernel vfs\n" > "$TMP_ROOT/rw-demo.txt"
 printf "nested file\n" > "$TMP_ROOT/etc/info.txt"
 printf "mount point for fat32\n" > "$TMP_ROOT/boot/README"
+cat > "$TMP_ROOT/usr/share/examples/min.c" <<'EOF'
+/*
+ * tinycc smoke test input:
+ * 只依赖 C 语法本身，避免把“编译器问题”和“libc/链接问题”混在一起。
+ */
+int add(int a, int b)
+{
+    return a + b;
+}
+EOF
+cat > "$TMP_ROOT/usr/share/examples/main0.c" <<'EOF'
+/*
+ * tinycc link smoke test input:
+ * 不依赖标准库，方便验证 tcc + 自身链接流程。
+ */
+int main(void)
+{
+    return 0;
+}
+EOF
+cat > "$TMP_ROOT/usr/share/examples/hello_stdio.c" <<'EOF'
+#include <stdio.h>
 
-if [ -n "${USER_BINS_DIR:-}" ] && [ -d "$USER_BINS_DIR" ]; then
-    find "$USER_BINS_DIR" -maxdepth 1 -type f -exec cp {} "$TMP_ROOT/bin/" \;
+int main(void)
+{
+    puts("hello from tcc+libc");
+    return 0;
+}
+EOF
+cat > "$TMP_ROOT/usr/share/examples/hello_uputs.c" <<'EOF'
+#include "stupidos_user.h"
+
+int main(void)
+{
+    u_puts((const int8_t *)"hello from tcc+u_puts\n");
+    return 0;
+}
+EOF
+
+if [ -n "$USER_BINS_LIST" ]; then
+    for bin in $USER_BINS_LIST; do
+        if [ -f "$bin" ]; then
+            cp "$bin" "$TMP_ROOT/bin/$(basename "$bin")"
+        fi
+    done
+elif [ -n "${USER_BINS_DIR:-}" ] && [ -d "$USER_BINS_DIR" ]; then
+    find "$USER_BINS_DIR" -maxdepth 1 -type f -perm -u+x -exec cp {} "$TMP_ROOT/bin/" \;
+fi
+
+if [ -d "$TMP_ROOT/bin" ]; then
     find "$TMP_ROOT/bin" -maxdepth 1 -type f -exec chmod 755 {} \;
     if [ -f "$TMP_ROOT/bin/python3" ] && [ ! -f "$TMP_ROOT/bin/python" ]; then
         cp "$TMP_ROOT/bin/python3" "$TMP_ROOT/bin/python"
@@ -68,6 +121,34 @@ if [ -n "$PYTHON_LIB_DIR" ] && [ -d "$PYTHON_LIB_DIR" ]; then
         "$TMP_ROOT/usr/local/lib/python3.10/idlelib" \
         "$TMP_ROOT/usr/local/lib/python3.10/tkinter" \
         "$TMP_ROOT/usr/local/lib/python3.10/lib2to3" 2>/dev/null || true
+fi
+
+if [ -n "$TCC_SRC_DIR" ] && [ -d "$TCC_SRC_DIR/include" ]; then
+    # 为 tinycc 提供运行时私有头文件目录，修复 guest 内 `tccdefs.h` 缺失。
+    mkdir -p "$TMP_ROOT/usr/local/lib/tcc"
+    cp -a "$TCC_SRC_DIR/include" "$TMP_ROOT/usr/local/lib/tcc/"
+fi
+
+if [ -n "$USER_INC_DIR" ] && [ -d "$USER_INC_DIR" ]; then
+    # 安装系统头文件，给后续 tcc/python/tcc 移植留统一入口。
+    mkdir -p "$TMP_ROOT/usr/include"
+    cp -a "$USER_INC_DIR"/. "$TMP_ROOT/usr/include/"
+fi
+
+if [ -n "$USER_RUNTIME_LIB" ] && [ -f "$USER_RUNTIME_LIB" ]; then
+    # 安装最小用户态运行库，支持 guest 内 tcc 直接链接出可执行 ELF。
+    mkdir -p "$TMP_ROOT/usr/lib"
+    cp "$USER_RUNTIME_LIB" "$TMP_ROOT/usr/lib/libstupidos.a"
+fi
+
+if [ -n "$USER_CRT0_OBJ" ] && [ -f "$USER_CRT0_OBJ" ]; then
+    mkdir -p "$TMP_ROOT/usr/lib"
+    cp "$USER_CRT0_OBJ" "$TMP_ROOT/usr/lib/crt0.o"
+fi
+
+if [ -n "$USER_LIBGCC" ] && [ -f "$USER_LIBGCC" ]; then
+    mkdir -p "$TMP_ROOT/usr/lib"
+    cp "$USER_LIBGCC" "$TMP_ROOT/usr/lib/libgcc.a"
 fi
 
 printf "hello from fat32 boot volume\n" > "$TMP_FAT/README.TXT"
