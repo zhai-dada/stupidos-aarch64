@@ -16,6 +16,7 @@
 #include "tty.h"
 #include "timer.h"
 #include "net/net.h"
+#include "ui.h"
 
 static uint64_t sys_monotonic_usec(void)
 {
@@ -44,6 +45,68 @@ struct futex_waiter
 
 static spinlock_t sys_futex_lock = SPINLOCK_INIT;
 static struct futex_waiter sys_futex_waiters[16];
+
+#define SYS_SOCKET_FD_BASE 64
+#define SYS_SOCKET_FD_MAX  8
+#define SYS_PIPE_FD_BASE   80
+#define SYS_PIPE_FD_MAX    16
+
+#ifndef SOL_SOCKET
+#define SOL_SOCKET 1
+#endif
+#ifndef SO_ERROR
+#define SO_ERROR 4
+#endif
+
+#ifndef KERNEL_O_RDONLY
+#define KERNEL_O_RDONLY    0
+#endif
+#ifndef KERNEL_O_WRONLY
+#define KERNEL_O_WRONLY    1
+#endif
+#ifndef KERNEL_O_NONBLOCK
+#define KERNEL_O_NONBLOCK  0x800
+#endif
+
+struct sys_socket_slot
+{
+    bool used;
+    int flags;
+    int domain;
+    int type;
+    int protocol;
+    struct net_socket sock;
+};
+
+struct sys_sockaddr_in
+{
+    uint16_t sin_family;
+    uint16_t sin_port;
+    uint32_t sin_addr;
+    uint8_t sin_zero[8];
+} __attribute__((packed));
+
+static struct sys_socket_slot sys_socket_slots[SYS_SOCKET_FD_MAX];
+
+struct sys_pipe_slot
+{
+    bool used;
+    int read_fd;
+    int write_fd;
+    bool read_open;
+    bool write_open;
+    bool read_nonblock;
+    bool write_nonblock;
+    uint32_t read_refs;
+    uint32_t write_refs;
+    size_t head;
+    size_t tail;
+    size_t used_bytes;
+    uint8_t buf[4096U];
+};
+
+static spinlock_t sys_pipe_lock = SPINLOCK_INIT;
+static struct sys_pipe_slot sys_pipe_slots[SYS_PIPE_FD_MAX];
 
 static uint32_t sys_order_for_size(uint64_t size)
 {
@@ -301,36 +364,315 @@ static int64_t sys_copy_path_from_user(int8_t *dst, size_t dst_len, const int8_t
     return -ENAMETOOLONG;
 }
 
+static bool sys_socket_fd_in_range(int64_t fd)
+{
+    return fd >= SYS_SOCKET_FD_BASE && fd < (SYS_SOCKET_FD_BASE + SYS_SOCKET_FD_MAX);
+}
+
+static struct sys_socket_slot *sys_socket_slot_from_fd(int64_t fd)
+{
+    struct sys_socket_slot *slot;
+
+    if (!sys_socket_fd_in_range(fd))
+    {
+        return 0;
+    }
+
+    slot = &sys_socket_slots[fd - SYS_SOCKET_FD_BASE];
+    if (!slot->used)
+    {
+        return 0;
+    }
+    return slot;
+}
+
+static int sys_socket_fd_alloc(struct sys_socket_slot **out_slot)
+{
+    uint32_t i;
+
+    if (!out_slot)
+    {
+        return -EINVAL;
+    }
+
+    for (i = 0; i < SYS_SOCKET_FD_MAX; i++)
+    {
+        if (!sys_socket_slots[i].used)
+        {
+            memset((int8_t *)&sys_socket_slots[i], 0, sizeof(sys_socket_slots[i]));
+            sys_socket_slots[i].used = true;
+            *out_slot = &sys_socket_slots[i];
+            return (int)(SYS_SOCKET_FD_BASE + i);
+        }
+    }
+
+    return -EMFILE;
+}
+
+static void sys_socket_slot_release(struct sys_socket_slot *slot)
+{
+    if (!slot || !slot->used)
+    {
+        return;
+    }
+
+    net_socket_close(&slot->sock);
+    memset((int8_t *)slot, 0, sizeof(*slot));
+}
+
+static bool sys_pipe_fd_in_range(int64_t fd)
+{
+    return fd >= SYS_PIPE_FD_BASE && fd < (SYS_PIPE_FD_BASE + (SYS_PIPE_FD_MAX * 2));
+}
+
+static struct sys_pipe_slot *sys_pipe_slot_from_fd(int64_t fd, bool *is_write_end)
+{
+    int64_t idx;
+    struct sys_pipe_slot *slot;
+
+    if (!sys_pipe_fd_in_range(fd))
+    {
+        return 0;
+    }
+
+    idx = (fd - SYS_PIPE_FD_BASE) / 2;
+    if (idx < 0 || idx >= SYS_PIPE_FD_MAX)
+    {
+        return 0;
+    }
+
+    slot = &sys_pipe_slots[idx];
+    if (!slot->used)
+    {
+        return 0;
+    }
+
+    if (fd == slot->read_fd)
+    {
+        if (is_write_end)
+        {
+            *is_write_end = false;
+        }
+        return slot;
+    }
+
+    if (fd == slot->write_fd)
+    {
+        if (is_write_end)
+        {
+            *is_write_end = true;
+        }
+        return slot;
+    }
+
+    return 0;
+}
+
+static void sys_pipe_slot_get(struct sys_pipe_slot *slot, bool is_write_end)
+{
+    uint64_t daif;
+
+    if (!slot || !slot->used)
+    {
+        return;
+    }
+
+    daif = read_daif();
+    disable_irq();
+    spin_lock(&sys_pipe_lock);
+    if (is_write_end)
+    {
+        slot->write_refs++;
+    }
+    else
+    {
+        slot->read_refs++;
+    }
+    spin_unlock(&sys_pipe_lock);
+    write_daif(daif);
+}
+
+static void sys_pipe_slot_put(struct sys_pipe_slot *slot, bool is_write_end)
+{
+    uint64_t daif;
+
+    if (!slot || !slot->used)
+    {
+        return;
+    }
+
+    daif = read_daif();
+    disable_irq();
+    spin_lock(&sys_pipe_lock);
+    if (is_write_end)
+    {
+        if (slot->write_refs > 0)
+        {
+            slot->write_refs--;
+        }
+        if (slot->write_refs == 0)
+        {
+            slot->write_open = false;
+        }
+    }
+    else
+    {
+        if (slot->read_refs > 0)
+        {
+            slot->read_refs--;
+        }
+        if (slot->read_refs == 0)
+        {
+            slot->read_open = false;
+        }
+    }
+
+    if (!slot->read_open && !slot->write_open &&
+        slot->read_refs == 0 && slot->write_refs == 0)
+    {
+        memset((int8_t *)slot, 0, sizeof(*slot));
+    }
+    spin_unlock(&sys_pipe_lock);
+    write_daif(daif);
+}
+
+static int32_t sys_stdio_target_fd(int64_t fd)
+{
+    struct task_struct *task;
+
+    if (fd < 0 || fd > 2)
+    {
+        return (int32_t)fd;
+    }
+
+    task = task_current();
+    if (!task)
+    {
+        return -1;
+    }
+
+    return task->stdio_fd[fd];
+}
+
+static int64_t sys_close(int64_t fd);
+static int sys_stdio_set_fd(int64_t fd, int32_t target_fd);
+
+static void sys_stdio_reset_fd(int64_t fd)
+{
+    struct task_struct *task;
+
+    if (fd < 0 || fd > 2)
+    {
+        return;
+    }
+
+    task = task_current();
+    if (!task)
+    {
+        return;
+    }
+
+    task->stdio_fd[fd] = -1;
+}
+
+static int sys_stdio_set_fd(int64_t fd, int32_t target_fd)
+{
+    struct task_struct *task;
+    int32_t old_target;
+
+    if (fd < 0 || fd > 2)
+    {
+        return -EINVAL;
+    }
+
+    task = task_current();
+    if (!task)
+    {
+        return -ESRCH;
+    }
+
+    old_target = task->stdio_fd[fd];
+    if (old_target == target_fd)
+    {
+        return 0;
+    }
+
+    if (old_target >= 3)
+    {
+        (void)sys_close(old_target);
+    }
+
+    task->stdio_fd[fd] = target_fd;
+    return 0;
+}
+
+static bool sys_fd_is_stdio_redirected(int64_t fd)
+{
+    return fd >= 0 && fd <= 2 && sys_stdio_target_fd(fd) >= 0;
+}
+
+static int sys_pipe_fd_alloc(struct sys_pipe_slot **out_slot)
+{
+    uint32_t i;
+
+    if (!out_slot)
+    {
+        return -EINVAL;
+    }
+
+    for (i = 0; i < SYS_PIPE_FD_MAX; i++)
+    {
+        if (!sys_pipe_slots[i].used)
+        {
+            memset((int8_t *)&sys_pipe_slots[i], 0, sizeof(sys_pipe_slots[i]));
+            sys_pipe_slots[i].used = true;
+            sys_pipe_slots[i].read_fd = SYS_PIPE_FD_BASE + (int)(i * 2U);
+            sys_pipe_slots[i].write_fd = sys_pipe_slots[i].read_fd + 1;
+            sys_pipe_slots[i].read_open = true;
+            sys_pipe_slots[i].write_open = true;
+            sys_pipe_slots[i].read_refs = 1;
+            sys_pipe_slots[i].write_refs = 1;
+            *out_slot = &sys_pipe_slots[i];
+            return sys_pipe_slots[i].read_fd;
+        }
+    }
+
+    return -EMFILE;
+}
+
 static int64_t sys_read(int64_t fd, int64_t buf, int64_t len)
 {
     uint8_t *bytes;
     int64_t i;
     int32_t ch;
     uint64_t wait_daif;
+    bool canonical;
+    struct sys_socket_slot *sock;
 
-    if (fd == 0)
+    if (fd >= 0 && fd <= 2)
     {
+        int32_t target_fd;
+
         if (len <= 0)
         {
             return 0;
         }
 
+        target_fd = sys_stdio_target_fd(fd);
+        if (target_fd >= 0)
+        {
+            return sys_read(target_fd, buf, len);
+        }
+
         bytes = (uint8_t *)buf;
+        canonical = tty_is_canonical_mode() != 0;
         /*
-         * stdin 这里改成“行缓冲阻塞等待”：
-         * - 字符一到就由 tty 层立刻回显
-         * - read() 只负责把整行收齐，再一次性交给用户态 shell
-         *
-         * 这样可以把“按键 -> 回显”与“读取命令行”分离开，
-         * 避免 shell 为了每个字符都做一次 syscall / 调度往返。
+         * stdin 支持最小 termios 语义：
+         * - 规范模式（ICANON）：按行返回，适合 shell；
+         * - 非规范模式：读到首字节就尽快返回，适合 vi/vim raw 输入。
          */
         for (i = 0; i < len; )
         {
-            /*
-             * 输入路径尽量只做一次快速探测。
-             * 之前这里的多次 yield 会引入可见的调度抖动，
-             * 反而让“按键 -> 回显”变慢。
-             */
             ch = tty_try_getc();
             if (ch >= 0)
             {
@@ -344,22 +686,34 @@ static int64_t sys_read(int64_t fd, int64_t buf, int64_t len)
                     return (i > 0) ? i : -EFAULT;
                 }
                 bytes[i++] = (uint8_t)ch;
-                if (ch == '\n' || ch == '\r')
+                if (canonical && (ch == '\n' || ch == '\r'))
+                {
+                    return i;
+                }
+                if (!canonical)
                 {
                     /*
-                     * 串口终端和虚拟键盘可能送回车或换行两种形式。
-                     * 这里统一把行结束条件放宽，避免用户按 Enter 后还要等下一次事件。
+                     * raw 模式下优先保证低延迟：拿到首字节后再顺手收一波现有队列，
+                     * 然后立刻返回给用户态（vi/vim 会自行驱动后续读取）。
                      */
+                    while (i < len)
+                    {
+                        ch = tty_try_getc();
+                        if (ch < 0)
+                        {
+                            break;
+                        }
+                        if (!sys_user_mem_valid((const void *)(bytes + i), 1))
+                        {
+                            return i;
+                        }
+                        bytes[i++] = (uint8_t)ch;
+                    }
                     return i;
                 }
                 continue;
             }
 
-            /*
-             * 没有新字符时进入事件等待。
-             * 这里不要在读到半行后就返回，避免把 shell 重新拖回
-             * “每个字符一次 read/syscall”的低效路径。
-             */
             wait_daif = read_daif();
             enable_irq();
             wfe();
@@ -367,6 +721,95 @@ static int64_t sys_read(int64_t fd, int64_t buf, int64_t len)
         }
 
         return i;
+    }
+
+    sock = sys_socket_slot_from_fd(fd);
+    if (sock)
+    {
+        if (!sys_user_mem_valid((const void *)buf, (size_t)len))
+        {
+            return -EFAULT;
+        }
+
+        return net_socket_read(&sock->sock, (void *)buf, (size_t)len, 0U);
+    }
+
+    {
+        bool is_write_end;
+        struct sys_pipe_slot *pipe;
+        uint8_t *dst;
+        uint64_t copied;
+        uint64_t first;
+
+        pipe = sys_pipe_slot_from_fd(fd, &is_write_end);
+        if (pipe)
+        {
+            if (is_write_end)
+            {
+                return -EBADF;
+            }
+
+            if (!sys_user_mem_valid((const void *)buf, (size_t)len))
+            {
+                return -EFAULT;
+            }
+
+            if (len <= 0)
+            {
+                return 0;
+            }
+
+            dst = (uint8_t *)buf;
+            for (;;)
+            {
+                uint64_t daif;
+
+                daif = read_daif();
+                disable_irq();
+                spin_lock(&sys_pipe_lock);
+                if (pipe->used_bytes > 0)
+                {
+                    copied = (uint64_t)len;
+                    if (copied > pipe->used_bytes)
+                    {
+                        copied = pipe->used_bytes;
+                    }
+                    first = copied;
+                    if (pipe->head + first > sizeof(pipe->buf))
+                    {
+                        first = sizeof(pipe->buf) - pipe->head;
+                    }
+                    memcpy((int8_t *)dst, (int8_t *)&pipe->buf[pipe->head], (size_t)first);
+                    if (copied > first)
+                    {
+                        memcpy((int8_t *)dst + first, (int8_t *)&pipe->buf[0], (size_t)(copied - first));
+                    }
+                    pipe->head = (pipe->head + copied) % sizeof(pipe->buf);
+                    pipe->used_bytes -= (size_t)copied;
+                    spin_unlock(&sys_pipe_lock);
+                    write_daif(daif);
+                    return (int64_t)copied;
+                }
+
+                if (!pipe->write_open)
+                {
+                    spin_unlock(&sys_pipe_lock);
+                    write_daif(daif);
+                    return 0;
+                }
+
+                if (pipe->read_nonblock)
+                {
+                    spin_unlock(&sys_pipe_lock);
+                    write_daif(daif);
+                    return -EAGAIN;
+                }
+
+                spin_unlock(&sys_pipe_lock);
+                write_daif(daif);
+                sched_yield();
+            }
+        }
     }
 
     if (fd >= 3)
@@ -385,22 +828,142 @@ static int64_t sys_read(int64_t fd, int64_t buf, int64_t len)
 static int64_t sys_write(int64_t fd, int64_t buf, int64_t len)
 {
     const uint8_t *bytes;
+    struct sys_socket_slot *sock;
 
     if (len < 0)
     {
         return -EINVAL;
     }
 
-    if (fd == 1 || fd == 2)
+    if (fd >= 0 && fd <= 2)
+    {
+        int32_t target_fd;
+
+        if (!sys_user_mem_valid((const void *)buf, (size_t)len))
+        {
+            return -EFAULT;
+        }
+
+        target_fd = sys_stdio_target_fd(fd);
+        if (target_fd >= 0)
+        {
+            return sys_write(target_fd, buf, len);
+        }
+
+        bytes = (const uint8_t *)buf;
+        tty_write_bytes(bytes, (size_t)len);
+        return len;
+    }
+
+    sock = sys_socket_slot_from_fd(fd);
+    if (sock)
     {
         if (!sys_user_mem_valid((const void *)buf, (size_t)len))
         {
             return -EFAULT;
         }
 
-        bytes = (const uint8_t *)buf;
-        tty_write_bytes(bytes, (size_t)len);
-        return len;
+        return net_socket_write(&sock->sock, (const void *)buf, (size_t)len, 0U);
+    }
+
+    {
+        bool is_write_end;
+        struct sys_pipe_slot *pipe;
+        const uint8_t *src;
+        uint64_t written;
+        uint64_t first;
+
+        pipe = sys_pipe_slot_from_fd(fd, &is_write_end);
+        if (pipe)
+        {
+            if (!is_write_end)
+            {
+                return -EBADF;
+            }
+
+            if (!sys_user_mem_valid((const void *)buf, (size_t)len))
+            {
+                return -EFAULT;
+            }
+
+            if (len <= 0)
+            {
+                return 0;
+            }
+
+            if (!pipe->read_open)
+            {
+                return -EPIPE;
+            }
+
+            src = (const uint8_t *)buf;
+            written = 0;
+            for (;;)
+            {
+                uint64_t daif;
+                uint64_t space;
+                uint64_t chunk;
+                uint64_t second;
+
+                daif = read_daif();
+                disable_irq();
+                spin_lock(&sys_pipe_lock);
+                if (!pipe->read_open)
+                {
+                    spin_unlock(&sys_pipe_lock);
+                    write_daif(daif);
+                    return (written > 0) ? (int64_t)written : -EPIPE;
+                }
+
+                if (pipe->used_bytes < sizeof(pipe->buf))
+                {
+                    space = (uint64_t)sizeof(pipe->buf) - (uint64_t)pipe->used_bytes;
+                    chunk = (uint64_t)len - written;
+                    if (chunk > space)
+                    {
+                        chunk = space;
+                    }
+                    first = chunk;
+                    if (pipe->tail + first > sizeof(pipe->buf))
+                    {
+                        first = sizeof(pipe->buf) - pipe->tail;
+                    }
+                    memcpy((int8_t *)&pipe->buf[pipe->tail], (int8_t *)src + written, (size_t)first);
+                    if (chunk > first)
+                    {
+                        second = chunk - first;
+                        memcpy((int8_t *)&pipe->buf[0], (int8_t *)src + written + first, (size_t)second);
+                        pipe->tail = (pipe->tail + first + second) % sizeof(pipe->buf);
+                        pipe->used_bytes += (size_t)(first + second);
+                        written += first + second;
+                    }
+                    else
+                    {
+                        pipe->tail = (pipe->tail + first) % sizeof(pipe->buf);
+                        pipe->used_bytes += (size_t)first;
+                        written += first;
+                    }
+                    spin_unlock(&sys_pipe_lock);
+                    write_daif(daif);
+                    if (written >= (uint64_t)len)
+                    {
+                        return (int64_t)written;
+                    }
+                    continue;
+                }
+
+                if (pipe->write_nonblock)
+                {
+                    spin_unlock(&sys_pipe_lock);
+                    write_daif(daif);
+                    return (written > 0) ? (int64_t)written : -EAGAIN;
+                }
+
+                spin_unlock(&sys_pipe_lock);
+                write_daif(daif);
+                sched_yield();
+            }
+        }
     }
 
     if (fd >= 3)
@@ -439,8 +1002,38 @@ static int64_t sys_open(int64_t path, int64_t flags)
 
 static int64_t sys_close(int64_t fd)
 {
-    if (fd < 3)
+    bool is_write_end;
+    struct sys_pipe_slot *pipe;
+    struct sys_socket_slot *sock;
+
+    if (fd >= 0 && fd <= 2)
     {
+        int32_t target_fd;
+
+        target_fd = sys_stdio_target_fd(fd);
+        if (target_fd >= 0)
+        {
+            sys_stdio_reset_fd(fd);
+            if (target_fd >= 3)
+            {
+                return sys_close(target_fd);
+            }
+            return 0;
+        }
+        return 0;
+    }
+
+    sock = sys_socket_slot_from_fd(fd);
+    if (sock)
+    {
+        sys_socket_slot_release(sock);
+        return 0;
+    }
+
+    pipe = sys_pipe_slot_from_fd(fd, &is_write_end);
+    if (pipe)
+    {
+        sys_pipe_slot_put(pipe, is_write_end);
         return 0;
     }
 
@@ -449,6 +1042,24 @@ static int64_t sys_close(int64_t fd)
 
 static int64_t sys_lseek(int64_t fd, int64_t offset, int64_t whence)
 {
+    int32_t target_fd;
+
+    target_fd = sys_stdio_target_fd(fd);
+    if (target_fd >= 0)
+    {
+        fd = target_fd;
+    }
+
+    if (sys_socket_slot_from_fd(fd))
+    {
+        return -ESPIPE;
+    }
+
+    if (sys_pipe_slot_from_fd(fd, 0))
+    {
+        return -ESPIPE;
+    }
+
     if (fd < 3)
     {
         return -ESPIPE;
@@ -775,10 +1386,26 @@ static int64_t sys_fstat(int64_t fd, int64_t out)
     struct vfs_stat st;
     int64_t kfd;
     int64_t ret;
+    struct sys_socket_slot *sock;
 
     if (fd < 0)
     {
         return -EBADF;
+    }
+
+    sock = sys_socket_slot_from_fd(fd);
+    if (sock)
+    {
+        memset((int8_t *)&st, 0, sizeof(st));
+        st.ino = (uint32_t)(fd - SYS_SOCKET_FD_BASE + 1);
+        st.mode = VFS_S_IFSOCK | 0600;
+        st.nlink = 1;
+        st.uid = 0;
+        st.gid = 0;
+        st.size = 0;
+        st.blocks = 0;
+        st.blksize = 4096;
+        return sys_copy_to_user((void *)out, &st, sizeof(st));
     }
 
     kfd = (fd >= 3) ? (fd - 3) : fd;
@@ -830,24 +1457,83 @@ static int64_t sys_isatty(int64_t fd)
 {
     if (fd >= 0 && fd <= 2)
     {
+        int32_t target_fd;
+
+        target_fd = sys_stdio_target_fd(fd);
+        if (target_fd >= 0)
+        {
+            return vfs_isatty_fd(target_fd) ? 1 : 0;
+        }
         return 1;
     }
 
-    return 0;
+    return vfs_isatty_fd((int)fd) ? 1 : 0;
 }
 
 static int64_t sys_dup2(int64_t oldfd, int64_t newfd)
 {
-    if (oldfd < 3 || newfd < 3)
+    bool is_write_end;
+    struct sys_pipe_slot *pipe;
+    int32_t resolved_oldfd;
+
+    if (newfd < 0)
     {
-        /*
-         * 当前 stdio 还走 tty 的特殊路径，不在 VFS fd 表里。
-         * 先只支持普通文件的 dup2，避免把 tty 语义和文件表强行混在一起。
-         */
         return -EBADF;
     }
 
-    return vfs_dup2((int)(oldfd - 3), (int)(newfd - 3)) + 3;
+    resolved_oldfd = sys_stdio_target_fd(oldfd);
+    if (resolved_oldfd >= 0)
+    {
+        oldfd = resolved_oldfd;
+    }
+
+    if (newfd >= 0 && newfd <= 2)
+    {
+        if (oldfd < 3 && !sys_fd_is_stdio_redirected(oldfd))
+        {
+            return newfd;
+        }
+
+        pipe = sys_pipe_slot_from_fd(oldfd, &is_write_end);
+        if (pipe)
+        {
+            sys_pipe_slot_get(pipe, is_write_end);
+            if (sys_stdio_set_fd(newfd, (int32_t)oldfd) < 0)
+            {
+                sys_pipe_slot_put(pipe, is_write_end);
+                return -EBADF;
+            }
+            return newfd;
+        }
+
+        if (oldfd >= 3)
+        {
+            int hidden_fd;
+
+            hidden_fd = vfs_dup((int)(oldfd - 3));
+            if (hidden_fd < 0)
+            {
+                return hidden_fd;
+            }
+
+            hidden_fd += 3;
+            if (sys_stdio_set_fd(newfd, (int32_t)hidden_fd) < 0)
+            {
+                (void)sys_close(hidden_fd);
+                return -EBADF;
+            }
+            return newfd;
+        }
+
+        return -EBADF;
+    }
+
+    if (oldfd < 3)
+    {
+        return -EBADF;
+    }
+
+    return vfs_dup2((int)(oldfd - 3), (int)newfd - 3) + 3;
 }
 
 static int64_t sys_brk(int64_t addr)
@@ -1329,26 +2015,344 @@ static int64_t sys_utimensat(int64_t dirfd, int64_t path, int64_t times, int64_t
     return vfs_utimens(kpath, atime, mtime);
 }
 
+static int64_t sys_httpget(int64_t ipv4, int64_t port, int64_t path, int64_t outfd, int64_t timeout_ms)
+{
+    int8_t kpath[VFS_PATH_MAX];
+    struct net_device *dev;
+    int64_t ret;
+
+    dev = net_default_device();
+    if (!dev)
+    {
+        return -ENODEV;
+    }
+
+    ret = sys_copy_path_from_user(kpath, sizeof(kpath), (const int8_t *)path);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    return net_http_get(dev, (uint32_t)ipv4, (uint16_t)port, kpath, (int)outfd, (uint32_t)timeout_ms);
+}
+
+static int64_t sys_dnslookup(int64_t hostname, int64_t out_ipv4, int64_t timeout_ms)
+{
+    int8_t khost[VFS_PATH_MAX];
+    struct net_device *dev;
+    uint32_t resolved_ip;
+    int64_t ret;
+
+    dev = net_default_device();
+    if (!dev)
+    {
+        return -ENODEV;
+    }
+
+    ret = sys_copy_path_from_user(khost, sizeof(khost), (const int8_t *)hostname);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    ret = net_dns_lookup(dev, khost, &resolved_ip, (uint32_t)timeout_ms);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    ret = sys_copy_to_user((void *)out_ipv4, &resolved_ip, sizeof(resolved_ip));
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    return 0;
+}
+
+static int64_t sys_socket(int64_t domain, int64_t type, int64_t protocol)
+{
+    struct sys_socket_slot *slot;
+    int fd;
+
+    if (domain != 2)
+    {
+        return -EAFNOSUPPORT;
+    }
+    if (type != 1)
+    {
+        return -EPROTONOSUPPORT;
+    }
+    if (protocol != 0 && protocol != 6)
+    {
+        return -EPROTONOSUPPORT;
+    }
+
+    fd = sys_socket_fd_alloc(&slot);
+    if (fd < 0)
+    {
+        return fd;
+    }
+
+    net_socket_init(&slot->sock);
+    slot->domain = (int)domain;
+    slot->type = (int)type;
+    slot->protocol = (int)protocol;
+    slot->flags = 0;
+    return fd;
+}
+
+static int64_t sys_connect(int64_t fd, int64_t addr, int64_t addrlen)
+{
+    struct sys_socket_slot *sock;
+    struct sys_sockaddr_in sin;
+    struct net_device *dev;
+    uint32_t ipv4;
+    uint16_t port;
+    int ret;
+
+    if (!sys_socket_fd_in_range(fd))
+    {
+        return -EBADF;
+    }
+
+    sock = sys_socket_slot_from_fd(fd);
+    if (!sock)
+    {
+        return -EBADF;
+    }
+    if (sock->sock.priv)
+    {
+        return -EISCONN;
+    }
+    if (!addr || addrlen < (int64_t)sizeof(sin))
+    {
+        return -EINVAL;
+    }
+    if (!sys_user_mem_valid((const void *)addr, sizeof(sin)))
+    {
+        return -EFAULT;
+    }
+
+    memcpy((int8_t *)&sin, (const int8_t *)addr, sizeof(sin));
+    if (sin.sin_family != 2)
+    {
+        return -EAFNOSUPPORT;
+    }
+
+    dev = net_default_device();
+    if (!dev)
+    {
+        return -ENODEV;
+    }
+
+    port = __builtin_bswap16(sin.sin_port);
+    ipv4 = __builtin_bswap32(sin.sin_addr);
+    ret = net_socket_connect_begin(&sock->sock, dev, ipv4, port);
+    if (ret == -EINPROGRESS)
+    {
+        return -EINPROGRESS;
+    }
+    return ret;
+}
+
+static int64_t sys_getsockopt(int64_t fd, int64_t level, int64_t optname, int64_t optval, int64_t optlen)
+{
+    struct sys_socket_slot *sock;
+    int value;
+    int32_t value_len;
+
+    sock = sys_socket_slot_from_fd(fd);
+    if (!sock)
+    {
+        return -EBADF;
+    }
+
+    if (level != SOL_SOCKET || optname != SO_ERROR)
+    {
+        return -ENOPROTOOPT;
+    }
+
+    if (!optval || !optlen)
+    {
+        return -EINVAL;
+    }
+    if (!sys_user_mem_valid((const void *)optval, sizeof(value)) ||
+        !sys_user_mem_valid((const void *)optlen, sizeof(value_len)))
+    {
+        return -EFAULT;
+    }
+
+    value = net_socket_so_error(&sock->sock);
+    value_len = (int32_t)sizeof(value);
+    if (sys_copy_to_user((void *)optval, &value, sizeof(value)) < 0)
+    {
+        return -EFAULT;
+    }
+    if (sys_copy_to_user((void *)optlen, &value_len, sizeof(value_len)) < 0)
+    {
+        return -EFAULT;
+    }
+    return 0;
+}
+
+static int64_t sys_shutdown(int64_t fd, int64_t how)
+{
+    struct sys_socket_slot *sock;
+
+    sock = sys_socket_slot_from_fd(fd);
+    if (!sock)
+    {
+        return -EBADF;
+    }
+
+    return net_socket_shutdown(&sock->sock, (int)how);
+}
+
+static int64_t sys_pipe2(int64_t fds, int64_t flags)
+{
+    struct sys_pipe_slot *slot;
+    int pipe_read_fd;
+    int pipe_write_fd;
+    int32_t out[2];
+    uint64_t bad_flags;
+
+    bad_flags = (uint64_t)flags & ~(KERNEL_O_NONBLOCK | 0x80000ULL);
+    if (bad_flags)
+    {
+        return -EINVAL;
+    }
+
+    if (!fds || !sys_user_mem_valid((const void *)fds, sizeof(out)))
+    {
+        return -EFAULT;
+    }
+
+    spin_lock(&sys_pipe_lock);
+    pipe_read_fd = sys_pipe_fd_alloc(&slot);
+    if (pipe_read_fd < 0)
+    {
+        spin_unlock(&sys_pipe_lock);
+        return pipe_read_fd;
+    }
+
+    pipe_write_fd = slot->write_fd;
+    slot->used = true;
+    slot->read_open = true;
+    slot->write_open = true;
+    slot->read_nonblock = (flags & KERNEL_O_NONBLOCK) != 0;
+    slot->write_nonblock = (flags & KERNEL_O_NONBLOCK) != 0;
+    slot->head = 0;
+    slot->tail = 0;
+    slot->used_bytes = 0;
+    spin_unlock(&sys_pipe_lock);
+
+    out[0] = pipe_read_fd;
+    out[1] = pipe_write_fd;
+    if (sys_copy_to_user((void *)fds, &out, sizeof(out)) < 0)
+    {
+        sys_pipe_slot_put(slot, false);
+        sys_pipe_slot_put(slot, true);
+        return -EFAULT;
+    }
+
+    return 0;
+}
+
+static int64_t sys_fbinfo(int64_t out)
+{
+    struct stupidos_fbinfo info;
+
+    if (!out)
+    {
+        return -EINVAL;
+    }
+
+    ui_fb_info(&info);
+    return sys_copy_to_user((void *)out, &info, sizeof(info));
+}
+
+static int64_t sys_fbfill(int64_t x, int64_t y, int64_t w, int64_t h, int64_t color)
+{
+    if (x < 0 || y < 0 || w <= 0 || h <= 0)
+    {
+        return -EINVAL;
+    }
+
+    ui_fill_rect((uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h, (uint32_t)color);
+    return 0;
+}
+
+static int64_t sys_fbtext(int64_t x, int64_t y, int64_t fg, int64_t bg, int64_t text)
+{
+    int8_t buf[512];
+    int64_t ret;
+
+    if (x < 0 || y < 0 || !text)
+    {
+        return -EINVAL;
+    }
+
+    ret = sys_copy_path_from_user(buf, sizeof(buf), (const int8_t *)text);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    ui_draw_text((uint32_t)x, (uint32_t)y, (uint32_t)fg, (uint32_t)bg, (const uint8_t *)buf);
+    return 0;
+}
+
 static int64_t sys_ioctl(int64_t fd, int64_t request, int64_t argp)
 {
     /*
-     * 先补一组最常见的终端 ioctl，方便用户态工具链/解释器探测 TTY。
-     * 目前只做“可运行”语义，不实现完整 termios 配置。
+     * 最小终端 ioctl 兼容层：
+     * - TCGETS/TCSETS*: 与 tty termios 状态联动
+     * - TIOCGWINSZ/FIONREAD: 给编辑器和 shell 做能力探测
      */
     if (fd >= 0 && fd <= 2)
     {
+        struct tty_termios_state tios;
+        int32_t target_fd;
+
+        target_fd = sys_stdio_target_fd(fd);
+        if (target_fd >= 0)
+        {
+            return sys_ioctl(target_fd, request, argp);
+        }
+
         /* TCGETS */
         if ((uint64_t)request == 0x5401ULL)
         {
-            uint8_t termios_blob[44];
-
             if (!argp)
             {
                 return -EINVAL;
             }
 
-            memset((int8_t *)termios_blob, 0, sizeof(termios_blob));
-            return sys_copy_to_user((void *)argp, termios_blob, sizeof(termios_blob));
+            tty_get_termios(&tios);
+            return sys_copy_to_user((void *)argp, &tios, sizeof(tios));
+        }
+
+        /* TCSETS / TCSETSW / TCSETSF */
+        if ((uint64_t)request == 0x5402ULL ||
+            (uint64_t)request == 0x5403ULL ||
+            (uint64_t)request == 0x5404ULL)
+        {
+            if (!argp)
+            {
+                return -EINVAL;
+            }
+            if (!sys_user_mem_valid((const void *)argp, sizeof(tios)))
+            {
+                return -EFAULT;
+            }
+
+            memcpy((int8_t *)&tios, (int8_t *)argp, sizeof(tios));
+            if (tty_set_termios(&tios, ((uint64_t)request == 0x5404ULL) ? 1 : 0) < 0)
+            {
+                return -EINVAL;
+            }
+            return 0;
         }
 
         /* TIOCGWINSZ */
@@ -1384,8 +2388,135 @@ static int64_t sys_ioctl(int64_t fd, int64_t request, int64_t argp)
                 return -EINVAL;
             }
 
-            pending = 0;
+            pending = tty_pending_count();
             return sys_copy_to_user((void *)argp, &pending, sizeof(pending));
+        }
+    }
+
+    if (sys_socket_fd_in_range(fd))
+    {
+        if ((uint64_t)request == 0x541BULL)
+        {
+            int32_t pending;
+            struct sys_socket_slot *sock;
+
+            if (!argp)
+            {
+                return -EINVAL;
+            }
+
+            sock = sys_socket_slot_from_fd(fd);
+            if (!sock)
+            {
+                return -EBADF;
+            }
+            pending = net_socket_pending(&sock->sock);
+            return sys_copy_to_user((void *)argp, &pending, sizeof(pending));
+        }
+    }
+
+    if (vfs_isatty_fd((int)fd))
+    {
+        struct tty_termios_state tios;
+
+        /*
+         * /dev/tty 这类伪字符设备也要表现得像真正终端，
+         * 否则 Dropbear 的密码提示和终端模式切换会退化成不可用。
+         */
+        if ((uint64_t)request == 0x5401ULL)
+        {
+            if (!argp)
+            {
+                return -EINVAL;
+            }
+
+            tty_get_termios(&tios);
+            return sys_copy_to_user((void *)argp, &tios, sizeof(tios));
+        }
+
+        if ((uint64_t)request == 0x5402ULL ||
+            (uint64_t)request == 0x5403ULL ||
+            (uint64_t)request == 0x5404ULL)
+        {
+            if (!argp)
+            {
+                return -EINVAL;
+            }
+            if (!sys_user_mem_valid((const void *)argp, sizeof(tios)))
+            {
+                return -EFAULT;
+            }
+
+            memcpy((int8_t *)&tios, (int8_t *)argp, sizeof(tios));
+            if (tty_set_termios(&tios, ((uint64_t)request == 0x5404ULL) ? 1 : 0) < 0)
+            {
+                return -EINVAL;
+            }
+            return 0;
+        }
+
+        if ((uint64_t)request == 0x5413ULL)
+        {
+            struct
+            {
+                uint16_t rows;
+                uint16_t cols;
+                uint16_t xpixel;
+                uint16_t ypixel;
+            } ws;
+
+            if (!argp)
+            {
+                return -EINVAL;
+            }
+
+            ws.rows = 40;
+            ws.cols = 120;
+            ws.xpixel = 0;
+            ws.ypixel = 0;
+            return sys_copy_to_user((void *)argp, &ws, sizeof(ws));
+        }
+
+        if ((uint64_t)request == 0x541BULL)
+        {
+            int32_t pending;
+
+            if (!argp)
+            {
+                return -EINVAL;
+            }
+
+            pending = tty_pending_count();
+            return sys_copy_to_user((void *)argp, &pending, sizeof(pending));
+        }
+    }
+
+    {
+        bool is_write_end;
+        struct sys_pipe_slot *pipe;
+
+        pipe = sys_pipe_slot_from_fd(fd, &is_write_end);
+        if (pipe)
+        {
+            if ((uint64_t)request == 0x541BULL)
+            {
+                int32_t pending;
+                uint64_t daif;
+
+                if (!argp)
+                {
+                    return -EINVAL;
+                }
+
+                daif = read_daif();
+                disable_irq();
+                spin_lock(&sys_pipe_lock);
+                pending = (int32_t)pipe->used_bytes;
+                spin_unlock(&sys_pipe_lock);
+                write_daif(daif);
+                return sys_copy_to_user((void *)argp, &pending, sizeof(pending));
+            }
+            return -ENOTTY;
         }
     }
 
@@ -1395,9 +2526,23 @@ static int64_t sys_ioctl(int64_t fd, int64_t request, int64_t argp)
 static int64_t sys_dup(int64_t oldfd)
 {
     int fd;
+    if (sys_socket_slot_from_fd(oldfd))
+    {
+        return -ENOTSUP;
+    }
 
     if (oldfd < 3)
     {
+        /*
+         * 最小 stdio dup 兼容（中文）：
+         * CPython 启动时会用 dup(fd) 探测 0/1/2 是否有效。
+         * 当前内核尚未给 tty 实现完整的“可分配副本 fd”语义，
+         * 这里先返回原 fd，让探测通过；close(0/1/2) 在内核里本来就是 no-op。
+         */
+        if (oldfd >= 0)
+        {
+            return oldfd;
+        }
         return -EBADF;
     }
 
@@ -1813,6 +2958,11 @@ static int64_t sys_pread64(int64_t fd, int64_t buf, int64_t len, int64_t off)
         return -EINVAL;
     }
 
+    if (sys_socket_slot_from_fd(fd))
+    {
+        return -ESPIPE;
+    }
+
     if (fd < 3)
     {
         return -EBADF;
@@ -1836,6 +2986,11 @@ static int64_t sys_pwrite64(int64_t fd, int64_t buf, int64_t len, int64_t off)
         return -EINVAL;
     }
 
+    if (sys_socket_slot_from_fd(fd))
+    {
+        return -ESPIPE;
+    }
+
     if (fd < 3)
     {
         return -EBADF;
@@ -1852,9 +3007,92 @@ static int64_t sys_pwrite64(int64_t fd, int64_t buf, int64_t len, int64_t off)
 
 static int64_t sys_fcntl(int64_t fd, int64_t cmd, int64_t arg)
 {
+    bool is_write_end;
+    struct sys_pipe_slot *pipe;
+    struct sys_socket_slot *sock;
+    int32_t target_fd;
+
+    if (fd >= 0 && fd <= 2)
+    {
+        target_fd = sys_stdio_target_fd(fd);
+        if (target_fd >= 0)
+        {
+            return sys_fcntl(target_fd, cmd, arg);
+        }
+    }
+
+    pipe = sys_pipe_slot_from_fd(fd, &is_write_end);
+    if (pipe)
+    {
+        switch ((int)cmd)
+        {
+        case VFS_F_GETFD:
+            return 0;
+        case VFS_F_SETFD:
+            return 0;
+        case VFS_F_GETFL:
+            return (is_write_end ? KERNEL_O_WRONLY : KERNEL_O_RDONLY) |
+                   ((is_write_end ? pipe->write_nonblock : pipe->read_nonblock) ? KERNEL_O_NONBLOCK : 0);
+        case VFS_F_SETFL:
+            if (is_write_end)
+            {
+                pipe->write_nonblock = ((uint64_t)arg & KERNEL_O_NONBLOCK) != 0;
+            }
+            else
+            {
+                pipe->read_nonblock = ((uint64_t)arg & KERNEL_O_NONBLOCK) != 0;
+            }
+            return 0;
+        default:
+            return -ENOTSUP;
+        }
+    }
+
+    sock = sys_socket_slot_from_fd(fd);
+    if (sock)
+    {
+        switch ((int)cmd)
+        {
+        case VFS_F_GETFD:
+            return 0;
+        case VFS_F_SETFD:
+            return 0;
+        case VFS_F_GETFL:
+            return sock->flags;
+        case VFS_F_SETFL:
+            sock->flags = (int)arg;
+            return 0;
+        default:
+            return -ENOTSUP;
+        }
+    }
+
     if (fd < 3)
     {
-        return -EBADF;
+        /*
+         * stdio 最小 fcntl 兼容（中文）：
+         * CPython 在初始化 sys.stdin/stdout/stderr 时会先做 F_GETFD/F_GETFL 探测。
+         * 之前对 0/1/2 直接返回 EBADF，导致 Python 认为标准流无效并把 sys.stdout 置为 None。
+         */
+        switch ((int)cmd)
+        {
+        case VFS_F_GETFD:
+            return 0;
+        case VFS_F_SETFD:
+            (void)arg;
+            return 0;
+        case VFS_F_GETFL:
+            if (fd == 0)
+            {
+                return VFS_O_RDONLY;
+            }
+            return VFS_O_WRONLY;
+        case VFS_F_SETFL:
+            (void)arg;
+            return 0;
+        default:
+            return -EINVAL;
+        }
     }
 
     return vfs_fcntl((int)(fd - 3), (int)cmd, (uint64_t)arg);
@@ -2108,6 +3346,37 @@ int64_t syscall_dispatch(pt_regs_t *regs)
     case SYS_UTIMENSAT:
         return sys_utimensat((int64_t)regs->s_reg[0], (int64_t)regs->s_reg[1],
                              (int64_t)regs->s_reg[2], (int64_t)regs->s_reg[3]);
+    case SYS_HTTPGET:
+        return sys_httpget((int64_t)regs->s_reg[0], (int64_t)regs->s_reg[1],
+                           (int64_t)regs->s_reg[2], (int64_t)regs->s_reg[3],
+                           (int64_t)regs->s_reg[4]);
+    case SYS_DNSLOOKUP:
+        return sys_dnslookup((int64_t)regs->s_reg[0], (int64_t)regs->s_reg[1],
+                             (int64_t)regs->s_reg[2]);
+    case SYS_SOCKET:
+        return sys_socket((int64_t)regs->s_reg[0], (int64_t)regs->s_reg[1],
+                          (int64_t)regs->s_reg[2]);
+    case SYS_CONNECT:
+        return sys_connect((int64_t)regs->s_reg[0], (int64_t)regs->s_reg[1],
+                           (int64_t)regs->s_reg[2]);
+    case SYS_SHUTDOWN:
+        return sys_shutdown((int64_t)regs->s_reg[0], (int64_t)regs->s_reg[1]);
+    case SYS_GETSOCKOPT:
+        return sys_getsockopt((int64_t)regs->s_reg[0], (int64_t)regs->s_reg[1],
+                              (int64_t)regs->s_reg[2], (int64_t)regs->s_reg[3],
+                              (int64_t)regs->s_reg[4]);
+    case SYS_FBINFO:
+        return sys_fbinfo((int64_t)regs->s_reg[0]);
+    case SYS_FBFILL:
+        return sys_fbfill((int64_t)regs->s_reg[0], (int64_t)regs->s_reg[1],
+                          (int64_t)regs->s_reg[2], (int64_t)regs->s_reg[3],
+                          (int64_t)regs->s_reg[4]);
+    case SYS_FBTEXT:
+        return sys_fbtext((int64_t)regs->s_reg[0], (int64_t)regs->s_reg[1],
+                          (int64_t)regs->s_reg[2], (int64_t)regs->s_reg[3],
+                          (int64_t)regs->s_reg[4]);
+    case SYS_PIPE2:
+        return sys_pipe2((int64_t)regs->s_reg[0], (int64_t)regs->s_reg[1]);
     default:
         return -ENOSYS;
     }

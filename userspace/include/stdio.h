@@ -12,6 +12,16 @@
 #define BUFSIZ 1024
 #endif
 
+#ifndef _IOFBF
+#define _IOFBF 0
+#endif
+#ifndef _IOLBF
+#define _IOLBF 1
+#endif
+#ifndef _IONBF
+#define _IONBF 2
+#endif
+
 #ifndef SEEK_SET
 #define SEEK_SET 0
 #endif
@@ -54,6 +64,11 @@ size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream);
 int fflush(FILE *stream);
 int fseek(FILE *stream, long offset, int whence);
 long ftell(FILE *stream);
+int fileno(FILE *stream);
+int setvbuf(FILE *stream, char *buf, int mode, size_t size);
+void setbuf(FILE *stream, char *buf);
+void flockfile(FILE *stream);
+void funlockfile(FILE *stream);
 void rewind(FILE *stream);
 char *fgets(char *s, int size, FILE *stream);
 int feof(FILE *stream);
@@ -61,6 +76,7 @@ int ferror(FILE *stream);
 void clearerr(FILE *stream);
 int ungetc(int ch, FILE *stream);
 int remove(const char *pathname);
+int rename(const char *oldpath, const char *newpath);
 
 void perror(const char *s);
 

@@ -5,7 +5,9 @@
 
 typedef struct
 {
-    uint32_t *ramfb_base;     // Pointer to pixel memory
+    uint32_t *ramfb_base;     // 当前生效的像素内存虚拟地址
+    uint64_t ramfb_phys_base; // 物理基址，便于 MMU 切换后重新绑定
+    uint32_t *ramfb_kimage_base; // KIMAGE_VADDR 下的高地址别名
     uint64_t ramfb_length;
 
     uint32_t width;     // Width in pixels
@@ -46,6 +48,7 @@ typedef struct
 extern ramfb_info_t ramfb_info;
 
 void ramfb_init(uint8_t *fb_addr, uint32_t width, uint32_t height);
+void ramfb_rebind_runtime_base(void);
 void ramfb_putstring(uint32_t fg, uint32_t bg, const uint8_t *s);
 
 #endif

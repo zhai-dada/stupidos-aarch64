@@ -1,6 +1,18 @@
 #ifndef __STUPIDOS_ERRNO_H__
 #define __STUPIDOS_ERRNO_H__
 
+/*
+ * 默认情况下，stupidos 用户态统一使用本地 errno 定义，保证：
+ * 1. freestanding ELF（例如 tcc.real、busybox applet）能够稳定链接；
+ * 2. 不会被宿主 libc 的 errno 头污染；
+ * 3. 内核返回的负值错误码可以直接映射成用户态 errno。
+ *
+ * 如果某个第三方源码明确需要工具链 libc 的 errno 语义，
+ * 可以显式定义 STUPIDOS_USE_TOOLCHAIN_ERRNO。
+ */
+#if defined(STUPIDOS_USE_TOOLCHAIN_ERRNO)
+#include_next <errno.h>
+#else
 extern int errno;
 
 #define E2BIG           1
@@ -84,5 +96,6 @@ extern int errno;
 #define ETXTBSY         79
 #define EWOULDBLOCK     80
 #define EXDEV           81
+#endif
 
 #endif

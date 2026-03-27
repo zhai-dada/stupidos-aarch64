@@ -3,12 +3,14 @@
 #include "stdlib.h"
 #include "string.h"
 #include "ctype.h"
+#include "stdio.h"
 #include "fcntl.h"
 #include "pthread.h"
 #include "time.h"
 #include <wchar.h>
 #include <locale.h>
 #include <pwd.h>
+#include <grp.h>
 #include <dirent.h>
 #include <langinfo.h>
 #include <sys/resource.h>
@@ -17,10 +19,45 @@
 #include <sys/syscall.h>
 #include <sys/select.h>
 #include <sys/time.h>
+#include <sys/ioctl.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include <utime.h>
 #include <stdarg.h>
 #include <setjmp.h>
 #include <limits.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <termios.h>
+#include <spawn.h>
+#include <sched.h>
+#include <sys/uio.h>
+#include <sys/utsname.h>
+#include <sys/statvfs.h>
+#include <sys/sendfile.h>
+#include <semaphore.h>
+#include <math.h>
+
+#ifndef __OFF64_TYPEDEF_STUPIDOS
+typedef off_t off64_t;
+#define __OFF64_TYPEDEF_STUPIDOS 1
+#endif
+
+#ifndef TCGETS
+#define TCGETS 0x5401
+#endif
+#ifndef TCSETS
+#define TCSETS 0x5402
+#endif
+#ifndef TCSETSW
+#define TCSETSW 0x5403
+#endif
+#ifndef TCSETSF
+#define TCSETSF 0x5404
+#endif
 
 /*
  * 某些交叉工具链在 freestanding 配置下不会暴露 stat64/rlimit64 的 tag 定义。
@@ -29,6 +66,16 @@
  */
 struct stat64;
 struct rlimit64;
+
+/*
+ * compat.c 内部会在定义这些包装函数之前先调用它们。
+ * 这里前置声明，避免 GCC 把调用当成隐式声明并产生噪音。
+ */
+int chdir(const char *path);
+int close(int fd);
+int dup2(int oldfd, int newfd);
+pid_t fork(void);
+int setsid(void);
 
 /*
  * 这是给后续 CPython / 其他 POSIX 用户态程序准备的最小 libc 兼容层。
@@ -78,6 +125,11 @@ static struct lconv u_locale_conv;
 static char u_langinfo_codeset[] = "UTF-8";
 static struct passwd u_passwd_root;
 static struct passwd u_passwd_user;
+static struct group u_group_root;
+static struct group u_group_user;
+static char *u_group_root_members[] = { (char *)"root", 0 };
+static char *u_group_user_members[] = { (char *)"user", 0 };
+static int u_passwd_iter_index;
 static char u_passwd_root_name[] = "root";
 static char u_passwd_root_passwd[] = "x";
 static char u_passwd_root_dir[] = "/";
@@ -93,6 +145,368 @@ struct u_dir_stream
     uint32_t index;
 };
 static struct dirent u_dirent_entry;
+static struct termios u_termios_state;
+static bool u_termios_state_ready;
+static void (*u_atexit_handlers[32])(void);
+static size_t u_atexit_count;
+struct u_sem_slot
+{
+    sem_t *sem;
+    int value;
+    bool used;
+};
+static struct u_sem_slot u_sem_slots[64];
+static int u_select_sleep_slice(void);
+
+/*
+ * Dropbear / BusyBox 这类程序需要最小 pipe 支持。
+ * 这里先在 libc 层做一套“自管管道”：
+ * - pipe() 返回一对用户态 fd
+ * - read/write/ioctl/fcntl/select/poll 识别这些 fd
+ * - 足够支撑 ssh 的 signal pipe、以及少量简单管道用法
+ *
+ * 这不是完整的内核 pipe，但能先把最关键的用户体验跑通。
+ */
+#define U_PIPE_SLOT_MAX     32
+/*
+ * 把 pipe 的保留 fd 段整体抬高一点，尽量避开普通 open/dup 使用的低位 fd。
+ * 这样 Dropbear / BusyBox 之类程序在启动时创建 self-pipe 时更不容易撞号。
+ *
+ * 这里仍然要控制在 FD_SETSIZE 范围内，否则 select()/poll() 的 fd_set 无法承载。
+ */
+#define U_PIPE_FD_BASE      512
+#define U_PIPE_FD_MAX       1024
+#define U_PIPE_BUF_SIZE     4096U
+
+struct u_pipe_slot
+{
+    bool used;
+    int read_fd;
+    int write_fd;
+    bool read_open;
+    bool write_open;
+    bool read_nonblock;
+    bool write_nonblock;
+    size_t head;
+    size_t tail;
+    size_t used_bytes;
+    uint8_t buf[U_PIPE_BUF_SIZE];
+};
+
+static struct u_pipe_slot u_pipe_slots[U_PIPE_SLOT_MAX];
+
+static struct u_pipe_slot *u_pipe_slot_from_fd(int fd, bool *is_write_end)
+{
+    size_t i;
+
+    if (fd < U_PIPE_FD_BASE || fd >= U_PIPE_FD_MAX)
+    {
+        return 0;
+    }
+
+    for (i = 0; i < U_PIPE_SLOT_MAX; i++)
+    {
+        struct u_pipe_slot *slot = &u_pipe_slots[i];
+
+        if (!slot->used)
+        {
+            continue;
+        }
+
+        if (fd == slot->read_fd)
+        {
+            if (is_write_end)
+            {
+                *is_write_end = false;
+            }
+            return slot;
+        }
+
+        if (fd == slot->write_fd)
+        {
+            if (is_write_end)
+            {
+                *is_write_end = true;
+            }
+            return slot;
+        }
+    }
+
+    return 0;
+}
+
+static int u_pipe_alloc_fd(void)
+{
+    int fd;
+    size_t i;
+    bool taken;
+
+    for (fd = U_PIPE_FD_BASE; fd < U_PIPE_FD_MAX; fd++)
+    {
+        taken = false;
+        for (i = 0; i < U_PIPE_SLOT_MAX; i++)
+        {
+            if (!u_pipe_slots[i].used)
+            {
+                continue;
+            }
+            if (u_pipe_slots[i].read_fd == fd || u_pipe_slots[i].write_fd == fd)
+            {
+                taken = true;
+                break;
+            }
+        }
+        if (!taken)
+        {
+            return fd;
+        }
+    }
+
+    return -1;
+}
+
+static void u_pipe_release_if_unused(struct u_pipe_slot *slot)
+{
+    if (!slot)
+    {
+        return;
+    }
+
+    if (!slot->read_open && !slot->write_open)
+    {
+        memset((int8_t *)slot, 0, sizeof(*slot));
+    }
+}
+
+static ssize_t u_pipe_read(int fd, void *buf, size_t len)
+{
+    struct u_pipe_slot *slot;
+    bool is_write_end;
+    size_t copied;
+    size_t first;
+
+    slot = u_pipe_slot_from_fd(fd, &is_write_end);
+    if (!slot || is_write_end)
+    {
+        errno = EBADF;
+        return -1;
+    }
+    if (!buf && len)
+    {
+        errno = EFAULT;
+        return -1;
+    }
+    if (len == 0)
+    {
+        return 0;
+    }
+
+    for (;;)
+    {
+        if (slot->used_bytes > 0)
+        {
+            copied = (len < slot->used_bytes) ? len : slot->used_bytes;
+            first = copied;
+            if (slot->head + first > U_PIPE_BUF_SIZE)
+            {
+                first = U_PIPE_BUF_SIZE - slot->head;
+            }
+            memcpy((int8_t *)buf, (int8_t *)&slot->buf[slot->head], first);
+            if (copied > first)
+            {
+                memcpy((int8_t *)buf + first, (int8_t *)&slot->buf[0], copied - first);
+            }
+            slot->head = (slot->head + copied) % U_PIPE_BUF_SIZE;
+            slot->used_bytes -= copied;
+            return (ssize_t)copied;
+        }
+
+        if (!slot->write_open)
+        {
+            return 0;
+        }
+
+        if (slot->read_nonblock)
+        {
+            errno = EAGAIN;
+            return -1;
+        }
+
+        if (u_select_sleep_slice() < 0)
+        {
+            errno = EINTR;
+            return -1;
+        }
+    }
+}
+
+static ssize_t u_pipe_write(int fd, const void *buf, size_t len)
+{
+    struct u_pipe_slot *slot;
+    bool is_write_end;
+    size_t written;
+    size_t space;
+    size_t first;
+
+    slot = u_pipe_slot_from_fd(fd, &is_write_end);
+    if (!slot || !is_write_end)
+    {
+        errno = EBADF;
+        return -1;
+    }
+    if (!buf && len)
+    {
+        errno = EFAULT;
+        return -1;
+    }
+    if (len == 0)
+    {
+        return 0;
+    }
+
+    if (!slot->read_open)
+    {
+        errno = EPIPE;
+        return -1;
+    }
+
+    written = 0;
+    while (written < len)
+    {
+        space = U_PIPE_BUF_SIZE - slot->used_bytes;
+        if (space == 0)
+        {
+            if (slot->write_nonblock)
+            {
+                errno = EAGAIN;
+                return (written > 0) ? (ssize_t)written : -1;
+            }
+
+            if (u_select_sleep_slice() < 0)
+            {
+                errno = EINTR;
+                return (written > 0) ? (ssize_t)written : -1;
+            }
+            continue;
+        }
+
+        first = len - written;
+        if (first > space)
+        {
+            first = space;
+        }
+        if (slot->tail + first > U_PIPE_BUF_SIZE)
+        {
+            first = U_PIPE_BUF_SIZE - slot->tail;
+        }
+
+        memcpy((int8_t *)&slot->buf[slot->tail], (int8_t *)buf + written, first);
+        if ((len - written) > first && (space - first) > 0)
+        {
+            size_t second = (len - written - first);
+            if (second > (space - first))
+            {
+                second = space - first;
+            }
+            memcpy((int8_t *)&slot->buf[0], (int8_t *)buf + written + first, second);
+            slot->tail = second;
+            slot->used_bytes += first + second;
+            written += first + second;
+        }
+        else
+        {
+            slot->tail = (slot->tail + first) % U_PIPE_BUF_SIZE;
+            slot->used_bytes += first;
+            written += first;
+        }
+    }
+
+    return (ssize_t)written;
+}
+
+static int u_pipe_close(int fd)
+{
+    struct u_pipe_slot *slot;
+    bool is_write_end;
+
+    slot = u_pipe_slot_from_fd(fd, &is_write_end);
+    if (!slot)
+    {
+        errno = EBADF;
+        return -1;
+    }
+
+    if (is_write_end)
+    {
+        slot->write_open = false;
+    }
+    else
+    {
+        slot->read_open = false;
+    }
+    u_pipe_release_if_unused(slot);
+    return 0;
+}
+
+static int u_pipe_ioctl(int fd, unsigned long request, void *argp)
+{
+    struct u_pipe_slot *slot;
+    bool is_write_end;
+
+    slot = u_pipe_slot_from_fd(fd, &is_write_end);
+    if (!slot)
+    {
+        errno = EBADF;
+        return -1;
+    }
+
+    if (request == FIONREAD)
+    {
+        if (!argp)
+        {
+            errno = EINVAL;
+            return -1;
+        }
+        *(int *)argp = (int)slot->used_bytes;
+        return 0;
+    }
+
+    errno = ENOTTY;
+    return -1;
+}
+
+static int u_pipe_fcntl(int fd, int cmd, unsigned long arg)
+{
+    struct u_pipe_slot *slot;
+    bool is_write_end;
+    bool *nonblock_flag;
+
+    slot = u_pipe_slot_from_fd(fd, &is_write_end);
+    if (!slot)
+    {
+        return 0;
+    }
+
+    nonblock_flag = is_write_end ? &slot->write_nonblock : &slot->read_nonblock;
+    switch (cmd)
+    {
+    case F_GETFD:
+        return 0;
+    case F_SETFD:
+        return 0;
+    case F_GETFL:
+        return (int)(is_write_end ? O_WRONLY : O_RDONLY) | (*nonblock_flag ? O_NONBLOCK : 0);
+    case F_SETFL:
+        *nonblock_flag = (arg & O_NONBLOCK) ? true : false;
+        return 0;
+    default:
+        errno = ENOTSUP;
+        return -1;
+    }
+}
+
+int pipe(int fds[2]);
+int pipe2(int fds[2], int flags);
 
 void u_lib_early_init(void)
 {
@@ -102,6 +516,87 @@ void u_lib_early_init(void)
      * 这里在运行时用真实地址重新绑定，避免 Python/stdlib 在 getenv/setenv 路径崩溃。
      */
     environ = u_environ_items;
+}
+
+int *__errno_location(void)
+{
+    return &errno;
+}
+
+/*
+ * Dropbear 以及部分 POSIX 代码会通过 glibc 风格的内部符号
+ * __xpg_basename() / dirname() 访问路径处理逻辑。
+ * 我们这里给一组最小实现，避免第三方程序在 freestanding 链接时
+ * 继续依赖宿主 libc。
+ */
+char *__xpg_basename(char *path)
+{
+    char *start;
+    char *end;
+
+    if (!path || !*path)
+    {
+        return (char *)".";
+    }
+
+    start = path;
+    end = path + strlen(path);
+    while (end > start + 1 && end[-1] == '/')
+    {
+        *--end = '\0';
+    }
+
+    if (end == start + 1 && start[0] == '/')
+    {
+        return start;
+    }
+
+    while (end > start && end[-1] != '/')
+    {
+        end--;
+    }
+
+    return end;
+}
+
+char *dirname(char *path)
+{
+    char *start;
+    char *end;
+
+    if (!path || !*path)
+    {
+        return (char *)".";
+    }
+
+    start = path;
+    end = path + strlen(path);
+    while (end > start + 1 && end[-1] == '/')
+    {
+        *--end = '\0';
+    }
+
+    if (end == start + 1 && start[0] == '/')
+    {
+        return start;
+    }
+
+    while (end > start && end[-1] != '/')
+    {
+        end--;
+    }
+
+    if (end == start)
+    {
+        return (char *)".";
+    }
+
+    while (end > start + 1 && end[-1] == '/')
+    {
+        end--;
+    }
+    *end = '\0';
+    return start;
 }
 
 static bool u_sysret_is_error(int64_t value)
@@ -137,6 +632,37 @@ static off_t u_sysret_off(int64_t value)
         return (off_t)-1;
     }
     return (off_t)value;
+}
+
+static struct u_sem_slot *u_sem_slot_find(sem_t *sem)
+{
+    size_t i;
+
+    for (i = 0; i < sizeof(u_sem_slots) / sizeof(u_sem_slots[0]); i++)
+    {
+        if (u_sem_slots[i].used && u_sem_slots[i].sem == sem)
+        {
+            return &u_sem_slots[i];
+        }
+    }
+    return 0;
+}
+
+static struct u_sem_slot *u_sem_slot_alloc(sem_t *sem)
+{
+    size_t i;
+
+    for (i = 0; i < sizeof(u_sem_slots) / sizeof(u_sem_slots[0]); i++)
+    {
+        if (!u_sem_slots[i].used)
+        {
+            u_sem_slots[i].used = true;
+            u_sem_slots[i].sem = sem;
+            u_sem_slots[i].value = 0;
+            return &u_sem_slots[i];
+        }
+    }
+    return 0;
 }
 
 static int u_errno_rofs(void)
@@ -735,6 +1261,11 @@ int isspace(int ch)
     return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\v' || ch == '\f';
 }
 
+int isblank(int ch)
+{
+    return ch == ' ' || ch == '\t';
+}
+
 int isascii(int ch)
 {
     return ((unsigned int)ch & ~0x7FU) == 0U;
@@ -772,6 +1303,16 @@ int isupper(int ch)
     return ch >= 'A' && ch <= 'Z';
 }
 
+int isprint(int ch)
+{
+    return ch >= 0x20 && ch <= 0x7e;
+}
+
+int ispunct(int ch)
+{
+    return isprint(ch) && !isalnum(ch) && !isspace(ch);
+}
+
 int tolower(int ch)
 {
     if (isupper(ch))
@@ -788,6 +1329,35 @@ int toupper(int ch)
         return ch - 'a' + 'A';
     }
     return ch;
+}
+
+int strncasecmp(const char *a, const char *b, size_t n)
+{
+    size_t i;
+
+    if (!a || !b)
+    {
+        return a ? 1 : (b ? -1 : 0);
+    }
+
+    for (i = 0; i < n; i++)
+    {
+        unsigned char ca = (unsigned char)tolower((unsigned char)a[i]);
+        unsigned char cb = (unsigned char)tolower((unsigned char)b[i]);
+        if (ca != cb || ca == '\0' || cb == '\0')
+        {
+            return (int)ca - (int)cb;
+        }
+    }
+    return 0;
+}
+
+int strcasecmp(const char *a, const char *b)
+{
+    size_t lena = a ? strlen(a) : 0;
+    size_t lenb = b ? strlen(b) : 0;
+    size_t n = lena > lenb ? lena : lenb;
+    return strncasecmp(a, b, n + 1U);
 }
 
 static int64_t u_parse_num(const char *nptr, int base, bool signed_mode, int64_t *out_signed, uint64_t *out_unsigned)
@@ -891,6 +1461,11 @@ int atoi(const char *nptr)
     return (int)v;
 }
 
+long atol(const char *nptr)
+{
+    return strtol(nptr, 0, 10);
+}
+
 long strtol(const char *nptr, char **endptr, int base)
 {
     int64_t v;
@@ -985,6 +1560,123 @@ char *strerror(int errnum)
         case ETIMEDOUT: return "Connection timed out";
         default: return "Unknown error";
     }
+}
+
+void explicit_bzero(void *s, size_t n)
+{
+    /*
+     * 保持和 libc 语义一致：即使编译器优化，也不要把这段清零折叠掉。
+     */
+    volatile unsigned char *p = (volatile unsigned char *)s;
+
+    while (n--)
+    {
+        *p++ = 0;
+    }
+}
+
+char *getpass(const char *prompt)
+{
+    static char passbuf[256];
+    char *nl;
+    FILE *tty;
+    struct termios old_tio;
+    struct termios noecho_tio;
+    int have_tty_termios;
+
+    if (prompt && *prompt)
+    {
+        tty = fopen("/dev/tty", "r+");
+        if (tty)
+        {
+            have_tty_termios = (tcgetattr(fileno(tty), &old_tio) == 0);
+            if (have_tty_termios)
+            {
+                noecho_tio = old_tio;
+                noecho_tio.c_lflag &= (tcflag_t)~ECHO;
+                (void)tcsetattr(fileno(tty), TCSANOW, &noecho_tio);
+            }
+            fputs(prompt, tty);
+            fflush(tty);
+            if (!fgets(passbuf, sizeof(passbuf), tty))
+            {
+                passbuf[0] = '\0';
+                if (have_tty_termios)
+                {
+                    (void)tcsetattr(fileno(tty), TCSANOW, &old_tio);
+                }
+                fclose(tty);
+                return passbuf;
+            }
+            if (have_tty_termios)
+            {
+                (void)tcsetattr(fileno(tty), TCSANOW, &old_tio);
+            }
+            fputs("\n", tty);
+            fflush(tty);
+            fclose(tty);
+        }
+        else
+        {
+            fputs(prompt, stderr);
+            fflush(stderr);
+            if (!fgets(passbuf, sizeof(passbuf), stdin))
+            {
+                passbuf[0] = '\0';
+                return passbuf;
+            }
+        }
+    }
+
+    nl = strchr(passbuf, '\n');
+    if (nl)
+    {
+        *nl = '\0';
+    }
+    return passbuf;
+}
+
+int daemon(int nochdir, int noclose)
+{
+    pid_t pid;
+    int fd;
+
+    pid = fork();
+    if (pid < 0)
+    {
+        return -1;
+    }
+    if (pid > 0)
+    {
+        _exit(0);
+    }
+
+    if (setsid() < 0)
+    {
+        return -1;
+    }
+
+    if (!nochdir)
+    {
+        (void)chdir("/");
+    }
+
+    if (!noclose)
+    {
+        fd = open("/dev/null", O_RDWR, 0);
+        if (fd >= 0)
+        {
+            (void)dup2(fd, 0);
+            (void)dup2(fd, 1);
+            (void)dup2(fd, 2);
+            if (fd > 2)
+            {
+                close(fd);
+            }
+        }
+    }
+
+    return 0;
 }
 
 size_t wcslen(const wchar_t *s)
@@ -1282,6 +1974,98 @@ size_t wcstombs(char *dst, const wchar_t *src, size_t len)
     return i;
 }
 
+int wmemcmp(const wchar_t *lhs, const wchar_t *rhs, size_t n)
+{
+    size_t i;
+
+    for (i = 0; i < n; i++)
+    {
+        if (lhs[i] != rhs[i])
+        {
+            return (lhs[i] < rhs[i]) ? -1 : 1;
+        }
+    }
+    return 0;
+}
+
+size_t mbrtowc(wchar_t *pwc, const char *s, size_t n, mbstate_t *ps)
+{
+    (void)ps;
+
+    if (!s)
+    {
+        return 0;
+    }
+    if (n == 0)
+    {
+        return (size_t)-2;
+    }
+    if (*s == '\0')
+    {
+        if (pwc)
+        {
+            *pwc = L'\0';
+        }
+        return 0;
+    }
+    if (pwc)
+    {
+        *pwc = (wchar_t)(unsigned char)*s;
+    }
+    return 1;
+}
+
+size_t mbrlen(const char *s, size_t n, mbstate_t *ps)
+{
+    return mbrtowc(0, s, n, ps);
+}
+
+size_t wcsxfrm(wchar_t *dst, const wchar_t *src, size_t n)
+{
+    size_t len;
+    size_t i;
+
+    len = wcslen(src);
+    if (!dst || n == 0)
+    {
+        return len;
+    }
+
+    for (i = 0; i + 1 < n && src[i] != L'\0'; i++)
+    {
+        dst[i] = src[i];
+    }
+    dst[i] = L'\0';
+    return len;
+}
+
+int wcscoll(const wchar_t *lhs, const wchar_t *rhs)
+{
+    return wcscmp(lhs, rhs);
+}
+
+size_t wcsftime(wchar_t *s, size_t max, const wchar_t *fmt, const struct tm *tm)
+{
+    size_t i;
+
+    (void)tm;
+    if (!s || max == 0 || !fmt)
+    {
+        return 0;
+    }
+
+    /*
+     * 先做最小实现：直接把格式串透传给调用方，避免依赖完整 strftime。
+     * 这足够让 CPython 的 time 模块基本路径继续运行，不会在链接期缺符号。
+     */
+    for (i = 0; i + 1 < max && fmt[i] != L'\0'; i++)
+    {
+        s[i] = fmt[i];
+    }
+    s[i] = L'\0';
+    return i;
+}
+
 int abs(int x)
 {
     return x < 0 ? -x : x;
@@ -1295,6 +2079,18 @@ long labs(long x)
 long long llabs(long long x)
 {
     return x < 0 ? -x : x;
+}
+
+void sincos(double x, double *sinx, double *cosx)
+{
+    if (sinx)
+    {
+        *sinx = sin(x);
+    }
+    if (cosx)
+    {
+        *cosx = cos(x);
+    }
 }
 
 char *getenv(const char *name)
@@ -1357,6 +2153,16 @@ char *bindtextdomain(const char *domainname, const char *dirname)
 {
     (void)domainname;
     return (char *)dirname;
+}
+
+char *bind_textdomain_codeset(const char *domainname, const char *codeset)
+{
+    (void)domainname;
+    if (!codeset)
+    {
+        return u_langinfo_codeset;
+    }
+    return (char *)codeset;
 }
 
 char *textdomain(const char *domainname)
@@ -1454,6 +2260,184 @@ struct passwd *getpwnam(const char *name)
 
     errno = ENOENT;
     return 0;
+}
+
+static int u_passwd_copy_to_buf(const struct passwd *src, struct passwd *dst, char *buf, size_t buflen)
+{
+    size_t need;
+    char *p;
+
+    if (!src || !dst || !buf)
+    {
+        return EINVAL;
+    }
+
+    need = strlen(src->pw_name) + 1U
+           + strlen(src->pw_passwd) + 1U
+           + strlen(src->pw_gecos) + 1U
+           + strlen(src->pw_dir) + 1U
+           + strlen(src->pw_shell) + 1U;
+    if (need > buflen)
+    {
+        return ERANGE;
+    }
+
+    p = buf;
+    strcpy(p, src->pw_name);
+    dst->pw_name = p;
+    p += strlen(p) + 1U;
+
+    strcpy(p, src->pw_passwd);
+    dst->pw_passwd = p;
+    p += strlen(p) + 1U;
+
+    strcpy(p, src->pw_gecos);
+    dst->pw_gecos = p;
+    p += strlen(p) + 1U;
+
+    strcpy(p, src->pw_dir);
+    dst->pw_dir = p;
+    p += strlen(p) + 1U;
+
+    strcpy(p, src->pw_shell);
+    dst->pw_shell = p;
+
+    dst->pw_uid = src->pw_uid;
+    dst->pw_gid = src->pw_gid;
+    return 0;
+}
+
+int getpwuid_r(uid_t uid, struct passwd *pwd, char *buf, size_t buflen, struct passwd **result)
+{
+    struct passwd *found;
+    int ret;
+
+    if (!pwd || !buf || !result)
+    {
+        return EINVAL;
+    }
+
+    found = getpwuid(uid);
+    if (!found)
+    {
+        *result = 0;
+        return errno ? errno : ENOENT;
+    }
+
+    ret = u_passwd_copy_to_buf(found, pwd, buf, buflen);
+    if (ret != 0)
+    {
+        *result = 0;
+        return ret;
+    }
+    *result = pwd;
+    return 0;
+}
+
+int getpwnam_r(const char *name, struct passwd *pwd, char *buf, size_t buflen, struct passwd **result)
+{
+    struct passwd *found;
+    int ret;
+
+    if (!pwd || !buf || !result)
+    {
+        return EINVAL;
+    }
+
+    found = getpwnam(name);
+    if (!found)
+    {
+        *result = 0;
+        return errno ? errno : ENOENT;
+    }
+
+    ret = u_passwd_copy_to_buf(found, pwd, buf, buflen);
+    if (ret != 0)
+    {
+        *result = 0;
+        return ret;
+    }
+    *result = pwd;
+    return 0;
+}
+
+void setpwent(void)
+{
+    u_passwd_iter_index = 0;
+}
+
+void endpwent(void)
+{
+    u_passwd_iter_index = 0;
+}
+
+struct passwd *getpwent(void)
+{
+    if (u_passwd_iter_index == 0)
+    {
+        u_passwd_iter_index = 1;
+        return getpwuid(0);
+    }
+    if (u_passwd_iter_index == 1)
+    {
+        u_passwd_iter_index = 2;
+        return getpwuid(1000);
+    }
+    return 0;
+}
+
+struct group *getgrgid(gid_t gid)
+{
+    if (gid == 0)
+    {
+        u_group_root.gr_name = (char *)"root";
+        u_group_root.gr_passwd = (char *)"x";
+        u_group_root.gr_gid = 0;
+        u_group_root.gr_mem = u_group_root_members;
+        return &u_group_root;
+    }
+
+    u_group_user.gr_name = (char *)"user";
+    u_group_user.gr_passwd = (char *)"x";
+    u_group_user.gr_gid = gid;
+    u_group_user.gr_mem = u_group_user_members;
+    return &u_group_user;
+}
+
+struct group *getgrnam(const char *name)
+{
+    if (!name)
+    {
+        errno = EINVAL;
+        return 0;
+    }
+    if (strcmp(name, "root") == 0)
+    {
+        return getgrgid(0);
+    }
+    if (strcmp(name, "user") == 0)
+    {
+        return getgrgid(1000);
+    }
+    errno = ENOENT;
+    return 0;
+}
+
+int getgrouplist(const char *user, gid_t group, gid_t *groups, int *ngroups)
+{
+    (void)user;
+    if (!ngroups || *ngroups <= 0)
+    {
+        return -1;
+    }
+    if (!groups)
+    {
+        return -1;
+    }
+
+    groups[0] = group;
+    *ngroups = 1;
+    return 1;
 }
 
 DIR *opendir(const char *name)
@@ -1634,6 +2618,31 @@ int getppid(void)
     return u_getppid();
 }
 
+char *getlogin(void)
+{
+    return (char *)"user";
+}
+
+int getloadavg(double loadavg[], int nelem)
+{
+    int i;
+
+    if (!loadavg || nelem <= 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    if (nelem > 3)
+    {
+        nelem = 3;
+    }
+    for (i = 0; i < nelem; i++)
+    {
+        loadavg[i] = 0.0;
+    }
+    return nelem;
+}
+
 pid_t gettid(void)
 {
     return (pid_t)u_sysret_int((int64_t)u_gettid());
@@ -1662,6 +2671,78 @@ int getegid(void)
 int sched_getaffinity(pid_t pid, size_t cpusetsize, cpu_set_t *mask)
 {
     return u_sysret_int((int64_t)u_sched_getaffinity((int)pid, cpusetsize, mask));
+}
+
+int sched_setaffinity(pid_t pid, size_t cpusetsize, const cpu_set_t *mask)
+{
+    (void)pid;
+    (void)cpusetsize;
+    (void)mask;
+    errno = ENOSYS;
+    return -1;
+}
+
+int sched_get_priority_max(int policy)
+{
+    (void)policy;
+    return 0;
+}
+
+int sched_get_priority_min(int policy)
+{
+    (void)policy;
+    return 0;
+}
+
+int sched_getscheduler(pid_t pid)
+{
+    (void)pid;
+    return SCHED_OTHER;
+}
+
+int sched_setscheduler(pid_t pid, int policy, const struct sched_param *param)
+{
+    (void)pid;
+    (void)policy;
+    (void)param;
+    errno = ENOSYS;
+    return -1;
+}
+
+int sched_getparam(pid_t pid, struct sched_param *param)
+{
+    (void)pid;
+    if (param)
+    {
+        param->sched_priority = 0;
+    }
+    return 0;
+}
+
+int sched_setparam(pid_t pid, const struct sched_param *param)
+{
+    (void)pid;
+    (void)param;
+    errno = ENOSYS;
+    return -1;
+}
+
+int sched_rr_get_interval(pid_t pid, struct timespec *tp)
+{
+    (void)pid;
+    if (!tp)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    tp->tv_sec = 0;
+    tp->tv_nsec = 0;
+    return 0;
+}
+
+int sched_yield(void)
+{
+    return 0;
 }
 
 int sysinfo(struct sysinfo *info)
@@ -1732,6 +2813,107 @@ int setregid(gid_t rgid, gid_t egid)
         errno = EPERM;
         return -1;
     }
+    return 0;
+}
+
+pid_t getpgrp(void)
+{
+    return 1;
+}
+
+pid_t getpgid(pid_t pid)
+{
+    (void)pid;
+    return 1;
+}
+
+int setpgid(pid_t pid, pid_t pgid)
+{
+    (void)pid;
+    (void)pgid;
+    return 0;
+}
+
+pid_t setsid(void)
+{
+    return 1;
+}
+
+pid_t getsid(pid_t pid)
+{
+    (void)pid;
+    return 1;
+}
+
+int setpgrp(void)
+{
+    return setpgid(0, 0);
+}
+
+int getpriority(int which, id_t who)
+{
+    (void)which;
+    (void)who;
+    return 0;
+}
+
+int setpriority(int which, id_t who, int prio)
+{
+    (void)which;
+    (void)who;
+    (void)prio;
+    return 0;
+}
+
+int getresuid(uid_t *ruid, uid_t *euid, uid_t *suid)
+{
+    if (ruid)
+    {
+        *ruid = (uid_t)u_getuid();
+    }
+    if (euid)
+    {
+        *euid = (uid_t)u_geteuid();
+    }
+    if (suid)
+    {
+        *suid = (uid_t)u_getuid();
+    }
+    return 0;
+}
+
+int getresgid(gid_t *rgid, gid_t *egid, gid_t *sgid)
+{
+    if (rgid)
+    {
+        *rgid = (gid_t)u_getgid();
+    }
+    if (egid)
+    {
+        *egid = (gid_t)u_getegid();
+    }
+    if (sgid)
+    {
+        *sgid = (gid_t)u_getgid();
+    }
+    return 0;
+}
+
+int setresuid(uid_t ruid, uid_t euid, uid_t suid)
+{
+    (void)suid;
+    return setreuid(ruid, euid);
+}
+
+int setresgid(gid_t rgid, gid_t egid, gid_t sgid)
+{
+    (void)sgid;
+    return setregid(rgid, egid);
+}
+
+int nice(int inc)
+{
+    (void)inc;
     return 0;
 }
 
@@ -1826,6 +3008,19 @@ int gettimeofday(struct timeval *tv, void *tz)
 int isatty(int fd)
 {
     return u_isatty(fd);
+}
+
+pid_t tcgetpgrp(int fd)
+{
+    (void)fd;
+    return (pid_t)1;
+}
+
+int tcsetpgrp(int fd, pid_t pgrp)
+{
+    (void)fd;
+    (void)pgrp;
+    return 0;
 }
 
 char *ttyname(int fd)
@@ -2012,6 +3207,96 @@ int renameat2(int olddirfd, const char *oldpath, int newdirfd, const char *newpa
     }
 
     return renameat(olddirfd, oldpath, newdirfd, newpath);
+}
+
+int chflags(const char *path, unsigned long flags)
+{
+    (void)path;
+    (void)flags;
+    errno = ENOTSUP;
+    return -1;
+}
+
+int lchflags(const char *path, unsigned long flags)
+{
+    return chflags(path, flags);
+}
+
+char *ctermid(char *s)
+{
+    static char u_ctermid_default[] = "/dev/tty";
+
+    if (!s)
+    {
+        return u_ctermid_default;
+    }
+    strcpy(s, u_ctermid_default);
+    return s;
+}
+
+int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, int flags)
+{
+    (void)flags;
+    if (olddirfd != AT_FDCWD || newdirfd != AT_FDCWD)
+    {
+        errno = ENOTSUP;
+        return -1;
+    }
+    return link(oldpath, newpath);
+}
+
+int symlinkat(const char *target, int newdirfd, const char *linkpath)
+{
+    if (newdirfd != AT_FDCWD)
+    {
+        errno = ENOTSUP;
+        return -1;
+    }
+    return symlink(target, linkpath);
+}
+
+int lchown(const char *path, uid_t owner, gid_t group)
+{
+    return chown(path, owner, group);
+}
+
+int mkfifo(const char *path, mode_t mode)
+{
+    (void)path;
+    (void)mode;
+    return u_errno_rofs();
+}
+
+int mkfifoat(int dirfd, const char *path, mode_t mode)
+{
+    if (dirfd != AT_FDCWD)
+    {
+        errno = ENOTSUP;
+        return -1;
+    }
+    return mkfifo(path, mode);
+}
+
+int futimens(int fd, const struct timespec times[2])
+{
+    (void)fd;
+    (void)times;
+    return 0;
+}
+
+int openat64(int dirfd, const char *path, int flags, ...)
+{
+    mode_t mode = 0;
+    va_list ap;
+
+    if (flags & O_CREAT)
+    {
+        va_start(ap, flags);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+        return openat(dirfd, path, flags, mode);
+    }
+    return openat(dirfd, path, flags);
 }
 
 int fchmodat(int dirfd, const char *path, mode_t mode, int flags)
@@ -2266,16 +3551,34 @@ int openat(int dirfd, const char *path, int flags, ...)
 
 int close(int fd)
 {
+    bool is_write_end;
+
+    if (u_pipe_slot_from_fd(fd, &is_write_end))
+    {
+        return u_pipe_close(fd);
+    }
     return u_sysret_int((int64_t)u_close(fd));
 }
 
 ssize_t read(int fd, void *buf, size_t len)
 {
+    bool is_write_end;
+
+    if (u_pipe_slot_from_fd(fd, &is_write_end))
+    {
+        return u_pipe_read(fd, buf, len);
+    }
     return u_sysret_ssize((int64_t)u_read(fd, buf, len));
 }
 
 ssize_t write(int fd, const void *buf, size_t len)
 {
+    bool is_write_end;
+
+    if (u_pipe_slot_from_fd(fd, &is_write_end))
+    {
+        return u_pipe_write(fd, buf, len);
+    }
     return u_sysret_ssize((int64_t)u_write(fd, buf, len));
 }
 
@@ -2289,36 +3592,185 @@ off_t lseek64(int fd, off_t offset, int whence)
     return u_sysret_off((int64_t)u_lseek(fd, offset, whence));
 }
 
+static void u_fill_stat(struct stat *out, const struct stupidos_stat *kst)
+{
+    if (!out || !kst)
+    {
+        return;
+    }
+
+    memset((int8_t *)out, 0, sizeof(*out));
+    out->st_dev = 0;
+    out->st_ino = (ino_t)kst->ino;
+    out->st_mode = (mode_t)kst->mode;
+    out->st_nlink = (nlink_t)kst->nlink;
+    out->st_uid = (uid_t)kst->uid;
+    out->st_gid = (gid_t)kst->gid;
+    out->st_rdev = 0;
+    out->st_size = (off_t)kst->size;
+    out->st_blksize = (blksize_t)(kst->blksize ? kst->blksize : 4096U);
+    out->st_blocks = (blkcnt_t)kst->blocks;
+    out->st_atime = 0;
+    out->st_mtime = 0;
+    out->st_ctime = 0;
+}
+
 int stat(const char *path, struct stat *out)
 {
-    return u_sysret_int((int64_t)u_stat((const int8_t *)path, (struct stupidos_stat *)out));
+    struct stupidos_stat kst;
+    int64_t ret;
+
+    if (!out)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    ret = (int64_t)u_stat((const int8_t *)path, &kst);
+    if (u_sysret_is_error(ret))
+    {
+        errno = (int)(-ret);
+        return -1;
+    }
+
+    u_fill_stat(out, &kst);
+    return 0;
 }
 
 int fstat(int fd, struct stat *out)
 {
-    return u_sysret_int((int64_t)u_fstat(fd, (struct stupidos_stat *)out));
+    struct stupidos_stat kst;
+    int64_t ret;
+    bool is_write_end;
+
+    if (!out)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (u_pipe_slot_from_fd(fd, &is_write_end))
+    {
+        memset((int8_t *)out, 0, sizeof(*out));
+        out->st_mode = (mode_t)(S_IFIFO | 0600);
+        out->st_nlink = 1;
+        out->st_blksize = 4096;
+        return 0;
+    }
+
+    ret = (int64_t)u_fstat(fd, &kst);
+    if (u_sysret_is_error(ret))
+    {
+        errno = (int)(-ret);
+        return -1;
+    }
+
+    u_fill_stat(out, &kst);
+    return 0;
 }
 
 int stat64(const char *path, struct stat64 *out)
 {
-    return u_sysret_int((int64_t)u_stat((const int8_t *)path, (struct stupidos_stat *)out));
+    struct stupidos_stat kst;
+    int64_t ret;
+
+    if (!out)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    ret = (int64_t)u_stat((const int8_t *)path, &kst);
+    if (u_sysret_is_error(ret))
+    {
+        errno = (int)(-ret);
+        return -1;
+    }
+
+    /*
+     * 某些头文件组合下 struct stat64 只有前置声明。
+     * AArch64 上 stat/stat64 布局一致，这里按 struct stat 填充即可。
+     */
+    u_fill_stat((struct stat *)out, &kst);
+    return 0;
 }
 
 int fstat64(int fd, struct stat64 *out)
 {
-    return u_sysret_int((int64_t)u_fstat(fd, (struct stupidos_stat *)out));
+    struct stupidos_stat kst;
+    int64_t ret;
+    bool is_write_end;
+
+    if (!out)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (u_pipe_slot_from_fd(fd, &is_write_end))
+    {
+        memset((int8_t *)out, 0, sizeof(struct stat));
+        ((struct stat *)out)->st_mode = (mode_t)(S_IFIFO | 0600);
+        ((struct stat *)out)->st_nlink = 1;
+        ((struct stat *)out)->st_blksize = 4096;
+        return 0;
+    }
+
+    ret = (int64_t)u_fstat(fd, &kst);
+    if (u_sysret_is_error(ret))
+    {
+        errno = (int)(-ret);
+        return -1;
+    }
+
+    u_fill_stat((struct stat *)out, &kst);
+    return 0;
 }
 
 int fstatat(int dirfd, const char *path, struct stat *out, int flags)
 {
+    struct stupidos_stat kst;
+    int64_t ret;
+
     (void)flags;
-    return u_sysret_int((int64_t)u_fstatat(dirfd, (const int8_t *)path, (struct stupidos_stat *)out));
+    if (!out)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    ret = (int64_t)u_fstatat(dirfd, (const int8_t *)path, &kst);
+    if (u_sysret_is_error(ret))
+    {
+        errno = (int)(-ret);
+        return -1;
+    }
+
+    u_fill_stat(out, &kst);
+    return 0;
 }
 
 int fstatat64(int dirfd, const char *path, struct stat64 *out, int flags)
 {
+    struct stupidos_stat kst;
+    int64_t ret;
+
     (void)flags;
-    return u_sysret_int((int64_t)u_fstatat(dirfd, (const int8_t *)path, (struct stupidos_stat *)out));
+    if (!out)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    ret = (int64_t)u_fstatat(dirfd, (const int8_t *)path, &kst);
+    if (u_sysret_is_error(ret))
+    {
+        errno = (int)(-ret);
+        return -1;
+    }
+
+    u_fill_stat((struct stat *)out, &kst);
+    return 0;
 }
 
 int newfstatat(int dirfd, const char *path, struct stat *out, int flags)
@@ -2346,6 +3798,69 @@ int lstat64(const char *path, struct stat64 *out)
     return stat64(path, out);
 }
 
+int __xstat64(int ver, const char *path, struct stat64 *out)
+{
+    (void)ver;
+    return stat64(path, out);
+}
+
+int __fxstat64(int ver, int fd, struct stat64 *out)
+{
+    (void)ver;
+    return fstat64(fd, out);
+}
+
+int __lxstat64(int ver, const char *path, struct stat64 *out)
+{
+    (void)ver;
+    return lstat64(path, out);
+}
+
+int __fxstatat64(int ver, int dirfd, const char *path, struct stat64 *out, int flags)
+{
+    (void)ver;
+    return fstatat64(dirfd, path, out, flags);
+}
+
+int __xmknod(int ver, const char *path, mode_t mode, dev_t *dev)
+{
+    (void)ver;
+    (void)path;
+    (void)mode;
+    (void)dev;
+    return u_errno_rofs();
+}
+
+int __xmknodat(int ver, int dirfd, const char *path, mode_t mode, dev_t *dev)
+{
+    (void)ver;
+    (void)dirfd;
+    (void)path;
+    (void)mode;
+    (void)dev;
+    return u_errno_rofs();
+}
+
+int statvfs64(const char *path, struct statvfs *buf)
+{
+    (void)path;
+    if (!buf)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(buf, 0, sizeof(*buf));
+    buf->f_bsize = 4096;
+    buf->f_frsize = 4096;
+    return 0;
+}
+
+int fstatvfs64(int fd, struct statvfs *buf)
+{
+    (void)fd;
+    return statvfs64("/", buf);
+}
+
 int chdir(const char *path)
 {
     return u_sysret_int((int64_t)u_chdir((const int8_t *)path));
@@ -2368,6 +3883,33 @@ int chroot(const char *path)
     (void)path;
     errno = ENOSYS;
     return -1;
+}
+
+int uname(struct utsname *buf)
+{
+    struct stupidos_utsname uts;
+    int ret;
+
+    if (!buf)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    ret = u_uname(&uts);
+    if (ret < 0)
+    {
+        errno = -ret;
+        return -1;
+    }
+
+    memset(buf, 0, sizeof(*buf));
+    strncpy(buf->sysname, (const char *)uts.sysname, sizeof(buf->sysname) - 1U);
+    strncpy(buf->nodename, (const char *)uts.nodename, sizeof(buf->nodename) - 1U);
+    strncpy(buf->release, (const char *)uts.release, sizeof(buf->release) - 1U);
+    strncpy(buf->version, (const char *)uts.version, sizeof(buf->version) - 1U);
+    strncpy(buf->machine, (const char *)uts.machine, sizeof(buf->machine) - 1U);
+    return 0;
 }
 
 char *getcwd(char *buf, size_t len)
@@ -2417,6 +3959,14 @@ char *getcwd(char *buf, size_t len)
 int clock_gettime(clockid_t clockid, struct timespec *out)
 {
     return u_sysret_int((int64_t)u_clock_gettime((int)clockid, (struct stupidos_timespec *)out));
+}
+
+int clock_settime(clockid_t clockid, const struct timespec *tp)
+{
+    (void)clockid;
+    (void)tp;
+    errno = ENOSYS;
+    return -1;
 }
 
 int clock_getres(clockid_t clockid, struct timespec *out)
@@ -2496,6 +4046,11 @@ time_t timegm(struct tm *tm)
          + (int64_t)tm->tm_min * 60LL
          + (int64_t)tm->tm_sec;
     return (time_t)secs;
+}
+
+time_t mktime(struct tm *tm)
+{
+    return timegm(tm);
 }
 
 static void u_civil_from_days(int64_t z, int64_t *year, unsigned *month, unsigned *day)
@@ -2619,6 +4174,140 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off)
     return (void *)(uint64_t)ret;
 }
 
+void *mmap64(void *addr, size_t len, int prot, int flags, int fd, off64_t off)
+{
+    return mmap(addr, len, prot, flags, fd, (off_t)off);
+}
+
+void *memrchr(const void *s, int c, size_t n)
+{
+    const unsigned char *p;
+    unsigned char ch;
+
+    if (!s || n == 0)
+    {
+        return 0;
+    }
+
+    p = (const unsigned char *)s + n;
+    ch = (unsigned char)c;
+    while (n--)
+    {
+        p--;
+        if (*p == ch)
+        {
+            return (void *)p;
+        }
+    }
+    return 0;
+}
+
+int sem_init(sem_t *sem, int pshared, unsigned int value)
+{
+    struct u_sem_slot *slot;
+
+    (void)pshared;
+    if (!sem)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    slot = u_sem_slot_find(sem);
+    if (!slot)
+    {
+        slot = u_sem_slot_alloc(sem);
+    }
+    if (!slot)
+    {
+        errno = ENOMEM;
+        return -1;
+    }
+
+    slot->value = (int)value;
+    return 0;
+}
+
+int sem_destroy(sem_t *sem)
+{
+    struct u_sem_slot *slot;
+
+    if (!sem)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    slot = u_sem_slot_find(sem);
+    if (!slot)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    slot->used = false;
+    slot->sem = 0;
+    slot->value = 0;
+    return 0;
+}
+
+int sem_post(sem_t *sem)
+{
+    struct u_sem_slot *slot;
+
+    slot = u_sem_slot_find(sem);
+    if (!slot)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    slot->value++;
+    return 0;
+}
+
+int sem_trywait(sem_t *sem)
+{
+    struct u_sem_slot *slot;
+
+    slot = u_sem_slot_find(sem);
+    if (!slot)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    if (slot->value <= 0)
+    {
+        errno = EAGAIN;
+        return -1;
+    }
+    slot->value--;
+    return 0;
+}
+
+int sem_wait(sem_t *sem)
+{
+    struct u_sem_slot *slot;
+
+    slot = u_sem_slot_find(sem);
+    if (!slot)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    while (slot->value <= 0)
+    {
+        (void)u_yield();
+    }
+    slot->value--;
+    return 0;
+}
+
+int sem_clockwait(sem_t *sem, clockid_t clockid, const struct timespec *abstime)
+{
+    (void)clockid;
+    (void)abstime;
+    return sem_wait(sem);
+}
+
 int munmap(void *addr, size_t len)
 {
     return u_sysret_int((int64_t)u_munmap(addr, len));
@@ -2640,93 +4329,316 @@ int fsync(int fd)
     return 0;
 }
 
+void sync(void)
+{
+}
+
 int fdatasync(int fd)
 {
     (void)fd;
     return 0;
 }
 
-static int u_select_sleep(const struct timeval *timeout)
+static void u_timespec_from_ms(struct stupidos_timespec *ts, uint32_t ms)
+{
+    if (!ts)
+    {
+        return;
+    }
+
+    ts->tv_sec = (int64_t)(ms / 1000U);
+    ts->tv_nsec = (int64_t)(ms % 1000U) * 1000000LL;
+}
+
+static int u_select_sleep_slice(void)
 {
     struct stupidos_timespec ts;
 
-    if (!timeout)
+    /*
+     * 只睡一个很小的时间片，避免把 select/poll 变成“长时间盯死”的轮询。
+     * 这样 stdin、socket、pty 这类输入路径都能更快被重新检查到。
+     */
+    u_timespec_from_ms(&ts, 1U);
+    return (int)u_nanosleep(&ts, 0);
+}
+
+static int u_fd_read_ready(int fd)
+{
+    int pending;
+    struct u_pipe_slot *pipe_slot;
+    bool is_write_end;
+
+    if (fd < 0)
     {
         return 0;
     }
 
-    if (timeout->tv_sec < 0 || timeout->tv_usec < 0)
+    pipe_slot = u_pipe_slot_from_fd(fd, &is_write_end);
+    if (pipe_slot)
     {
-        return EINVAL;
-    }
-
-    ts.tv_sec = (int64_t)timeout->tv_sec;
-    ts.tv_nsec = (int64_t)timeout->tv_usec * 1000LL;
-    if (ts.tv_nsec >= 1000000000LL)
-    {
-        ts.tv_sec += ts.tv_nsec / 1000000000LL;
-        ts.tv_nsec %= 1000000000LL;
+        if (is_write_end)
+        {
+            return 0;
+        }
+        return (pipe_slot->used_bytes > 0) || !pipe_slot->write_open;
     }
 
     /*
-     * 先把 select 退化成“超时等待”：
-     * - timemodule / selectors / subprocess 这类路径先能继续跑
-     * - 当前 stupidos 还没有完整的 fd 就绪唤醒链路
-     * - 后面接入真正的事件驱动后，再替换成精确等待
+     * 读取就绪统一走 FIONREAD 探测：
+     * - tty / stdin：pending > 0 时立刻返回
+     * - socket：后面 socket ioctl 会返回接收队列长度
+     * - 普通文件：ioctl 失败后按“总是可读”处理
      */
-    return (int)u_nanosleep((const struct stupidos_timespec *)&ts, 0);
+    pending = 0;
+    if (ioctl(fd, FIONREAD, &pending) == 0)
+    {
+        return pending > 0;
+    }
+
+    return 1;
 }
 
-static int u_select_count_ready(int nfds, fd_set *set)
+static int u_fd_write_ready(int fd)
 {
-    int fd;
-    int ready;
+    struct u_pipe_slot *pipe_slot;
+    bool is_write_end;
+    int so_error;
+    unsigned int so_len;
 
-    if (!set || nfds <= 0)
+    if (fd < 0)
     {
         return 0;
     }
 
-    ready = 0;
-    for (fd = 0; fd < nfds; ++fd)
+    pipe_slot = u_pipe_slot_from_fd(fd, &is_write_end);
+    if (pipe_slot)
     {
-        if (FD_ISSET(fd, set))
+        if (!is_write_end)
         {
-            ++ready;
+            return 0;
         }
+        return pipe_slot->read_open && pipe_slot->used_bytes < U_PIPE_BUF_SIZE;
     }
-    return ready;
+
+    /*
+     * 对非 stdin 的真实 fd 先按“通常可写”处理。
+     * 这里对 socket 额外询问 SO_ERROR：
+     * - EINPROGRESS 说明 connect 还没完成，先别把它当成可写
+     * - 其他值（包括 0）都交还给上层，让 dropbear 走自己的处理逻辑
+     *
+     * 这样 SSH 的 nonblocking connect 就不会在“连接未完成”时被
+     * select/poll 误判为可写，从而出现静默等待或者假连接。
+     */
+    if (fd == 0)
+    {
+        return 0;
+    }
+
+    so_error = 0;
+    so_len = sizeof(so_error);
+    if (u_getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &so_len) == 0)
+    {
+        return so_error != EINPROGRESS;
+    }
+
+    return 1;
+}
+
+static int u_fd_except_ready(int fd)
+{
+    (void)fd;
+    return 0;
 }
 
 int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout)
 {
     int ready;
-    int ret;
+    int fd;
+    struct timeval deadline;
+    struct timeval now;
+    struct timeval rem;
+    int have_timeout;
+    fd_set read_orig;
+    fd_set write_orig;
+    fd_set except_orig;
+    fd_set read_work;
+    fd_set write_work;
+    fd_set except_work;
 
-    ret = u_select_sleep(timeout);
-    if (ret < 0)
+    if (nfds < 0)
     {
-        errno = -ret;
+        errno = EINVAL;
         return -1;
     }
 
-    /*
-     * 当前没有完整的 fd 就绪通知链路。
-     * 为了让 CPython 以及大量基于 select 轮询的库继续推进，
-     * 我们先把传入的 fd 视为“可用”。
-     *
-     * 这样会让上层逻辑偏向“立即返回”，但比卡死更有利于迁移。
-     */
-    ready = u_select_count_ready(nfds, readfds)
-          + u_select_count_ready(nfds, writefds)
-          + u_select_count_ready(nfds, exceptfds);
-
-    if (readfds || writefds || exceptfds)
+    have_timeout = timeout != 0;
+    if (have_timeout)
     {
-        return ready;
+        if (timeout->tv_sec < 0 || timeout->tv_usec < 0)
+        {
+            errno = EINVAL;
+            return -1;
+        }
+
+        if (u_gettimeofday((struct stupidos_timeval *)&now) < 0)
+        {
+            now.tv_sec = 0;
+            now.tv_usec = 0;
+        }
+        deadline.tv_sec = now.tv_sec + timeout->tv_sec;
+        deadline.tv_usec = now.tv_usec + timeout->tv_usec;
+        if (deadline.tv_usec >= 1000000)
+        {
+            deadline.tv_sec += deadline.tv_usec / 1000000;
+            deadline.tv_usec %= 1000000;
+        }
     }
 
-    return 0;
+    if (readfds)
+    {
+        read_orig = *readfds;
+    }
+    if (writefds)
+    {
+        write_orig = *writefds;
+    }
+    if (exceptfds)
+    {
+        except_orig = *exceptfds;
+    }
+
+    for (;;)
+    {
+        ready = 0;
+        if (readfds)
+        {
+            read_work = read_orig;
+            for (fd = 0; fd < nfds; ++fd)
+            {
+                if (!FD_ISSET(fd, &read_work))
+                {
+                    continue;
+                }
+                if (u_fd_read_ready(fd))
+                {
+                    ready++;
+                }
+                else
+                {
+                    FD_CLR(fd, &read_work);
+                }
+            }
+        }
+
+        if (writefds)
+        {
+            write_work = write_orig;
+            for (fd = 0; fd < nfds; ++fd)
+            {
+                if (!FD_ISSET(fd, &write_work))
+                {
+                    continue;
+                }
+                if (u_fd_write_ready(fd))
+                {
+                    ready++;
+                }
+                else
+                {
+                    FD_CLR(fd, &write_work);
+                }
+            }
+        }
+
+        if (exceptfds)
+        {
+            except_work = except_orig;
+            for (fd = 0; fd < nfds; ++fd)
+            {
+                if (!FD_ISSET(fd, &except_work))
+                {
+                    continue;
+                }
+                if (u_fd_except_ready(fd))
+                {
+                    ready++;
+                }
+                else
+                {
+                    FD_CLR(fd, &except_work);
+                }
+            }
+        }
+
+        if (ready > 0)
+        {
+            if (readfds)
+            {
+                *readfds = read_work;
+            }
+            if (writefds)
+            {
+                *writefds = write_work;
+            }
+            if (exceptfds)
+            {
+                *exceptfds = except_work;
+            }
+            return ready;
+        }
+
+        if (!have_timeout)
+        {
+            if (u_select_sleep_slice() < 0)
+            {
+                errno = EINTR;
+                return -1;
+            }
+            continue;
+        }
+
+        if (u_gettimeofday((struct stupidos_timeval *)&now) < 0)
+        {
+            errno = EIO;
+            return -1;
+        }
+
+        if (now.tv_sec > deadline.tv_sec || (now.tv_sec == deadline.tv_sec && now.tv_usec >= deadline.tv_usec))
+        {
+            if (readfds)
+            {
+                FD_ZERO(readfds);
+            }
+            if (writefds)
+            {
+                FD_ZERO(writefds);
+            }
+            if (exceptfds)
+            {
+                FD_ZERO(exceptfds);
+            }
+            return 0;
+        }
+
+        rem.tv_sec = deadline.tv_sec - now.tv_sec;
+        rem.tv_usec = deadline.tv_usec - now.tv_usec;
+        if (rem.tv_usec < 0)
+        {
+            rem.tv_sec--;
+            rem.tv_usec += 1000000;
+        }
+        if (rem.tv_sec > 0 || rem.tv_usec > 1000)
+        {
+            rem.tv_sec = 0;
+            rem.tv_usec = 1000;
+        }
+
+        if (u_nanosleep((const struct stupidos_timespec *)&(struct stupidos_timespec){ .tv_sec = rem.tv_sec, .tv_nsec = rem.tv_usec * 1000LL }, 0) < 0)
+        {
+            errno = EINTR;
+            return -1;
+        }
+    }
 }
 
 int pselect(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, const struct timespec *timeout, const sigset_t *sigmask)
@@ -2748,6 +4660,198 @@ int pselect(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, cons
     }
 
     return select(nfds, readfds, writefds, exceptfds, tvp);
+}
+
+static void u_termios_init_once(void)
+{
+    if (u_termios_state_ready)
+    {
+        return;
+    }
+
+    memset((char *)&u_termios_state, 0, sizeof(u_termios_state));
+    u_termios_state.c_iflag = ICRNL | IXON;
+    u_termios_state.c_oflag = OPOST | ONLCR;
+    u_termios_state.c_cflag = CS8 | CREAD;
+    u_termios_state.c_lflag = ISIG | ICANON | ECHO | ECHOE | ECHOK;
+    u_termios_state.c_cc[VMIN] = 1;
+    u_termios_state.c_cc[VTIME] = 0;
+    u_termios_state_ready = true;
+}
+
+int tcgetattr(int fd, struct termios *termios_p)
+{
+    if (!termios_p)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!isatty(fd))
+    {
+        errno = ENOTTY;
+        return -1;
+    }
+
+    /*
+     * 优先向内核同步真实 tty 状态（ECHO/ICANON），
+     * 失败时再回退到用户态缓存，保证老路径兼容。
+     */
+    if (ioctl(fd, TCGETS, termios_p) == 0)
+    {
+        u_termios_state = *termios_p;
+        u_termios_state_ready = true;
+        return 0;
+    }
+
+    u_termios_init_once();
+    *termios_p = u_termios_state;
+    return 0;
+}
+
+int tcsetattr(int fd, int optional_actions, const struct termios *termios_p)
+{
+    unsigned long req;
+
+    if (!termios_p)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!isatty(fd))
+    {
+        errno = ENOTTY;
+        return -1;
+    }
+
+    req = TCSETS;
+    if (optional_actions == TCSADRAIN)
+    {
+        req = TCSETSW;
+    }
+    else if (optional_actions == TCSAFLUSH)
+    {
+        req = TCSETSF;
+    }
+
+    (void)ioctl(fd, req, (void *)termios_p);
+    u_termios_state = *termios_p;
+    u_termios_state_ready = true;
+    return 0;
+}
+
+int poll(struct pollfd *fds, nfds_t nfds, int timeout)
+{
+    fd_set rfds;
+    fd_set wfds;
+    fd_set efds;
+    struct timeval tv;
+    struct timeval *tvp;
+    int maxfd;
+    int ret;
+    nfds_t i;
+    int ready;
+
+    if (!fds && nfds)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    FD_ZERO(&rfds);
+    FD_ZERO(&wfds);
+    FD_ZERO(&efds);
+    maxfd = -1;
+    for (i = 0; i < nfds; i++)
+    {
+        fds[i].revents = 0;
+        if (fds[i].fd < 0)
+        {
+            continue;
+        }
+        if (fds[i].events & (POLLIN | POLLPRI))
+        {
+            FD_SET(fds[i].fd, &rfds);
+        }
+        if (fds[i].events & POLLOUT)
+        {
+            FD_SET(fds[i].fd, &wfds);
+        }
+        if (fds[i].events & POLLERR)
+        {
+            FD_SET(fds[i].fd, &efds);
+        }
+        if (fds[i].fd > maxfd)
+        {
+            maxfd = fds[i].fd;
+        }
+    }
+
+    if (timeout < 0)
+    {
+        tvp = 0;
+    }
+    else
+    {
+        tv.tv_sec = (time_t)(timeout / 1000);
+        tv.tv_usec = (suseconds_t)((timeout % 1000) * 1000);
+        tvp = &tv;
+    }
+
+    ret = select(maxfd + 1, &rfds, &wfds, &efds, tvp);
+    if (ret <= 0)
+    {
+        return ret;
+    }
+
+    ready = 0;
+    for (i = 0; i < nfds; i++)
+    {
+        short revents = 0;
+        if (fds[i].fd < 0)
+        {
+            continue;
+        }
+        if (FD_ISSET(fds[i].fd, &rfds))
+        {
+            revents |= POLLIN;
+        }
+        if (FD_ISSET(fds[i].fd, &wfds))
+        {
+            revents |= POLLOUT;
+        }
+        if (FD_ISSET(fds[i].fd, &efds))
+        {
+            revents |= POLLERR;
+        }
+        fds[i].revents = revents;
+        if (revents)
+        {
+            ready++;
+        }
+    }
+
+    return ready;
+}
+
+int ppoll(struct pollfd *fds, nfds_t nfds, const struct timespec *timeout_ts, const sigset_t *sigmask)
+{
+    int timeout;
+
+    (void)sigmask;
+    if (!timeout_ts)
+    {
+        timeout = -1;
+    }
+    else
+    {
+        if (timeout_ts->tv_sec < 0 || timeout_ts->tv_nsec < 0)
+        {
+            errno = EINVAL;
+            return -1;
+        }
+        timeout = (int)(timeout_ts->tv_sec * 1000 + timeout_ts->tv_nsec / 1000000);
+    }
+    return poll(fds, nfds, timeout);
 }
 
 /*
@@ -2893,6 +4997,17 @@ int pthread_condattr_setclock(pthread_condattr_t *attr, clockid_t clock_id)
 {
     (void)attr;
     (void)clock_id;
+    return 0;
+}
+
+int pthread_getcpuclockid(pthread_t thread_id, clockid_t *clock_id)
+{
+    (void)thread_id;
+    if (!clock_id)
+    {
+        return EINVAL;
+    }
+    *clock_id = CLOCK_MONOTONIC;
     return 0;
 }
 
@@ -3306,10 +5421,168 @@ ssize_t pwrite(int fd, const void *buf, size_t len, off_t off)
     return u_sysret_ssize((int64_t)u_pwrite64(fd, buf, len, (uint64_t)off));
 }
 
+ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
+{
+    struct stupidos_iovec tmp[16];
+    int i;
+
+    if (!iov || iovcnt < 0 || iovcnt > 16)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    for (i = 0; i < iovcnt; i++)
+    {
+        tmp[i].iov_base = iov[i].iov_base;
+        tmp[i].iov_len = (uint64_t)iov[i].iov_len;
+    }
+    return u_sysret_ssize((int64_t)u_readv(fd, tmp, iovcnt));
+}
+
+ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
+{
+    struct stupidos_iovec tmp[16];
+    int i;
+
+    if (!iov || iovcnt < 0 || iovcnt > 16)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    for (i = 0; i < iovcnt; i++)
+    {
+        tmp[i].iov_base = (void *)iov[i].iov_base;
+        tmp[i].iov_len = (uint64_t)iov[i].iov_len;
+    }
+    return u_sysret_ssize((int64_t)u_writev(fd, tmp, iovcnt));
+}
+
+ssize_t preadv64v2(int fd, const struct iovec *iov, int iovcnt, off64_t off, int flags)
+{
+    ssize_t total;
+    int i;
+
+    (void)flags;
+    if (!iov || iovcnt < 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    total = 0;
+    for (i = 0; i < iovcnt; i++)
+    {
+        ssize_t n = pread(fd, iov[i].iov_base, iov[i].iov_len, (off_t)off);
+        if (n < 0)
+        {
+            return (total > 0) ? total : -1;
+        }
+        total += n;
+        if ((size_t)n < iov[i].iov_len)
+        {
+            break;
+        }
+        off += (off64_t)n;
+    }
+    return total;
+}
+
+ssize_t pwritev64v2(int fd, const struct iovec *iov, int iovcnt, off64_t off, int flags)
+{
+    ssize_t total;
+    int i;
+
+    (void)flags;
+    if (!iov || iovcnt < 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    total = 0;
+    for (i = 0; i < iovcnt; i++)
+    {
+        ssize_t n = pwrite(fd, iov[i].iov_base, iov[i].iov_len, (off_t)off);
+        if (n < 0)
+        {
+            return (total > 0) ? total : -1;
+        }
+        total += n;
+        if ((size_t)n < iov[i].iov_len)
+        {
+            break;
+        }
+        off += (off64_t)n;
+    }
+    return total;
+}
+
+ssize_t sendfile64(int out_fd, int in_fd, off64_t *offset, size_t count)
+{
+    uint8_t buf[4096];
+    size_t done;
+    ssize_t rd;
+    ssize_t wr;
+    off_t off;
+
+    done = 0;
+    off = offset ? (off_t)(*offset) : lseek(in_fd, 0, SEEK_CUR);
+    while (done < count)
+    {
+        size_t chunk = count - done;
+        if (chunk > sizeof(buf))
+        {
+            chunk = sizeof(buf);
+        }
+
+        rd = pread(in_fd, buf, chunk, off);
+        if (rd <= 0)
+        {
+            break;
+        }
+
+        wr = write(out_fd, buf, (size_t)rd);
+        if (wr <= 0)
+        {
+            break;
+        }
+
+        done += (size_t)wr;
+        off += (off_t)wr;
+    }
+
+    if (offset)
+    {
+        *offset = (off64_t)off;
+    }
+    return (ssize_t)done;
+}
+
+ssize_t splice(int fd_in, off64_t *off_in, int fd_out, off64_t *off_out, size_t len, unsigned int flags)
+{
+    (void)fd_out;
+    (void)off_out;
+    (void)flags;
+    return sendfile64(fd_out, fd_in, off_in, len);
+}
+
+ssize_t copy_file_range(int fd_in,
+                        off64_t *off_in,
+                        int fd_out,
+                        off64_t *off_out,
+                        size_t len,
+                        unsigned int flags)
+{
+    (void)flags;
+    (void)off_out;
+    return sendfile64(fd_out, fd_in, off_in, len);
+}
+
 int fcntl(int fd, int cmd, ...)
 {
     unsigned long arg = 0;
     va_list ap;
+    bool is_write_end;
 
     switch (cmd)
     {
@@ -3321,6 +5594,11 @@ int fcntl(int fd, int cmd, ...)
         arg = va_arg(ap, unsigned long);
         va_end(ap);
         break;
+    }
+
+    if (u_pipe_slot_from_fd(fd, &is_write_end))
+    {
+        return u_pipe_fcntl(fd, cmd, arg);
     }
 
     return u_sysret_int((int64_t)u_fcntl(fd, cmd, arg));
@@ -3330,6 +5608,7 @@ int fcntl64(int fd, int cmd, ...)
 {
     unsigned long arg = 0;
     va_list ap;
+    bool is_write_end;
 
     switch (cmd)
     {
@@ -3343,26 +5622,141 @@ int fcntl64(int fd, int cmd, ...)
         break;
     }
 
+    if (u_pipe_slot_from_fd(fd, &is_write_end))
+    {
+        return u_pipe_fcntl(fd, cmd, arg);
+    }
+
     return u_sysret_int((int64_t)u_fcntl(fd, cmd, arg));
 }
 
-int ioctl(int fd, unsigned long request, void *argp)
+int lockf64(int fd, int cmd, off64_t len)
 {
+    (void)fd;
+    (void)cmd;
+    (void)len;
+    return 0;
+}
+
+int posix_fadvise64(int fd, off64_t offset, off64_t len, int advice)
+{
+    (void)fd;
+    (void)offset;
+    (void)len;
+    (void)advice;
+    return 0;
+}
+
+int posix_fallocate64(int fd, off64_t offset, off64_t len)
+{
+    (void)fd;
+    (void)offset;
+    (void)len;
+    return 0;
+}
+
+int ioctl(int fd, unsigned long request, ...)
+{
+    void *argp;
+    va_list ap;
+    bool is_write_end;
+
+    va_start(ap, request);
+    argp = va_arg(ap, void *);
+    va_end(ap);
+
+    if (u_pipe_slot_from_fd(fd, &is_write_end))
+    {
+        return u_pipe_ioctl(fd, request, argp);
+    }
     return u_sysret_int((int64_t)u_ioctl(fd, request, argp));
 }
 
 int pipe(int fds[2])
 {
-    (void)fds;
-    errno = ENOSYS;
-    return -1;
+    return pipe2(fds, 0);
 }
 
 int pipe2(int fds[2], int flags)
 {
-    (void)fds;
-    (void)flags;
-    errno = ENOSYS;
+    int64_t kret;
+    struct u_pipe_slot *slot;
+    int read_fd;
+    int write_fd;
+    size_t i;
+
+    if (!fds)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (flags & ~(O_CLOEXEC | O_NONBLOCK))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    /*
+     * 优先尝试内核 pipe2：
+     * - 这样 Dropbear / BusyBox / 后续 shell pipeline 都能走真实 fd
+     * - 如果内核路径暂时不稳定，也不要直接把 ssh/dbclient 卡死
+     *   这里会继续回退到 libc 自管管道，保证交互工具“先能连上”
+     *
+     * 这层回退对 dbclient 特别重要，因为它启动时会先创建一个
+     * signal self-pipe；只要这个 pipe 能工作，SSH 后续的 select
+     * / 信号唤醒 / 输入输出协作就能继续跑下去。
+     */
+    kret = (int64_t)u_pipe2(fds, flags);
+    if (!u_sysret_is_error(kret))
+    {
+        return 0;
+    }
+
+    for (i = 0; i < U_PIPE_SLOT_MAX; i++)
+    {
+        if (!u_pipe_slots[i].used)
+        {
+            slot = &u_pipe_slots[i];
+            memset((int8_t *)slot, 0, sizeof(*slot));
+            slot->used = true;
+            slot->read_fd = -1;
+            slot->write_fd = -1;
+            read_fd = u_pipe_alloc_fd();
+            if (read_fd < 0)
+            {
+                memset((int8_t *)slot, 0, sizeof(*slot));
+                errno = EMFILE;
+                return -1;
+            }
+            slot->read_fd = read_fd;
+            write_fd = u_pipe_alloc_fd();
+            if (write_fd < 0)
+            {
+                memset((int8_t *)slot, 0, sizeof(*slot));
+                errno = EMFILE;
+                return -1;
+            }
+            slot->write_fd = write_fd;
+            slot->read_open = true;
+            slot->write_open = true;
+            slot->read_nonblock = (flags & O_NONBLOCK) ? true : false;
+            slot->write_nonblock = (flags & O_NONBLOCK) ? true : false;
+            slot->head = 0;
+            slot->tail = 0;
+            slot->used_bytes = 0;
+            fds[0] = read_fd;
+            fds[1] = write_fd;
+            return 0;
+        }
+    }
+
+    /*
+     * 如果内核 pipe2 失败，而 libc 兜底管道也没有槽位了，
+     * 就按“资源耗尽”返回。这里优先保证 ssh/dbclient 可继续启动，
+     * 因为它对 signal self-pipe 的要求本质上只是“有一个可用 pipe”。
+     */
+    errno = EMFILE;
     return -1;
 }
 
@@ -3426,10 +5820,11 @@ long sysconf(int name)
      */
     switch (name)
     {
-#ifdef _SC_PAGESIZE
+#if defined(_SC_PAGESIZE) && defined(_SC_PAGE_SIZE) && (_SC_PAGESIZE == _SC_PAGE_SIZE)
     case _SC_PAGESIZE:
-#endif
-#ifdef _SC_PAGE_SIZE
+#elif defined(_SC_PAGESIZE)
+    case _SC_PAGESIZE:
+#elif defined(_SC_PAGE_SIZE)
     case _SC_PAGE_SIZE:
 #endif
         return 4096L;
@@ -3521,6 +5916,25 @@ size_t confstr(int name, char *buf, size_t len)
 int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 {
     return u_sysret_int((int64_t)u_rt_sigaction(signum, act, oldact, sizeof(sigset_t)));
+}
+
+sighandler_t signal(int signum, sighandler_t handler)
+{
+    struct sigaction act;
+    struct sigaction oldact;
+
+    memset((char *)&act, 0, sizeof(act));
+    act.sa_handler = handler;
+    act.sa_flags = SA_RESTART;
+    if (sigemptyset(&act.sa_mask) < 0)
+    {
+        return SIG_ERR;
+    }
+    if (sigaction(signum, &act, &oldact) < 0)
+    {
+        return SIG_ERR;
+    }
+    return oldact.sa_handler;
 }
 
 int sigprocmask(int how, const sigset_t *set, sigset_t *oldset)
@@ -3643,9 +6057,79 @@ int kill(pid_t pid, int sig)
     return -1;
 }
 
+int killpg(pid_t pgrp, int sig)
+{
+    (void)pgrp;
+    (void)sig;
+    errno = ENOSYS;
+    return -1;
+}
+
+unsigned int alarm(unsigned int seconds)
+{
+    (void)seconds;
+    return 0;
+}
+
+int getitimer(int which, struct itimerval *curr_value)
+{
+    (void)which;
+    if (curr_value)
+    {
+        memset(curr_value, 0, sizeof(*curr_value));
+    }
+    return 0;
+}
+
+int setitimer(int which, const struct itimerval *new_value, struct itimerval *old_value)
+{
+    (void)which;
+    (void)new_value;
+    if (old_value)
+    {
+        memset(old_value, 0, sizeof(*old_value));
+    }
+    return 0;
+}
+
+int sigpending(sigset_t *set)
+{
+    if (!set)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    return sigemptyset(set);
+}
+
+int sigwaitinfo(const sigset_t *set, siginfo_t *info)
+{
+    (void)set;
+    (void)info;
+    errno = ENOSYS;
+    return -1;
+}
+
+int sigtimedwait(const sigset_t *set, siginfo_t *info, const struct timespec *timeout)
+{
+    (void)set;
+    (void)info;
+    (void)timeout;
+    errno = ENOSYS;
+    return -1;
+}
+
 int raise(int sig)
 {
     return kill(getpid(), sig);
+}
+
+char *strsignal(int sig)
+{
+    static char buf[32];
+
+    (void)snprintf(buf, sizeof(buf), "signal %d", sig);
+    return buf;
 }
 
 pid_t fork(void)
@@ -3684,20 +6168,63 @@ pid_t wait(int *status)
     return waitpid(-1, status, 0);
 }
 
-pid_t wait4(pid_t pid, int *status, int options, void *rusage)
+pid_t wait4(pid_t pid, int *status, int options, struct rusage *rusage)
 {
     (void)rusage;
     return waitpid(pid, status, options);
 }
 
+pid_t wait3(int *status, int options, struct rusage *rusage)
+{
+    return wait4(-1, status, options, rusage);
+}
+
+int waitid(idtype_t idtype, id_t id, siginfo_t *infop, int options)
+{
+    (void)idtype;
+    (void)id;
+    (void)infop;
+    (void)options;
+    errno = ENOSYS;
+    return -1;
+}
+
 void exit(int code)
 {
+    while (u_atexit_count > 0)
+    {
+        void (*handler)(void);
+
+        handler = u_atexit_handlers[--u_atexit_count];
+        if (handler)
+        {
+            handler();
+        }
+    }
     u_exit(code);
 }
 
 void _exit(int code)
 {
     u_exit(code);
+}
+
+int atexit(void (*func)(void))
+{
+    if (!func)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (u_atexit_count >= (sizeof(u_atexit_handlers) / sizeof(u_atexit_handlers[0])))
+    {
+        errno = ENOMEM;
+        return -1;
+    }
+
+    u_atexit_handlers[u_atexit_count++] = func;
+    return 0;
 }
 
 void abort(void)
@@ -4042,6 +6569,202 @@ int execvpe(const char *file, char *const argv[], char *const envp[])
 {
     (void)envp;
     return execvp(file, argv);
+}
+
+int fexecve(int fd, char *const argv[], char *const envp[])
+{
+    (void)fd;
+    (void)argv;
+    (void)envp;
+    errno = ENOSYS;
+    return -1;
+}
+
+DIR *fdopendir(int fd)
+{
+    (void)fd;
+    errno = ENOSYS;
+    return 0;
+}
+
+int forkpty(int *amaster, char *name, const struct termios *termp, const struct winsize *winp)
+{
+    (void)amaster;
+    (void)name;
+    (void)termp;
+    (void)winp;
+    errno = ENOSYS;
+    return -1;
+}
+
+int posix_spawn(pid_t *pid,
+                const char *path,
+                const posix_spawn_file_actions_t *file_actions,
+                const posix_spawnattr_t *attrp,
+                char *const argv[],
+                char *const envp[])
+{
+    int child;
+
+    (void)file_actions;
+    (void)attrp;
+    (void)envp;
+
+    child = u_exec_spawn_only(path, argv);
+    if (child < 0)
+    {
+        return errno ? errno : ENOSYS;
+    }
+    if (pid)
+    {
+        *pid = (pid_t)child;
+    }
+    return 0;
+}
+
+int posix_spawnp(pid_t *pid,
+                 const char *file,
+                 const posix_spawn_file_actions_t *file_actions,
+                 const posix_spawnattr_t *attrp,
+                 char *const argv[],
+                 char *const envp[])
+{
+    (void)file_actions;
+    (void)attrp;
+    (void)envp;
+
+    if (pid)
+    {
+        *pid = -1;
+    }
+    if (!file)
+    {
+        return EINVAL;
+    }
+    return ENOSYS;
+}
+
+int posix_spawn_file_actions_init(posix_spawn_file_actions_t *actions)
+{
+    if (!actions)
+    {
+        return EINVAL;
+    }
+    memset(actions, 0, sizeof(*actions));
+    return 0;
+}
+
+int posix_spawn_file_actions_destroy(posix_spawn_file_actions_t *actions)
+{
+    if (!actions)
+    {
+        return EINVAL;
+    }
+    return 0;
+}
+
+int posix_spawn_file_actions_addopen(posix_spawn_file_actions_t *actions, int fd, const char *path, int oflag, mode_t mode)
+{
+    (void)actions;
+    (void)fd;
+    (void)path;
+    (void)oflag;
+    (void)mode;
+    return ENOSYS;
+}
+
+int posix_spawn_file_actions_addclose(posix_spawn_file_actions_t *actions, int fd)
+{
+    (void)actions;
+    (void)fd;
+    return ENOSYS;
+}
+
+int posix_spawn_file_actions_adddup2(posix_spawn_file_actions_t *actions, int fd, int newfd)
+{
+    (void)actions;
+    (void)fd;
+    (void)newfd;
+    return ENOSYS;
+}
+
+int posix_spawnattr_init(posix_spawnattr_t *attr)
+{
+    if (!attr)
+    {
+        return EINVAL;
+    }
+    memset(attr, 0, sizeof(*attr));
+    return 0;
+}
+
+int posix_spawnattr_destroy(posix_spawnattr_t *attr)
+{
+    if (!attr)
+    {
+        return EINVAL;
+    }
+    return 0;
+}
+
+int posix_spawnattr_setflags(posix_spawnattr_t *attr, short flags)
+{
+    if (!attr)
+    {
+        return EINVAL;
+    }
+    attr->_flags = flags;
+    return 0;
+}
+
+int posix_spawnattr_setpgroup(posix_spawnattr_t *attr, pid_t pgroup)
+{
+    if (!attr)
+    {
+        return EINVAL;
+    }
+    attr->_pgrp = pgroup;
+    return 0;
+}
+
+int posix_spawnattr_setschedpolicy(posix_spawnattr_t *attr, int policy)
+{
+    if (!attr)
+    {
+        return EINVAL;
+    }
+    attr->_policy = policy;
+    return 0;
+}
+
+int posix_spawnattr_setschedparam(posix_spawnattr_t *attr, const struct sched_param *param)
+{
+    if (!attr || !param)
+    {
+        return EINVAL;
+    }
+    attr->_sp = *param;
+    return 0;
+}
+
+int posix_spawnattr_setsigdefault(posix_spawnattr_t *attr, const sigset_t *sigdefault)
+{
+    if (!attr || !sigdefault)
+    {
+        return EINVAL;
+    }
+    attr->_sd = *sigdefault;
+    return 0;
+}
+
+int posix_spawnattr_setsigmask(posix_spawnattr_t *attr, const sigset_t *sigmask)
+{
+    if (!attr || !sigmask)
+    {
+        return EINVAL;
+    }
+    attr->_ss = *sigmask;
+    return 0;
 }
 
 long syscall(long number, ...)
@@ -4989,6 +7712,484 @@ char *dlerror(void)
         return 0;
     }
     return u_dlerror_buf;
+}
+
+static uint16_t u_bswap16(uint16_t v)
+{
+    return __builtin_bswap16(v);
+}
+
+static uint32_t u_bswap32(uint32_t v)
+{
+    return __builtin_bswap32(v);
+}
+
+uint16_t htons(uint16_t hostshort)
+{
+    return u_bswap16(hostshort);
+}
+
+uint16_t ntohs(uint16_t netshort)
+{
+    return u_bswap16(netshort);
+}
+
+uint32_t htonl(uint32_t hostlong)
+{
+    return u_bswap32(hostlong);
+}
+
+uint32_t ntohl(uint32_t netlong)
+{
+    return u_bswap32(netlong);
+}
+
+int inet_pton(int af, const char *src, void *dst)
+{
+    uint32_t octets[4];
+    uint32_t cur;
+    size_t i;
+    size_t idx;
+    uint8_t *out;
+
+    if (!src || !dst)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (af != AF_INET)
+    {
+        errno = EAFNOSUPPORT;
+        return -1;
+    }
+
+    idx = 0;
+    cur = 0;
+    for (i = 0;; i++)
+    {
+        char ch = src[i];
+        if (ch >= '0' && ch <= '9')
+        {
+            cur = cur * 10U + (uint32_t)(ch - '0');
+            if (cur > 255U)
+            {
+                errno = EINVAL;
+                return -1;
+            }
+            continue;
+        }
+        if (ch == '.' || ch == '\0')
+        {
+            if (idx >= 4)
+            {
+                errno = EINVAL;
+                return -1;
+            }
+            octets[idx++] = cur;
+            cur = 0;
+            if (ch == '\0')
+            {
+                break;
+            }
+            continue;
+        }
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (idx != 4)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    out = (uint8_t *)dst;
+    out[0] = (uint8_t)octets[0];
+    out[1] = (uint8_t)octets[1];
+    out[2] = (uint8_t)octets[2];
+    out[3] = (uint8_t)octets[3];
+    return 1;
+}
+
+const char *inet_ntop(int af, const void *src, char *dst, socklen_t size)
+{
+    const uint8_t *p;
+    int n;
+
+    if (!src || !dst)
+    {
+        errno = EINVAL;
+        return 0;
+    }
+    if (af != AF_INET)
+    {
+        errno = EAFNOSUPPORT;
+        return 0;
+    }
+    if (size < 16U)
+    {
+        errno = ENOSPC;
+        return 0;
+    }
+
+    p = (const uint8_t *)src;
+    n = snprintf(dst, size, "%u.%u.%u.%u", p[0], p[1], p[2], p[3]);
+    if (n < 0 || (socklen_t)n >= size)
+    {
+        errno = ENOSPC;
+        return 0;
+    }
+    return dst;
+}
+
+static int u_parse_service_port(const char *service, uint16_t *port_out)
+{
+    uint32_t port;
+    size_t i;
+
+    if (!service || !port_out || !service[0])
+    {
+        return -1;
+    }
+
+    if (strcmp(service, "ssh") == 0)
+    {
+        *port_out = 22;
+        return 0;
+    }
+    if (strcmp(service, "http") == 0)
+    {
+        *port_out = 80;
+        return 0;
+    }
+    if (strcmp(service, "https") == 0)
+    {
+        *port_out = 443;
+        return 0;
+    }
+
+    port = 0;
+    for (i = 0; service[i] != '\0'; i++)
+    {
+        if (service[i] < '0' || service[i] > '9')
+        {
+            return -1;
+        }
+        port = port * 10U + (uint32_t)(service[i] - '0');
+        if (port > 65535U)
+        {
+            return -1;
+        }
+    }
+
+    if (port == 0)
+    {
+        return -1;
+    }
+
+    *port_out = (uint16_t)port;
+    return 0;
+}
+
+int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res)
+{
+    struct addrinfo *ai;
+    struct sockaddr_in *sin;
+    uint32_t ipv4;
+    uint16_t port;
+    size_t node_len;
+    char hostbuf[128];
+
+    if (!res)
+    {
+        return EAI_SYSTEM;
+    }
+
+    *res = 0;
+
+    if (hints && hints->ai_family != AF_UNSPEC && hints->ai_family != AF_INET)
+    {
+        return EAI_FAMILY;
+    }
+    if (hints && hints->ai_socktype && hints->ai_socktype != SOCK_STREAM && hints->ai_socktype != SOCK_DGRAM)
+    {
+        return EAI_SOCKTYPE;
+    }
+
+    if (service)
+    {
+        if (u_parse_service_port(service, &port) < 0)
+        {
+            return EAI_SERVICE;
+        }
+    }
+    else
+    {
+        port = 0;
+    }
+
+    ipv4 = INADDR_LOOPBACK;
+    if (!node || !node[0])
+    {
+        if (hints && (hints->ai_flags & AI_PASSIVE))
+        {
+            ipv4 = INADDR_ANY;
+        }
+    }
+    else if (inet_pton(AF_INET, node, &ipv4) == 1)
+    {
+        uint8_t *raw = (uint8_t *)&ipv4;
+        ipv4 = ((uint32_t)raw[0] << 24) | ((uint32_t)raw[1] << 16) | ((uint32_t)raw[2] << 8) | (uint32_t)raw[3];
+    }
+    else if (strcmp(node, "localhost") == 0)
+    {
+        ipv4 = INADDR_LOOPBACK;
+    }
+    else
+    {
+        if (hints && (hints->ai_flags & AI_NUMERICHOST))
+        {
+            return EAI_NONAME;
+        }
+
+        node_len = strnlen(node, sizeof(hostbuf) - 1U);
+        if (node_len == 0 || node_len >= sizeof(hostbuf))
+        {
+            return EAI_NONAME;
+        }
+        memcpy(hostbuf, node, node_len);
+        hostbuf[node_len] = '\0';
+        if (u_dns_lookup((const int8_t *)hostbuf, &ipv4, 3000U) < 0)
+        {
+            return EAI_AGAIN;
+        }
+    }
+
+    ai = (struct addrinfo *)calloc(1, sizeof(*ai));
+    if (!ai)
+    {
+        return EAI_MEMORY;
+    }
+
+    sin = (struct sockaddr_in *)calloc(1, sizeof(*sin));
+    if (!sin)
+    {
+        free(ai);
+        return EAI_MEMORY;
+    }
+
+    sin->sin_family = AF_INET;
+    sin->sin_port = htons(port);
+    {
+        uint8_t *dst = (uint8_t *)&sin->sin_addr.s_addr;
+        dst[0] = (uint8_t)((ipv4 >> 24) & 0xffU);
+        dst[1] = (uint8_t)((ipv4 >> 16) & 0xffU);
+        dst[2] = (uint8_t)((ipv4 >> 8) & 0xffU);
+        dst[3] = (uint8_t)(ipv4 & 0xffU);
+    }
+
+    ai->ai_family = AF_INET;
+    ai->ai_socktype = hints ? hints->ai_socktype : SOCK_STREAM;
+    ai->ai_protocol = hints ? hints->ai_protocol : IPPROTO_TCP;
+    ai->ai_addrlen = sizeof(*sin);
+    ai->ai_addr = (struct sockaddr *)sin;
+    if (node && (hints && (hints->ai_flags & AI_CANONNAME)))
+    {
+        size_t canon_len = strlen(node) + 1U;
+
+        ai->ai_canonname = (char *)malloc(canon_len);
+        if (!ai->ai_canonname)
+        {
+            free(sin);
+            free(ai);
+            return EAI_MEMORY;
+        }
+        memcpy(ai->ai_canonname, node, canon_len);
+    }
+
+    *res = ai;
+    return 0;
+}
+
+void freeaddrinfo(struct addrinfo *res)
+{
+    while (res)
+    {
+        struct addrinfo *next = res->ai_next;
+        free(res->ai_addr);
+        free(res->ai_canonname);
+        free(res);
+        res = next;
+    }
+}
+
+const char *gai_strerror(int errcode)
+{
+    switch (errcode)
+    {
+    case 0: return "success";
+    case EAI_BADFLAGS: return "bad flags";
+    case EAI_NONAME: return "name not found";
+    case EAI_AGAIN: return "temporary failure";
+    case EAI_FAIL: return "non-recoverable failure";
+    case EAI_FAMILY: return "address family not supported";
+    case EAI_SOCKTYPE: return "socket type not supported";
+    case EAI_SERVICE: return "service not supported";
+    case EAI_MEMORY: return "out of memory";
+    default: return "unknown error";
+    }
+}
+
+int getnameinfo(const struct sockaddr *sa, socklen_t salen, char *host, socklen_t hostlen,
+                char *serv, socklen_t servlen, int flags)
+{
+    const struct sockaddr_in *sin;
+    const uint8_t *ip;
+    uint16_t port;
+
+    (void)flags;
+    if (!sa || salen < sizeof(*sin))
+    {
+        return EAI_FAMILY;
+    }
+
+    sin = (const struct sockaddr_in *)sa;
+    if (sin->sin_family != AF_INET)
+    {
+        return EAI_FAMILY;
+    }
+
+    if (host && hostlen > 0)
+    {
+        ip = (const uint8_t *)&sin->sin_addr.s_addr;
+        if (!inet_ntop(AF_INET, ip, host, hostlen))
+        {
+            return EAI_MEMORY;
+        }
+    }
+
+    if (serv && servlen > 0)
+    {
+        port = ntohs(sin->sin_port);
+        if (snprintf(serv, servlen, "%u", port) < 0)
+        {
+            return EAI_MEMORY;
+        }
+    }
+
+    return 0;
+}
+
+int socket(int domain, int type, int protocol)
+{
+    if (domain != AF_INET || type != SOCK_STREAM || (protocol != 0 && protocol != IPPROTO_TCP))
+    {
+        errno = EAFNOSUPPORT;
+        return -1;
+    }
+    return u_sysret_int((int64_t)u_socket(domain, type, protocol));
+}
+
+int connect(int fd, const struct sockaddr *addr, socklen_t addrlen)
+{
+    return u_sysret_int((int64_t)u_connect(fd, addr, addrlen));
+}
+
+int shutdown(int fd, int how)
+{
+    return u_sysret_int((int64_t)u_shutdown(fd, how));
+}
+
+ssize_t send(int fd, const void *buf, size_t len, int flags)
+{
+    (void)flags;
+    return u_sysret_ssize((int64_t)u_write(fd, buf, len));
+}
+
+ssize_t recv(int fd, void *buf, size_t len, int flags)
+{
+    (void)flags;
+    return u_sysret_ssize((int64_t)u_read(fd, buf, len));
+}
+
+ssize_t sendto(int fd, const void *buf, size_t len, int flags, const struct sockaddr *addr, socklen_t addrlen)
+{
+    (void)addr;
+    (void)addrlen;
+    return send(fd, buf, len, flags);
+}
+
+ssize_t recvfrom(int fd, void *buf, size_t len, int flags, struct sockaddr *addr, socklen_t *addrlen)
+{
+    (void)addr;
+    (void)addrlen;
+    return recv(fd, buf, len, flags);
+}
+
+int bind(int fd, const struct sockaddr *addr, socklen_t addrlen)
+{
+    (void)fd;
+    (void)addr;
+    (void)addrlen;
+    errno = ENOTSUP;
+    return -1;
+}
+
+int listen(int fd, int backlog)
+{
+    (void)fd;
+    (void)backlog;
+    errno = ENOTSUP;
+    return -1;
+}
+
+int accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
+{
+    (void)fd;
+    (void)addr;
+    (void)addrlen;
+    errno = ENOTSUP;
+    return -1;
+}
+
+int getsockname(int fd, struct sockaddr *addr, socklen_t *addrlen)
+{
+    (void)fd;
+    (void)addr;
+    (void)addrlen;
+    errno = ENOTSUP;
+    return -1;
+}
+
+int getpeername(int fd, struct sockaddr *addr, socklen_t *addrlen)
+{
+    (void)fd;
+    (void)addr;
+    (void)addrlen;
+    errno = ENOTSUP;
+    return -1;
+}
+
+int setsockopt(int fd, int level, int optname, const void *optval, socklen_t optlen)
+{
+    (void)fd;
+    (void)level;
+    (void)optname;
+    (void)optval;
+    (void)optlen;
+    return 0;
+}
+
+int getsockopt(int fd, int level, int optname, void *optval, socklen_t *optlen)
+{
+    if (!optval || !optlen)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    return u_sysret_int((int64_t)u_getsockopt(fd, level, optname, optval, (unsigned int *)optlen));
 }
 
 int _setjmp(jmp_buf env)

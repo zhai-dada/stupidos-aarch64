@@ -56,7 +56,7 @@ void *memset(int8_t *s, int32_t c, size_t count)
     return s;
 }
 
-void* memcpy(int8_t* dest, int8_t* src, size_t count)
+void* memcpy(int8_t* dest, const int8_t* src, size_t count)
 {
     int8_t* tmp = dest;
     const int8_t *s = src;

@@ -65,6 +65,16 @@
 #define SYS_TRUNCATE   62
 #define SYS_FTRUNCATE  63
 #define SYS_UTIMENSAT  64
+#define SYS_HTTPGET    65
+#define SYS_DNSLOOKUP  66
+#define SYS_SOCKET     67
+#define SYS_CONNECT    68
+#define SYS_SHUTDOWN   69
+#define SYS_GETSOCKOPT 70
+#define SYS_FBINFO     71
+#define SYS_FBFILL     72
+#define SYS_FBTEXT     73
+#define SYS_PIPE2      74
 
 .section .text
 
@@ -457,6 +467,66 @@ FUNC_GLOBAL(u_utimensat)
 	svc #0
 	ret
 FUNC_END(u_utimensat)
+
+FUNC_GLOBAL(u_http_get)
+	mov x8, #SYS_HTTPGET
+	svc #0
+	ret
+FUNC_END(u_http_get)
+
+FUNC_GLOBAL(u_dns_lookup)
+	mov x8, #SYS_DNSLOOKUP
+	svc #0
+	ret
+FUNC_END(u_dns_lookup)
+
+FUNC_GLOBAL(u_socket)
+	mov x8, #SYS_SOCKET
+	svc #0
+	ret
+FUNC_END(u_socket)
+
+FUNC_GLOBAL(u_connect)
+	mov x8, #SYS_CONNECT
+	svc #0
+	ret
+FUNC_END(u_connect)
+
+FUNC_GLOBAL(u_shutdown)
+	mov x8, #SYS_SHUTDOWN
+	svc #0
+	ret
+FUNC_END(u_shutdown)
+
+FUNC_GLOBAL(u_getsockopt)
+	mov x8, #SYS_GETSOCKOPT
+	svc #0
+	ret
+FUNC_END(u_getsockopt)
+
+FUNC_GLOBAL(u_pipe2)
+	mov x8, #SYS_PIPE2
+	svc #0
+	ret
+FUNC_END(u_pipe2)
+
+FUNC_GLOBAL(u_fbinfo)
+	mov x8, #SYS_FBINFO
+	svc #0
+	ret
+FUNC_END(u_fbinfo)
+
+FUNC_GLOBAL(u_fbfill)
+	mov x8, #SYS_FBFILL
+	svc #0
+	ret
+FUNC_END(u_fbfill)
+
+FUNC_GLOBAL(u_fbtext)
+	mov x8, #SYS_FBTEXT
+	svc #0
+	ret
+FUNC_END(u_fbtext)
 
 FUNC_GLOBAL(u_exit)
 	mov x8, #SYS_EXIT

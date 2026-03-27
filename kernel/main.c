@@ -121,6 +121,8 @@ static __attribute__((noreturn)) void kernel_main_high(void)
     ssize_t nread;
     int8_t file_buf[128];
     enable_irq();
+    ramfb_rebind_runtime_base();
+    ui_early_banner();
 
     /*
      * 当前启动路径下仍然永久保留 TTBR0 的低地址 idmap，
@@ -238,15 +240,16 @@ static __attribute__((noreturn)) void kernel_main_high(void)
      */
     printk("[boot\tinit]: shell start\n");
     shell_init();
-    if (shell_foreground_pid() >= 0)
-    {
-        /*
-         * 用户态 shell 接管后，把串口日志收敛为静音模式。
-         * 这样正常交互不会再被大量内核 init/debug 日志刷屏，
-         * 但真正的 error/failed 类信息仍然会保留。
-         */
-        uart_set_quiet(true);
-    }
+    /*
+     * shell 一旦接管交互，就把串口日志收敛为静音模式。
+     *
+     * 这样可以显著减少前台命令执行时的串口刷屏和阻塞：
+     * - 交互命令只保留真正需要用户看到的输出
+     * - 内核 init / selftest / 运行态调试日志默认不再打扰前台体验
+     *
+     * 真正的 error / fault / panic 仍会通过 uart_log_is_important 保留。
+     */
+    uart_set_quiet(true);
 
     /*
      * 这一轮先保留最小内核线程框架：

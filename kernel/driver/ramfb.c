@@ -2,11 +2,26 @@
 #include "driver/fwcfg.h"
 #include "lib/libmem.h"
 #include "font.h"
+#include "mmu.h"
 #include "printk.h"
 
 uint8_t framebuffer[FB_WIDTH * FB_HEIGHT * FB_BPP];
 
 ramfb_info_t ramfb_info;
+
+void ramfb_rebind_runtime_base(void)
+{
+    /*
+     * 启用 MMU 之后，内核代码运行在 KIMAGE_VADDR 别名下。
+     * framebuffer 也属于内核镜像 BSS，给它绑定一个高地址别名，
+     * 后续 UI / browser / shell 的绘制就始终走统一虚拟地址。
+     */
+    if (ramfb_info.ramfb_phys_base)
+    {
+        ramfb_info.ramfb_kimage_base = (uint32_t *)kimage_phys_to_virt(ramfb_info.ramfb_phys_base);
+        ramfb_info.ramfb_base = ramfb_info.ramfb_kimage_base;
+    }
+}
 
 void ramfb_init(uint8_t *fb_addr, uint32_t width, uint32_t height)
 {
@@ -52,7 +67,9 @@ void ramfb_init(uint8_t *fb_addr, uint32_t width, uint32_t height)
         sizeof(ramfb_config_t),
         (uint64_t)&config);
 
-    ramfb_info.ramfb_base = (uint32_t*)fb_addr;
+    ramfb_info.ramfb_base = (uint32_t *)fb_addr;
+    ramfb_info.ramfb_phys_base = (uint64_t)fb_addr;
+    ramfb_info.ramfb_kimage_base = NULL;
     ramfb_info.ramfb_length = FB_HEIGHT * FB_WIDTH * FB_BPP;
     ramfb_info.width = FB_WIDTH;
     ramfb_info.height = FB_HEIGHT;
@@ -71,8 +88,15 @@ void ramfb_init(uint8_t *fb_addr, uint32_t width, uint32_t height)
 
 static void ramfb_putchar(uint32_t x, uint32_t y, char c, uint32_t fg, uint32_t bg)
 {
+    uint32_t *base;
     const uint8_t *glyph = font_ascii[(uint8_t)c];
-    uint32_t *row_ptr = (uint32_t *)&ramfb_info.ramfb_base[y * FB_WIDTH + x];
+    base = ramfb_info.ramfb_base;
+    if (!base)
+    {
+        return;
+    }
+
+    uint32_t *row_ptr = &base[y * ramfb_info.width + x];
 
     for (uint8_t row = 0; row < ramfb_info.y_charsize; row++)
     {

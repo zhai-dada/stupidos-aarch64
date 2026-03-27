@@ -72,6 +72,30 @@ static bool uart_log_is_important(const int8_t *fmt)
            uart_contains_ci(fmt, (const int8_t *)"Unhandled");
 }
 
+void uart_write_bytes(const uint8_t *buf, size_t len)
+{
+    size_t i;
+
+    if (!buf || !len)
+    {
+        return;
+    }
+
+    /*
+     * 批量写串口（中文）：
+     * vi / vim 这类全屏编辑器会频繁输出控制序列。
+     * 与其每个字符都在上层多绕一次函数调用，不如在驱动层直接连续灌 FIFO。
+     */
+    for (i = 0; i < len; i++)
+    {
+        while (get32(PL011_UART0_BASE + UART_FR) & UART_FR_TXFF)
+        {
+            nop();
+        }
+        put32(PL011_UART0_BASE + UART_DR, (uint32_t)buf[i]);
+    }
+}
+
 static uint32_t uart_detect_irq_line(void)
 {
     const struct fdt_device_desc *uart_dev;
@@ -92,10 +116,12 @@ static uint32_t uart_detect_irq_line(void)
 
 static void uart_send_string_raw(int8_t *str)
 {
-    for (int32_t i = 0; str[i] != '\0'; i++)
+    if (!str)
     {
-        uart_putc((int8_t)str[i]);
+        return;
     }
+
+    uart_write_bytes((const uint8_t *)str, strlen(str));
 }
 
 void uart_send_string(int8_t *str)

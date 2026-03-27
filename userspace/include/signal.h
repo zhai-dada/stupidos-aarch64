@@ -3,13 +3,15 @@
 
 #include <stddef.h>
 #include <sys/types.h>
-#include_next <signal.h>
+#include <time.h>
 
 /*
- * 用户态 signal 兼容层。
- * 这里优先使用交叉工具链自带的 POSIX 定义，只补足 CPython
- * 交叉编译时偶尔缺失的宏常量，避免我们自己重新定义一整套信号类型。
+ * 交叉 GCC / glibc 编译时直接沿用工具链的 signal.h。
+ * guest TinyCC 或显式最小模式时，走本地兼容定义。
  */
+#if !defined(__TINYC__) && !defined(STUPIDOS_SIGNAL_MINIMAL)
+#include_next <signal.h>
+#endif
 
 #ifndef __sig_atomic_t_defined
 typedef int sig_atomic_t;
@@ -24,16 +26,28 @@ typedef struct
 #define __sigset_t_defined 1
 #endif
 
-#ifndef __sigaction_defined
-struct sigaction
+#ifndef __sigval_defined
+union sigval
 {
-    void (*sa_handler)(int);
-    sigset_t sa_mask;
-    int sa_flags;
-    void (*sa_restorer)(void);
+    int sival_int;
+    void *sival_ptr;
 };
-typedef struct sigaction sigaction_t;
-#define __sigaction_defined 1
+#define __sigval_defined 1
+#endif
+
+#ifndef __siginfo_t_defined
+typedef struct
+{
+    int si_signo;
+    int si_errno;
+    int si_code;
+    pid_t si_pid;
+    uid_t si_uid;
+    int si_status;
+    long si_band;
+    union sigval si_value;
+} siginfo_t;
+#define __siginfo_t_defined 1
 #endif
 
 #ifndef __stack_t_defined
@@ -44,6 +58,18 @@ typedef struct
     size_t ss_size;
 } stack_t;
 #define __stack_t_defined 1
+#endif
+
+#ifndef __sigaction_defined
+struct sigaction
+{
+    void (*sa_handler)(int);
+    sigset_t sa_mask;
+    int sa_flags;
+    void (*sa_restorer)(void);
+};
+typedef struct sigaction sigaction_t;
+#define __sigaction_defined 1
 #endif
 
 typedef void (*sighandler_t)(int);
@@ -62,6 +88,10 @@ typedef void (*sighandler_t)(int);
 #endif
 #ifndef SA_SIGINFO
 #define SA_SIGINFO 0x00000004
+#endif
+
+#ifndef SIGSTKSZ
+#define SIGSTKSZ 8192
 #endif
 
 #ifndef SIG_ERR
@@ -127,17 +157,28 @@ typedef void (*sighandler_t)(int);
 #ifndef SIGCHLD
 #define SIGCHLD 17
 #endif
+#ifndef SIGSTOP
+/* neatvi 在挂起终端时会发送 SIGSTOP，最小 signal 头需要补齐该常量。 */
+#define SIGSTOP 19
+#endif
+#ifndef SIGWINCH
+#define SIGWINCH 28
+#endif
 
 int sigemptyset(sigset_t *set);
 int sigfillset(sigset_t *set);
 int sigaddset(sigset_t *set, int signum);
 int sigdelset(sigset_t *set, int signum);
 int sigismember(const sigset_t *set, int signum);
+sighandler_t signal(int signum, sighandler_t handler);
 int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact);
 int sigprocmask(int how, const sigset_t *set, sigset_t *oldset);
 int sigaltstack(const stack_t *ss, stack_t *old_ss);
 int raise(int sig);
 int sigwait(const sigset_t *set, int *sig);
 int kill(pid_t pid, int sig);
+int sigpending(sigset_t *set);
+int sigwaitinfo(const sigset_t *set, siginfo_t *info);
+int sigtimedwait(const sigset_t *set, siginfo_t *info, const struct timespec *timeout);
 
 #endif

@@ -98,6 +98,7 @@
 void early_uart_init(void);
 void uart_init(void);
 void uart_putc(uint8_t ch);
+void uart_write_bytes(const uint8_t *buf, size_t len);
 int32_t uart_getc(void);
 int32_t uart_try_getc(void);
 

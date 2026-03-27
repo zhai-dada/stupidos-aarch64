@@ -1,6 +1,15 @@
 #ifndef __ERRNO_H__
 #define __ERRNO_H__
 
+/*
+ * 这个头同时被内核和用户态工程复用。
+ * 默认提供本地 errno 常量表，只有第三方源码显式要求时，
+ * 才通过 STUPIDOS_USE_TOOLCHAIN_ERRNO 切换到工具链 libc 的 errno。
+ */
+#if defined(STUPIDOS_USE_TOOLCHAIN_ERRNO)
+#include_next <errno.h>
+#endif
+
 #define	E2BIG			1		/* 参数列表过长或输出缓冲区空间不足或参数超过系统规定的最大值 */
 #define	EACCES			2		/* 拒绝访问 */
 #define	EADDRINUSE		3		/* 地址正在使用中 */

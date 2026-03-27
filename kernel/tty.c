@@ -3,6 +3,7 @@
 #include "driver/uart.h"
 #include "lib/libasm.h"
 #include "lib/libirq.h"
+#include "lib/libstr.h"
 #include "sched.h"
 #include "spinlock.h"
 
@@ -12,6 +13,20 @@
  */
 #define TTY_RX_BUF_SIZE 512
 #define TTY_ACTIVE_POLL_SPINS 4096U
+/* 最小 termios 标志位（与 Linux 常量保持一致）。 */
+#define TTY_TERM_LFLAG_ICANON 0x00000002U
+#define TTY_TERM_LFLAG_ECHO   0x00000008U
+#define TTY_TERM_LFLAG_ISIG   0x00000001U
+#define TTY_TERM_LFLAG_ECHOE  0x00000010U
+#define TTY_TERM_LFLAG_ECHOK  0x00000020U
+#define TTY_TERM_IFLAG_ICRNL  0x00000100U
+#define TTY_TERM_IFLAG_IXON   0x00000400U
+#define TTY_TERM_OFLAG_OPOST  0x00000001U
+#define TTY_TERM_OFLAG_ONLCR  0x00000004U
+#define TTY_TERM_CFLAG_CREAD  0x00000080U
+#define TTY_TERM_CFLAG_CS8    0x00000030U
+#define TTY_TERM_CC_VTIME     5U
+#define TTY_TERM_CC_VMIN      6U
 
 static spinlock_t tty_lock = SPINLOCK_INIT;
 static uint8_t tty_rx_buf[TTY_RX_BUF_SIZE];
@@ -20,6 +35,7 @@ static uint32_t tty_rx_tail;
 static uint32_t tty_line_len;
 static uint8_t tty_escape_state;
 static struct tty_mouse_state tty_mouse;
+static struct tty_termios_state tty_termios;
 
 static void tty_rx_push(uint8_t ch)
 {
@@ -57,6 +73,11 @@ static size_t tty_ingest_char_locked(uint8_t ch, uint8_t *echo_buf)
 {
     uint8_t stored_ch;
     size_t echo_len;
+    bool canonical;
+    bool echo_enabled;
+
+    canonical = (tty_termios.lflag & TTY_TERM_LFLAG_ICANON) != 0U;
+    echo_enabled = (tty_termios.lflag & TTY_TERM_LFLAG_ECHO) != 0U;
 
     /*
      * 所有输入源统一在这里做规范化和回显：
@@ -66,6 +87,10 @@ static size_t tty_ingest_char_locked(uint8_t ch, uint8_t *echo_buf)
      *
      * 这样 UART IRQ、virtio keyboard IRQ，以及轮询补位路径的表现一致。
     */
+    /*
+     * 统一把 CR 归一化成 LF，避免不同输入设备（串口/virtio 键盘）
+     * 在 Enter 键上行为不一致，影响 vi 命令模式确认。
+     */
     stored_ch = (ch == '\r') ? '\n' : ch;
     tty_rx_push(stored_ch);
 
@@ -74,7 +99,11 @@ static size_t tty_ingest_char_locked(uint8_t ch, uint8_t *echo_buf)
      * 这些字节要继续留给上层 shell 解析，但不要直接回显出来，
      * 否则终端上会看到 "[A" 这类碎片字符。
      */
-    if (tty_escape_state == 1)
+    if (!canonical || !echo_enabled)
+    {
+        tty_escape_state = 0;
+    }
+    else if (tty_escape_state == 1)
     {
         if (stored_ch == '[')
         {
@@ -88,7 +117,7 @@ static size_t tty_ingest_char_locked(uint8_t ch, uint8_t *echo_buf)
          */
         tty_escape_state = 0;
     }
-    if (tty_escape_state == 2)
+    if (canonical && echo_enabled && tty_escape_state == 2)
     {
         /*
          * CSI 序列以 0x40..0x7e 结尾，期间所有字节都不回显。
@@ -100,13 +129,32 @@ static size_t tty_ingest_char_locked(uint8_t ch, uint8_t *echo_buf)
         }
         return 0;
     }
-    if (stored_ch == 0x1b)
+    if (canonical && echo_enabled && stored_ch == 0x1b)
     {
         tty_escape_state = 1;
         return 0;
     }
 
     echo_len = 0;
+    if (!echo_enabled)
+    {
+        return 0;
+    }
+
+    if (!canonical)
+    {
+        if (stored_ch == '\n' || stored_ch == '\r')
+        {
+            echo_buf[echo_len++] = '\r';
+            echo_buf[echo_len++] = '\n';
+        }
+        else if (stored_ch >= 0x20 && stored_ch <= 0x7e)
+        {
+            echo_buf[echo_len++] = stored_ch;
+        }
+        return echo_len;
+    }
+
     if (stored_ch == '\n')
     {
         tty_line_len = 0;
@@ -142,6 +190,25 @@ void tty_init(void)
     tty_mouse.x = 0;
     tty_mouse.y = 0;
     tty_mouse.buttons = 0;
+
+    /*
+     * 缺省使用“规范模式 + 回显”，保证 shell 行编辑开箱即用；
+     * vi/vim 再通过 tcsetattr 切换到 raw/noecho。
+     */
+    tty_termios.iflag = TTY_TERM_IFLAG_ICRNL | TTY_TERM_IFLAG_IXON;
+    tty_termios.oflag = TTY_TERM_OFLAG_OPOST | TTY_TERM_OFLAG_ONLCR;
+    tty_termios.cflag = TTY_TERM_CFLAG_CREAD | TTY_TERM_CFLAG_CS8;
+    tty_termios.lflag = TTY_TERM_LFLAG_ISIG | TTY_TERM_LFLAG_ICANON | TTY_TERM_LFLAG_ECHO |
+                        TTY_TERM_LFLAG_ECHOE | TTY_TERM_LFLAG_ECHOK;
+    tty_termios.line = 0;
+    for (uint32_t i = 0; i < 19U; i++)
+    {
+        tty_termios.cc[i] = 0;
+    }
+    tty_termios.cc[TTY_TERM_CC_VMIN] = 1;
+    tty_termios.cc[TTY_TERM_CC_VTIME] = 0;
+    tty_termios.ispeed = 0;
+    tty_termios.ospeed = 0;
 }
 
 void tty_flush_input(void)
@@ -175,16 +242,12 @@ void tty_write(const int8_t *str)
         return;
     }
 
-    while (*str)
-    {
-        tty_putc((uint8_t)*str++);
-    }
+    uart_write_bytes((const uint8_t *)str, strlen((int8_t *)str));
 }
 
 void tty_write_bytes(const void *buf, size_t len)
 {
     const uint8_t *bytes;
-    size_t i;
 
     if (!buf || !len)
     {
@@ -197,10 +260,7 @@ void tty_write_bytes(const void *buf, size_t len)
      * 单字节调用带来的函数开销和调度抖动。
      */
     bytes = (const uint8_t *)buf;
-    for (i = 0; i < len; i++)
-    {
-        tty_putc(bytes[i]);
-    }
+    uart_write_bytes(bytes, len);
 }
 
 int32_t tty_try_getc(void)
@@ -417,4 +477,97 @@ void tty_mouse_get_state(struct tty_mouse_state *out)
     *out = tty_mouse;
     spin_unlock(&tty_lock);
     write_daif(daif);
+}
+
+int32_t tty_pending_count(void)
+{
+    uint64_t daif;
+    uint32_t count;
+    uint32_t fr;
+
+    daif = read_daif();
+    disable_irq();
+    spin_lock(&tty_lock);
+    if (tty_rx_head >= tty_rx_tail)
+    {
+        count = tty_rx_head - tty_rx_tail;
+    }
+    else
+    {
+        count = (TTY_RX_BUF_SIZE - tty_rx_tail) + tty_rx_head;
+    }
+    /*
+     * 如果环形队列里暂时还没有字节，但 UART 硬件 FIFO 已经收到输入，
+     * 这里也把它算作“有待处理输入”。
+     *
+     * 这样 select/poll 能更快判断 stdin 可读，不会因为 IRQ 与上层轮询
+     * 的极小时间差把编辑器交互拖慢。
+     */
+    if (count == 0)
+    {
+        fr = get32(PL011_UART0_BASE + UART_FR);
+        if ((fr & UART_FR_RXFE) == 0U)
+        {
+            count = 1;
+        }
+    }
+    spin_unlock(&tty_lock);
+    write_daif(daif);
+    return (int32_t)count;
+}
+
+int32_t tty_is_canonical_mode(void)
+{
+    uint64_t daif;
+    int32_t canonical;
+
+    daif = read_daif();
+    disable_irq();
+    spin_lock(&tty_lock);
+    canonical = (tty_termios.lflag & TTY_TERM_LFLAG_ICANON) ? 1 : 0;
+    spin_unlock(&tty_lock);
+    write_daif(daif);
+    return canonical;
+}
+
+void tty_get_termios(struct tty_termios_state *out)
+{
+    uint64_t daif;
+
+    if (!out)
+    {
+        return;
+    }
+
+    daif = read_daif();
+    disable_irq();
+    spin_lock(&tty_lock);
+    *out = tty_termios;
+    spin_unlock(&tty_lock);
+    write_daif(daif);
+}
+
+int32_t tty_set_termios(const struct tty_termios_state *in, int32_t flush_input)
+{
+    uint64_t daif;
+
+    if (!in)
+    {
+        return -1;
+    }
+
+    daif = read_daif();
+    disable_irq();
+    spin_lock(&tty_lock);
+    tty_termios = *in;
+    if (flush_input)
+    {
+        tty_rx_head = 0;
+        tty_rx_tail = 0;
+        tty_line_len = 0;
+        tty_escape_state = 0;
+    }
+    spin_unlock(&tty_lock);
+    write_daif(daif);
+    return 0;
 }

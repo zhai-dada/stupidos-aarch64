@@ -11,11 +11,12 @@
  * 这是一个面向当前内核启动环境的简化 ext4 驱动：
  * 1. 从 GPT 第 2 分区挂载 ext4
  * 2. 支持 extent 树查块
- * 3. 支持目录 lookup、普通文件 read/write
+ * 3. 支持目录 lookup/readdir、普通文件 read/write
+ * 4. 支持最小 create/mkdir（不含 journal）
  *
  * 当前明确不支持：
- * - block/inode 分配
- * - truncate / create / unlink
+ * - 完整 ext4 元数据校验和更新（metadata_csum）
+ * - unlink / rename / 多级 extent 树修改
  * - journal 回放与提交
  */
 #define GPT_SIGNATURE               "EFI PART"
@@ -29,6 +30,7 @@
 #define EXT4_FT_UNKNOWN             0
 #define EXT4_FT_REG_FILE            1
 #define EXT4_FT_DIR                 2
+#define EXT4_DIR_REC_LEN(name_len)  (((uint16_t)(8 + (name_len)) + 3U) & ~3U)
 
 struct gpt_header
 {
@@ -256,6 +258,13 @@ static int ext4_lookup(struct vfs_inode *dir, const int8_t *name, struct vfs_ino
 static int ext4_readdir(struct vfs_inode *dir, uint32_t index, struct vfs_dirent *out);
 static ssize_t ext4_read(struct vfs_inode *inode, uint64_t offset, void *buf, size_t len);
 static ssize_t ext4_write(struct vfs_inode *inode, uint64_t offset, const void *buf, size_t len);
+static int ext4_create(struct vfs_inode *dir, const int8_t *name, uint16_t mode, struct vfs_inode *out);
+static int ext4_mkdir(struct vfs_inode *dir, const int8_t *name, uint16_t mode, struct vfs_inode *out);
+static int ext4_unlink(struct vfs_inode *dir, const int8_t *name, bool dir_only);
+static int ext4_rename(struct vfs_inode *old_dir, const int8_t *old_name,
+                       struct vfs_inode *new_dir, const int8_t *new_name);
+static int ext4_truncate(struct vfs_inode *inode, uint64_t size);
+static uint64_t ext4_desc_inode_table(const struct ext4_group_desc *desc);
 
 static struct vfs_inode_ops ext4_inode_ops;
 static bool ext4_inode_ops_ready;
@@ -275,6 +284,11 @@ static void ext4_init_inode_ops(void)
     ext4_inode_ops.readdir = ext4_readdir;
     ext4_inode_ops.read = ext4_read;
     ext4_inode_ops.write = ext4_write;
+    ext4_inode_ops.create = ext4_create;
+    ext4_inode_ops.mkdir = ext4_mkdir;
+    ext4_inode_ops.unlink = ext4_unlink;
+    ext4_inode_ops.rename = ext4_rename;
+    ext4_inode_ops.truncate = ext4_truncate;
     ext4_inode_ops_ready = true;
 }
 
@@ -399,7 +413,7 @@ static int ext4_read_inode_raw(struct ext4_fs *fs, uint32_t ino, struct ext4_ino
         return -EIO;
     }
 
-    table_block = desc.inode_table_lo;
+    table_block = ext4_desc_inode_table(&desc);
     block = table_block + (((uint64_t)index * fs->inode_size) / fs->block_size);
     offset = ((uint64_t)index * fs->inode_size) % fs->block_size;
 
@@ -429,7 +443,7 @@ static int ext4_write_inode_raw(struct ext4_fs *fs, uint32_t ino, const struct e
         return -EIO;
     }
 
-    table_block = desc.inode_table_lo;
+    table_block = ext4_desc_inode_table(&desc);
     block = table_block + (((uint64_t)index * fs->inode_size) / fs->block_size);
     offset = ((uint64_t)index * fs->inode_size) % fs->block_size;
 
@@ -440,6 +454,550 @@ static int ext4_write_inode_raw(struct ext4_fs *fs, uint32_t ino, const struct e
 
     memcpy((int8_t *)(ext4_block_buf_a + offset), (int8_t *)inode, sizeof(*inode));
     return ext4_write_block(fs, block, ext4_block_buf_a);
+}
+
+static uint64_t ext4_blocks_count(const struct ext4_super_block *sb)
+{
+    return ((uint64_t)sb->blocks_count_hi << 32) | sb->blocks_count_lo;
+}
+
+static uint64_t ext4_free_blocks_count(const struct ext4_super_block *sb)
+{
+    return ((uint64_t)sb->free_blocks_count_hi << 32) | sb->free_blocks_count_lo;
+}
+
+static void ext4_set_free_blocks_count(struct ext4_super_block *sb, uint64_t value)
+{
+    sb->free_blocks_count_lo = (uint32_t)value;
+    sb->free_blocks_count_hi = (uint32_t)(value >> 32);
+}
+
+static uint64_t ext4_desc_block_bitmap(const struct ext4_group_desc *desc)
+{
+    return ((uint64_t)desc->block_bitmap_hi << 32) | desc->block_bitmap_lo;
+}
+
+static uint64_t ext4_desc_inode_bitmap(const struct ext4_group_desc *desc)
+{
+    return ((uint64_t)desc->inode_bitmap_hi << 32) | desc->inode_bitmap_lo;
+}
+
+static uint64_t ext4_desc_inode_table(const struct ext4_group_desc *desc)
+{
+    return ((uint64_t)desc->inode_table_hi << 32) | desc->inode_table_lo;
+}
+
+static uint32_t ext4_desc_free_blocks(const struct ext4_group_desc *desc)
+{
+    return ((uint32_t)desc->free_blocks_count_hi << 16) | desc->free_blocks_count_lo;
+}
+
+static uint32_t ext4_desc_free_inodes(const struct ext4_group_desc *desc)
+{
+    return ((uint32_t)desc->free_inodes_count_hi << 16) | desc->free_inodes_count_lo;
+}
+
+static void ext4_desc_set_free_blocks(struct ext4_group_desc *desc, uint32_t value)
+{
+    desc->free_blocks_count_lo = (uint16_t)(value & 0xffffU);
+    desc->free_blocks_count_hi = (uint16_t)(value >> 16);
+}
+
+static void ext4_desc_set_free_inodes(struct ext4_group_desc *desc, uint32_t value)
+{
+    desc->free_inodes_count_lo = (uint16_t)(value & 0xffffU);
+    desc->free_inodes_count_hi = (uint16_t)(value >> 16);
+}
+
+static int ext4_write_group_desc(const struct ext4_fs *fs, uint32_t group, const struct ext4_group_desc *desc)
+{
+    uint64_t byte_offset;
+    uint64_t block;
+    uint32_t offset;
+
+    byte_offset = (uint64_t)group * fs->group_desc_size;
+    block = fs->gdt_block + (byte_offset / fs->block_size);
+    offset = byte_offset % fs->block_size;
+
+    if (ext4_read_block(fs, block, ext4_block_buf_a))
+    {
+        return -EIO;
+    }
+    memcpy((int8_t *)(ext4_block_buf_a + offset), (int8_t *)desc, sizeof(*desc));
+    if (ext4_write_block(fs, block, ext4_block_buf_a))
+    {
+        return -EIO;
+    }
+    return 0;
+}
+
+static int ext4_read_superblock_raw(struct ext4_fs *fs, struct ext4_super_block *out)
+{
+    if (virtio_blk_read(fs->part_lba_start + 2, ext4_block_buf_a, 2))
+    {
+        return -EIO;
+    }
+    memcpy((int8_t *)out, (int8_t *)ext4_block_buf_a, sizeof(*out));
+    return 0;
+}
+
+static int ext4_write_superblock_raw(struct ext4_fs *fs, const struct ext4_super_block *sb)
+{
+    if (virtio_blk_read(fs->part_lba_start + 2, ext4_block_buf_a, 2))
+    {
+        return -EIO;
+    }
+    memcpy((int8_t *)ext4_block_buf_a, (int8_t *)sb, sizeof(*sb));
+    if (virtio_blk_write(fs->part_lba_start + 2, ext4_block_buf_a, 2))
+    {
+        return -EIO;
+    }
+    return 0;
+}
+
+static int ext4_alloc_inode(struct ext4_fs *fs, uint32_t *out_ino)
+{
+    struct ext4_super_block sb;
+    uint64_t blocks_count;
+    uint32_t group_count;
+    uint32_t group;
+    uint32_t first_ino;
+
+    if (!out_ino)
+    {
+        return -EINVAL;
+    }
+
+    if (ext4_read_superblock_raw(fs, &sb))
+    {
+        return -EIO;
+    }
+
+    blocks_count = ext4_blocks_count(&sb);
+    if (blocks_count == 0)
+    {
+        return -EIO;
+    }
+    group_count = (uint32_t)((blocks_count + fs->blocks_per_group - 1U) / fs->blocks_per_group);
+    first_ino = sb.first_ino ? sb.first_ino : 11U;
+
+    for (group = 0; group < group_count; group++)
+    {
+        struct ext4_group_desc desc;
+        uint64_t bitmap_block;
+        uint32_t free_inodes;
+        uint32_t i;
+
+        if (ext4_read_group_desc(fs, group, &desc))
+        {
+            return -EIO;
+        }
+
+        free_inodes = ext4_desc_free_inodes(&desc);
+        if (free_inodes == 0)
+        {
+            continue;
+        }
+
+        bitmap_block = ext4_desc_inode_bitmap(&desc);
+        if (!bitmap_block || ext4_read_block(fs, bitmap_block, ext4_block_buf_a))
+        {
+            return -EIO;
+        }
+
+        for (i = 0; i < fs->inodes_per_group; i++)
+        {
+            uint32_t ino;
+            uint32_t byte_index;
+            uint8_t bit;
+
+            ino = group * fs->inodes_per_group + i + 1U;
+            if (ino < first_ino)
+            {
+                continue;
+            }
+            if (ino > sb.inodes_count)
+            {
+                break;
+            }
+
+            byte_index = i >> 3;
+            bit = (uint8_t)(1U << (i & 7U));
+            if ((ext4_block_buf_a[byte_index] & bit) != 0)
+            {
+                continue;
+            }
+
+            ext4_block_buf_a[byte_index] |= bit;
+            if (ext4_write_block(fs, bitmap_block, ext4_block_buf_a))
+            {
+                return -EIO;
+            }
+
+            ext4_desc_set_free_inodes(&desc, free_inodes - 1U);
+            if (ext4_write_group_desc(fs, group, &desc))
+            {
+                return -EIO;
+            }
+
+            if (sb.free_inodes_count > 0)
+            {
+                sb.free_inodes_count--;
+                if (ext4_write_superblock_raw(fs, &sb))
+                {
+                    return -EIO;
+                }
+            }
+
+            *out_ino = ino;
+            return 0;
+        }
+    }
+
+    return -ENOSPC;
+}
+
+static int ext4_free_inode(struct ext4_fs *fs, uint32_t ino)
+{
+    struct ext4_super_block sb;
+    struct ext4_group_desc desc;
+    uint32_t group;
+    uint32_t index;
+    uint64_t bitmap_block;
+    uint32_t byte_index;
+    uint8_t bit;
+
+    if (ino == 0)
+    {
+        return -EINVAL;
+    }
+
+    if (ext4_read_superblock_raw(fs, &sb))
+    {
+        return -EIO;
+    }
+
+    group = (ino - 1U) / fs->inodes_per_group;
+    index = (ino - 1U) % fs->inodes_per_group;
+    if (ext4_read_group_desc(fs, group, &desc))
+    {
+        return -EIO;
+    }
+
+    bitmap_block = ext4_desc_inode_bitmap(&desc);
+    if (!bitmap_block || ext4_read_block(fs, bitmap_block, ext4_block_buf_a))
+    {
+        return -EIO;
+    }
+
+    byte_index = index >> 3;
+    bit = (uint8_t)(1U << (index & 7U));
+    if ((ext4_block_buf_a[byte_index] & bit) == 0)
+    {
+        return 0;
+    }
+
+    ext4_block_buf_a[byte_index] &= (uint8_t)~bit;
+    if (ext4_write_block(fs, bitmap_block, ext4_block_buf_a))
+    {
+        return -EIO;
+    }
+
+    ext4_desc_set_free_inodes(&desc, ext4_desc_free_inodes(&desc) + 1U);
+    if (ext4_write_group_desc(fs, group, &desc))
+    {
+        return -EIO;
+    }
+
+    sb.free_inodes_count++;
+    if (ext4_write_superblock_raw(fs, &sb))
+    {
+        return -EIO;
+    }
+
+    return 0;
+}
+
+static int ext4_alloc_block(struct ext4_fs *fs, uint64_t *out_block)
+{
+    struct ext4_super_block sb;
+    uint64_t blocks_count;
+    uint32_t group_count;
+    uint32_t group;
+    uint64_t first_data_block;
+
+    if (!out_block)
+    {
+        return -EINVAL;
+    }
+
+    if (ext4_read_superblock_raw(fs, &sb))
+    {
+        return -EIO;
+    }
+
+    blocks_count = ext4_blocks_count(&sb);
+    if (blocks_count == 0)
+    {
+        return -EIO;
+    }
+    first_data_block = sb.first_data_block;
+    group_count = (uint32_t)((blocks_count + fs->blocks_per_group - 1U) / fs->blocks_per_group);
+
+    for (group = 0; group < group_count; group++)
+    {
+        struct ext4_group_desc desc;
+        uint64_t bitmap_block;
+        uint64_t group_first_block;
+        uint32_t free_blocks;
+        uint32_t i;
+
+        if (ext4_read_group_desc(fs, group, &desc))
+        {
+            return -EIO;
+        }
+
+        free_blocks = ext4_desc_free_blocks(&desc);
+        if (free_blocks == 0)
+        {
+            continue;
+        }
+
+        bitmap_block = ext4_desc_block_bitmap(&desc);
+        if (!bitmap_block || ext4_read_block(fs, bitmap_block, ext4_block_buf_a))
+        {
+            return -EIO;
+        }
+
+        group_first_block = first_data_block + ((uint64_t)group * fs->blocks_per_group);
+        for (i = 0; i < fs->blocks_per_group; i++)
+        {
+            uint64_t block;
+            uint32_t byte_index;
+            uint8_t bit;
+
+            block = group_first_block + i;
+            if (block >= blocks_count)
+            {
+                break;
+            }
+
+            byte_index = i >> 3;
+            bit = (uint8_t)(1U << (i & 7U));
+            if ((ext4_block_buf_a[byte_index] & bit) != 0)
+            {
+                continue;
+            }
+
+            ext4_block_buf_a[byte_index] |= bit;
+            if (ext4_write_block(fs, bitmap_block, ext4_block_buf_a))
+            {
+                return -EIO;
+            }
+
+            ext4_desc_set_free_blocks(&desc, free_blocks - 1U);
+            if (ext4_write_group_desc(fs, group, &desc))
+            {
+                return -EIO;
+            }
+
+            if (ext4_free_blocks_count(&sb) > 0)
+            {
+                ext4_set_free_blocks_count(&sb, ext4_free_blocks_count(&sb) - 1U);
+                if (ext4_write_superblock_raw(fs, &sb))
+                {
+                    return -EIO;
+                }
+            }
+
+            *out_block = block;
+            return 0;
+        }
+    }
+
+    return -ENOSPC;
+}
+
+static int ext4_free_block(struct ext4_fs *fs, uint64_t block)
+{
+    struct ext4_super_block sb;
+    struct ext4_group_desc desc;
+    uint64_t blocks_count;
+    uint64_t first_data_block;
+    uint32_t group;
+    uint32_t index;
+    uint64_t bitmap_block;
+    uint32_t byte_index;
+    uint8_t bit;
+
+    if (ext4_read_superblock_raw(fs, &sb))
+    {
+        return -EIO;
+    }
+
+    blocks_count = ext4_blocks_count(&sb);
+    first_data_block = sb.first_data_block;
+    if (block < first_data_block || block >= blocks_count)
+    {
+        return -EINVAL;
+    }
+
+    group = (uint32_t)((block - first_data_block) / fs->blocks_per_group);
+    index = (uint32_t)((block - first_data_block) % fs->blocks_per_group);
+
+    if (ext4_read_group_desc(fs, group, &desc))
+    {
+        return -EIO;
+    }
+    bitmap_block = ext4_desc_block_bitmap(&desc);
+    if (!bitmap_block || ext4_read_block(fs, bitmap_block, ext4_block_buf_a))
+    {
+        return -EIO;
+    }
+
+    byte_index = index >> 3;
+    bit = (uint8_t)(1U << (index & 7U));
+    if ((ext4_block_buf_a[byte_index] & bit) == 0)
+    {
+        return 0;
+    }
+
+    ext4_block_buf_a[byte_index] &= (uint8_t)~bit;
+    if (ext4_write_block(fs, bitmap_block, ext4_block_buf_a))
+    {
+        return -EIO;
+    }
+
+    ext4_desc_set_free_blocks(&desc, ext4_desc_free_blocks(&desc) + 1U);
+    if (ext4_write_group_desc(fs, group, &desc))
+    {
+        return -EIO;
+    }
+
+    ext4_set_free_blocks_count(&sb, ext4_free_blocks_count(&sb) + 1U);
+    if (ext4_write_superblock_raw(fs, &sb))
+    {
+        return -EIO;
+    }
+
+    return 0;
+}
+
+static int ext4_inode_add_extent_block(const struct ext4_fs *fs, struct ext4_inode_disk *inode,
+                                       uint32_t logical, uint64_t phys_block)
+{
+    struct ext4_extent_header *eh;
+    struct ext4_extent *ext;
+    uint16_t i;
+    uint16_t insert_pos;
+
+    if (!fs || !inode)
+    {
+        return -EINVAL;
+    }
+
+    inode->flags |= EXT4_EXTENTS_FL;
+    eh = (struct ext4_extent_header *)inode->block;
+    if (eh->magic != EXT4_EXT_MAGIC)
+    {
+        memset((int8_t *)inode->block, 0, sizeof(inode->block));
+        eh = (struct ext4_extent_header *)inode->block;
+        eh->magic = EXT4_EXT_MAGIC;
+        eh->entries = 0;
+        eh->depth = 0;
+        eh->max = (uint16_t)((sizeof(inode->block) - sizeof(*eh)) / sizeof(struct ext4_extent));
+        eh->generation = 0;
+    }
+
+    if (eh->depth != 0)
+    {
+        return -ENOTSUP;
+    }
+
+    ext = (struct ext4_extent *)((uint8_t *)inode->block + sizeof(*eh));
+    for (i = 0; i < eh->entries; i++)
+    {
+        uint32_t len = ext[i].ee_len & 0x7fffU;
+        if (logical >= ext[i].ee_block && logical < ext[i].ee_block + len)
+        {
+            return -EEXIST;
+        }
+    }
+
+    /*
+     * 关键路径（中文）：
+     * 先尝试和已有 extent 做“连续块合并”，能有效减少 extent 条目消耗，
+     * 对后续频繁 append 写文件（如 tcc 输出）很重要。
+     */
+    if (eh->entries > 0)
+    {
+        struct ext4_extent *last = &ext[eh->entries - 1];
+        uint32_t last_len = last->ee_len & 0x7fffU;
+        uint64_t last_phys_end = ext4_extent_start(last) + last_len;
+        if (logical == last->ee_block + last_len &&
+            phys_block == last_phys_end &&
+            last_len < 0x7fffU)
+        {
+            last->ee_len = (uint16_t)(last_len + 1U);
+            inode->blocks_lo += fs->block_size / 512U;
+            return 0;
+        }
+    }
+
+    if (eh->entries >= eh->max)
+    {
+        return -ENOSPC;
+    }
+
+    insert_pos = eh->entries;
+    for (i = 0; i < eh->entries; i++)
+    {
+        if (logical < ext[i].ee_block)
+        {
+            insert_pos = i;
+            break;
+        }
+    }
+
+    for (i = eh->entries; i > insert_pos; i--)
+    {
+        ext[i] = ext[i - 1];
+    }
+
+    ext[insert_pos].ee_block = logical;
+    ext[insert_pos].ee_len = 1;
+    ext[insert_pos].ee_start_hi = (uint16_t)(phys_block >> 32);
+    ext[insert_pos].ee_start_lo = (uint32_t)phys_block;
+    eh->entries++;
+    inode->blocks_lo += fs->block_size / 512U;
+    return 0;
+}
+
+static int ext4_init_new_inode(struct ext4_inode_disk *inode, uint16_t mode, uint16_t links)
+{
+    struct ext4_extent_header *eh;
+
+    if (!inode)
+    {
+        return -EINVAL;
+    }
+
+    memset((int8_t *)inode, 0, sizeof(*inode));
+    inode->mode = mode;
+    inode->uid = 0;
+    inode->gid = 0;
+    inode->links_count = links;
+    inode->flags = EXT4_EXTENTS_FL;
+    inode->blocks_lo = 0;
+    ext4_set_inode_size(inode, 0);
+
+    eh = (struct ext4_extent_header *)inode->block;
+    eh->magic = EXT4_EXT_MAGIC;
+    eh->entries = 0;
+    eh->max = (uint16_t)((sizeof(inode->block) - sizeof(*eh)) / sizeof(struct ext4_extent));
+    eh->depth = 0;
+    eh->generation = 0;
+    return 0;
 }
 
 static int ext4_map_extent_block(const struct ext4_fs *fs, const struct ext4_inode_disk *inode,
@@ -725,6 +1283,414 @@ static int ext4_readdir(struct vfs_inode *dir, uint32_t index, struct vfs_dirent
     return -ENOENT;
 }
 
+static void ext4_dir_entry_fill(struct ext4_dir_entry_2 *de, uint32_t ino, uint16_t rec_len,
+                                uint8_t file_type, const int8_t *name, uint8_t name_len)
+{
+    de->inode = ino;
+    de->rec_len = rec_len;
+    de->name_len = name_len;
+    de->file_type = file_type;
+    if (name_len)
+    {
+        memcpy(de->name, (int8_t *)name, name_len);
+    }
+}
+
+struct ext4_dir_loc
+{
+    uint64_t phys_block;
+    uint32_t off;
+    uint32_t prev_off;
+    uint16_t rec_len;
+    uint32_t inode;
+    uint8_t file_type;
+    uint8_t name_len;
+};
+
+static uint8_t ext4_file_type_from_mode(uint16_t mode)
+{
+    if ((mode & VFS_S_IFMT) == VFS_S_IFDIR)
+    {
+        return EXT4_FT_DIR;
+    }
+    if ((mode & VFS_S_IFMT) == VFS_S_IFREG)
+    {
+        return EXT4_FT_REG_FILE;
+    }
+    return EXT4_FT_UNKNOWN;
+}
+
+static int ext4_dir_find_entry(struct ext4_fs *fs, const struct ext4_inode_disk *dir_inode,
+                               const int8_t *name, struct ext4_dir_loc *out_loc)
+{
+    uint64_t size;
+    uint32_t block_count;
+    uint32_t logical;
+    size_t name_len;
+
+    if (!fs || !dir_inode || !name || !out_loc)
+    {
+        return -EINVAL;
+    }
+
+    name_len = strlen((int8_t *)name);
+    if (name_len == 0 || name_len > VFS_NAME_MAX)
+    {
+        return -EINVAL;
+    }
+
+    size = ext4_inode_size(dir_inode);
+    block_count = (uint32_t)((size + fs->block_size - 1U) / fs->block_size);
+    for (logical = 0; logical < block_count; logical++)
+    {
+        uint64_t phys_block;
+        uint32_t off;
+        uint32_t prev_off;
+
+        if (ext4_map_extent_block(fs, dir_inode, logical, &phys_block))
+        {
+            continue;
+        }
+        if (ext4_read_block(fs, phys_block, ext4_block_buf_a))
+        {
+            return -EIO;
+        }
+
+        off = 0;
+        prev_off = 0xffffffffU;
+        while (off < fs->block_size)
+        {
+            struct ext4_dir_entry_2 *de = (struct ext4_dir_entry_2 *)(ext4_block_buf_a + off);
+
+            if (de->rec_len < 8U || off + de->rec_len > fs->block_size)
+            {
+                return -EIO;
+            }
+
+            if (de->inode &&
+                de->name_len == name_len &&
+                memcmp(de->name, (int8_t *)name, name_len) == 0)
+            {
+                out_loc->phys_block = phys_block;
+                out_loc->off = off;
+                out_loc->prev_off = prev_off;
+                out_loc->rec_len = de->rec_len;
+                out_loc->inode = de->inode;
+                out_loc->file_type = de->file_type;
+                out_loc->name_len = de->name_len;
+                return 0;
+            }
+
+            prev_off = off;
+            off += de->rec_len;
+        }
+    }
+
+    return -ENOENT;
+}
+
+static int ext4_dir_remove_entry(struct ext4_fs *fs, const struct ext4_dir_loc *loc)
+{
+    struct ext4_dir_entry_2 *de;
+
+    if (!fs || !loc)
+    {
+        return -EINVAL;
+    }
+    if (ext4_read_block(fs, loc->phys_block, ext4_block_buf_a))
+    {
+        return -EIO;
+    }
+
+    de = (struct ext4_dir_entry_2 *)(ext4_block_buf_a + loc->off);
+    if (de->inode != loc->inode)
+    {
+        return -EIO;
+    }
+
+    if (loc->prev_off != 0xffffffffU)
+    {
+        struct ext4_dir_entry_2 *prev = (struct ext4_dir_entry_2 *)(ext4_block_buf_a + loc->prev_off);
+        uint32_t sum = (uint32_t)prev->rec_len + (uint32_t)de->rec_len;
+        if (sum > 0xffffU)
+        {
+            return -EIO;
+        }
+        prev->rec_len = (uint16_t)sum;
+    }
+    else
+    {
+        de->inode = 0;
+        de->name_len = 0;
+        de->file_type = EXT4_FT_UNKNOWN;
+    }
+
+    if (ext4_write_block(fs, loc->phys_block, ext4_block_buf_a))
+    {
+        return -EIO;
+    }
+    return 0;
+}
+
+static int ext4_dir_is_empty(struct ext4_fs *fs, const struct ext4_inode_disk *dir_inode, bool *out_empty)
+{
+    uint64_t size;
+    uint32_t block_count;
+    uint32_t logical;
+
+    if (!fs || !dir_inode || !out_empty)
+    {
+        return -EINVAL;
+    }
+    *out_empty = true;
+
+    size = ext4_inode_size(dir_inode);
+    block_count = (uint32_t)((size + fs->block_size - 1U) / fs->block_size);
+    for (logical = 0; logical < block_count; logical++)
+    {
+        uint64_t phys_block;
+        uint32_t off;
+
+        if (ext4_map_extent_block(fs, dir_inode, logical, &phys_block))
+        {
+            continue;
+        }
+        if (ext4_read_block(fs, phys_block, ext4_block_buf_a))
+        {
+            return -EIO;
+        }
+
+        off = 0;
+        while (off < fs->block_size)
+        {
+            struct ext4_dir_entry_2 *de = (struct ext4_dir_entry_2 *)(ext4_block_buf_a + off);
+            if (de->rec_len < 8U || off + de->rec_len > fs->block_size)
+            {
+                return -EIO;
+            }
+
+            if (de->inode && !ext4_dirent_is_skip(de))
+            {
+                *out_empty = false;
+                return 0;
+            }
+            off += de->rec_len;
+        }
+    }
+
+    return 0;
+}
+
+static int ext4_free_inode_data_blocks(struct ext4_fs *fs, const struct ext4_inode_disk *inode)
+{
+    struct ext4_extent_header *eh;
+    struct ext4_extent *ext;
+    uint16_t i;
+
+    if (!fs || !inode)
+    {
+        return -EINVAL;
+    }
+
+    if ((inode->flags & EXT4_EXTENTS_FL) == 0)
+    {
+        return 0;
+    }
+    eh = (struct ext4_extent_header *)inode->block;
+    if (eh->magic != EXT4_EXT_MAGIC)
+    {
+        return 0;
+    }
+    if (eh->depth != 0)
+    {
+        /*
+         * 兼容策略（中文）：
+         * 深度>0 的 extent 树释放逻辑尚未实现，这里先保持“功能优先”：
+         * unlink/rmdir 可以继续完成，但该 inode 的数据块可能延后回收。
+         */
+        return 0;
+    }
+
+    ext = (struct ext4_extent *)((uint8_t *)inode->block + sizeof(*eh));
+    for (i = 0; i < eh->entries; i++)
+    {
+        uint32_t len = ext[i].ee_len & 0x7fffU;
+        uint64_t start = ext4_extent_start(&ext[i]);
+        uint32_t j;
+
+        for (j = 0; j < len; j++)
+        {
+            int ret = ext4_free_block(fs, start + j);
+            if (ret)
+            {
+                return ret;
+            }
+        }
+    }
+
+    return 0;
+}
+
+static int ext4_dir_try_add_in_block(struct ext4_fs *fs, uint64_t phys_block,
+                                     uint32_t child_ino, const int8_t *name, uint8_t name_len, uint8_t file_type)
+{
+    uint16_t need;
+    uint32_t off;
+
+    if (ext4_read_block(fs, phys_block, ext4_block_buf_a))
+    {
+        return -EIO;
+    }
+
+    need = EXT4_DIR_REC_LEN(name_len);
+    off = 0;
+    while (off < fs->block_size)
+    {
+        struct ext4_dir_entry_2 *de = (struct ext4_dir_entry_2 *)(ext4_block_buf_a + off);
+        uint16_t rec_len;
+
+        rec_len = de->rec_len;
+        if (rec_len < 8U || off + rec_len > fs->block_size)
+        {
+            return -EIO;
+        }
+
+        if (de->inode == 0)
+        {
+            if (rec_len >= need)
+            {
+                uint16_t remain = rec_len - need;
+                if (remain >= 8U)
+                {
+                    struct ext4_dir_entry_2 *next = (struct ext4_dir_entry_2 *)(ext4_block_buf_a + off + need);
+                    memset((int8_t *)next, 0, remain);
+                    next->rec_len = remain;
+                    rec_len = need;
+                }
+                ext4_dir_entry_fill(de, child_ino, rec_len, file_type, name, name_len);
+                if (ext4_write_block(fs, phys_block, ext4_block_buf_a))
+                {
+                    return -EIO;
+                }
+                return 0;
+            }
+        }
+        else
+        {
+            uint16_t used = EXT4_DIR_REC_LEN(de->name_len);
+            if (rec_len >= used && rec_len - used >= need)
+            {
+                struct ext4_dir_entry_2 *new_de = (struct ext4_dir_entry_2 *)(ext4_block_buf_a + off + used);
+                uint16_t new_rec_len = rec_len - used;
+                de->rec_len = used;
+                ext4_dir_entry_fill(new_de, child_ino, new_rec_len, file_type, name, name_len);
+                if (ext4_write_block(fs, phys_block, ext4_block_buf_a))
+                {
+                    return -EIO;
+                }
+                return 0;
+            }
+        }
+
+        off += rec_len;
+    }
+
+    return -ENOSPC;
+}
+
+static int ext4_dir_add_entry(struct ext4_fs *fs, uint32_t dir_ino, struct ext4_inode_disk *dir_inode,
+                              uint32_t child_ino, const int8_t *name, uint8_t file_type)
+{
+    uint64_t size;
+    uint32_t block_count;
+    uint32_t logical;
+    size_t raw_name_len;
+    uint8_t name_len;
+
+    if (!fs || !dir_inode || !name)
+    {
+        return -EINVAL;
+    }
+
+    raw_name_len = strlen((int8_t *)name);
+    if (raw_name_len == 0 || raw_name_len > VFS_NAME_MAX)
+    {
+        return -EINVAL;
+    }
+    if (raw_name_len > 255U)
+    {
+        return -ENAMETOOLONG;
+    }
+    name_len = (uint8_t)raw_name_len;
+
+    size = ext4_inode_size(dir_inode);
+    block_count = (uint32_t)((size + fs->block_size - 1U) / fs->block_size);
+    for (logical = 0; logical < block_count; logical++)
+    {
+        uint64_t phys_block;
+        int ret;
+
+        ret = ext4_map_extent_block(fs, dir_inode, logical, &phys_block);
+        if (ret)
+        {
+            continue;
+        }
+
+        ret = ext4_dir_try_add_in_block(fs, phys_block, child_ino, name, name_len, file_type);
+        if (ret == 0)
+        {
+            return 0;
+        }
+        if (ret != -ENOSPC)
+        {
+            return ret;
+        }
+    }
+
+    /*
+     * 目录无空洞时按 ext4 语义增长一个新块：
+     * 1) 分配数据块；
+     * 2) 在 inode extent 中挂上 logical->physical 映射；
+     * 3) 回写 inode，再写目录项数据。
+     */
+    {
+        uint64_t new_block;
+        uint32_t new_logical;
+        int ret;
+
+        ret = ext4_alloc_block(fs, &new_block);
+        if (ret)
+        {
+            return ret;
+        }
+
+        memset((int8_t *)ext4_block_buf_a, 0, fs->block_size);
+        ext4_dir_entry_fill((struct ext4_dir_entry_2 *)ext4_block_buf_a,
+                            child_ino, (uint16_t)fs->block_size, file_type, name, name_len);
+        if (ext4_write_block(fs, new_block, ext4_block_buf_a))
+        {
+            ext4_free_block(fs, new_block);
+            return -EIO;
+        }
+
+        new_logical = block_count;
+        ret = ext4_inode_add_extent_block(fs, dir_inode, new_logical, new_block);
+        if (ret)
+        {
+            ext4_free_block(fs, new_block);
+            return ret;
+        }
+
+        ext4_set_inode_size(dir_inode, size + fs->block_size);
+        if (ext4_write_inode_raw(fs, dir_ino, dir_inode))
+        {
+            return -EIO;
+        }
+    }
+
+    return 0;
+}
+
 static ssize_t ext4_read(struct vfs_inode *inode, uint64_t offset, void *buf, size_t len)
 {
     struct ext4_fs *fs;
@@ -820,7 +1786,31 @@ static ssize_t ext4_write(struct vfs_inode *inode, uint64_t offset, const void *
 
         if (ext4_map_extent_block(fs, &raw_inode, logical, &phys_block))
         {
-            return done ? (ssize_t)done : -ENOSPC;
+            uint64_t new_block;
+            int alloc_ret;
+
+            /*
+             * 关键修复（中文）：
+             * 旧实现只能覆盖“已有映射块”，对新建文件第一次写入会直接 ENOSPC。
+             * 这里在缺块时即时分配 block 并追加 extent，让 O_CREAT + write 真正可用。
+             */
+            alloc_ret = ext4_alloc_block(fs, &new_block);
+            if (alloc_ret)
+            {
+                return done ? (ssize_t)done : alloc_ret;
+            }
+            alloc_ret = ext4_inode_add_extent_block(fs, &raw_inode, logical, new_block);
+            if (alloc_ret)
+            {
+                ext4_free_block(fs, new_block);
+                return done ? (ssize_t)done : alloc_ret;
+            }
+            if (ext4_write_inode_raw(fs, inode->ino, &raw_inode))
+            {
+                ext4_free_block(fs, new_block);
+                return done ? (ssize_t)done : -EIO;
+            }
+            phys_block = new_block;
         }
 
         if (block_off || chunk != fs->block_size)
@@ -856,6 +1846,420 @@ static ssize_t ext4_write(struct vfs_inode *inode, uint64_t offset, const void *
     }
 
     return done;
+}
+
+static int ext4_create(struct vfs_inode *dir, const int8_t *name, uint16_t mode, struct vfs_inode *out)
+{
+    struct ext4_fs *fs;
+    struct ext4_inode_disk parent_raw;
+    struct ext4_inode_disk child_raw;
+    struct vfs_inode exists;
+    uint32_t ino;
+    int ret;
+
+    if (!dir || !name || name[0] == '\0')
+    {
+        return -EINVAL;
+    }
+
+    if (strlen((int8_t *)name) > VFS_NAME_MAX)
+    {
+        return -ENAMETOOLONG;
+    }
+
+    fs = (struct ext4_fs *)dir->fs_private;
+    ret = ext4_lookup(dir, name, &exists);
+    if (ret == 0)
+    {
+        return -EEXIST;
+    }
+    if (ret != -ENOENT)
+    {
+        return ret;
+    }
+
+    if (ext4_read_inode_raw(fs, dir->ino, &parent_raw))
+    {
+        return -EIO;
+    }
+    if ((parent_raw.mode & VFS_S_IFMT) != VFS_S_IFDIR)
+    {
+        return -ENOTDIR;
+    }
+
+    ret = ext4_alloc_inode(fs, &ino);
+    if (ret)
+    {
+        return ret;
+    }
+
+    ext4_init_new_inode(&child_raw, (uint16_t)(VFS_S_IFREG | (mode & 0777U)), 1U);
+    if (ext4_write_inode_raw(fs, ino, &child_raw))
+    {
+        ext4_free_inode(fs, ino);
+        return -EIO;
+    }
+
+    ret = ext4_dir_add_entry(fs, dir->ino, &parent_raw, ino, name, EXT4_FT_REG_FILE);
+    if (ret)
+    {
+        ext4_free_inode(fs, ino);
+        return ret;
+    }
+
+    if (out)
+    {
+        return ext4_fill_vfs_inode(fs, ino, out);
+    }
+    return 0;
+}
+
+static int ext4_mkdir(struct vfs_inode *dir, const int8_t *name, uint16_t mode, struct vfs_inode *out)
+{
+    struct ext4_fs *fs;
+    struct ext4_inode_disk parent_raw;
+    struct ext4_inode_disk child_raw;
+    struct vfs_inode exists;
+    uint32_t ino;
+    uint64_t block;
+    int ret;
+
+    if (!dir || !name || name[0] == '\0')
+    {
+        return -EINVAL;
+    }
+    if (strlen((int8_t *)name) > VFS_NAME_MAX)
+    {
+        return -ENAMETOOLONG;
+    }
+
+    fs = (struct ext4_fs *)dir->fs_private;
+    ret = ext4_lookup(dir, name, &exists);
+    if (ret == 0)
+    {
+        return -EEXIST;
+    }
+    if (ret != -ENOENT)
+    {
+        return ret;
+    }
+
+    if (ext4_read_inode_raw(fs, dir->ino, &parent_raw))
+    {
+        return -EIO;
+    }
+    if ((parent_raw.mode & VFS_S_IFMT) != VFS_S_IFDIR)
+    {
+        return -ENOTDIR;
+    }
+
+    ret = ext4_alloc_inode(fs, &ino);
+    if (ret)
+    {
+        return ret;
+    }
+
+    ext4_init_new_inode(&child_raw, (uint16_t)(VFS_S_IFDIR | (mode & 0777U)), 2U);
+    ret = ext4_alloc_block(fs, &block);
+    if (ret)
+    {
+        ext4_free_inode(fs, ino);
+        return ret;
+    }
+
+    ret = ext4_inode_add_extent_block(fs, &child_raw, 0, block);
+    if (ret)
+    {
+        ext4_free_block(fs, block);
+        ext4_free_inode(fs, ino);
+        return ret;
+    }
+    ext4_set_inode_size(&child_raw, fs->block_size);
+
+    memset((int8_t *)ext4_block_buf_a, 0, fs->block_size);
+    ext4_dir_entry_fill((struct ext4_dir_entry_2 *)ext4_block_buf_a, ino, EXT4_DIR_REC_LEN(1), EXT4_FT_DIR, (const int8_t *)".", 1);
+    ext4_dir_entry_fill((struct ext4_dir_entry_2 *)(ext4_block_buf_a + EXT4_DIR_REC_LEN(1)),
+                        dir->ino, (uint16_t)(fs->block_size - EXT4_DIR_REC_LEN(1)), EXT4_FT_DIR, (const int8_t *)"..", 2);
+    if (ext4_write_block(fs, block, ext4_block_buf_a))
+    {
+        ext4_free_block(fs, block);
+        ext4_free_inode(fs, ino);
+        return -EIO;
+    }
+
+    if (ext4_write_inode_raw(fs, ino, &child_raw))
+    {
+        ext4_free_block(fs, block);
+        ext4_free_inode(fs, ino);
+        return -EIO;
+    }
+
+    ret = ext4_dir_add_entry(fs, dir->ino, &parent_raw, ino, name, EXT4_FT_DIR);
+    if (ret)
+    {
+        ext4_free_block(fs, block);
+        ext4_free_inode(fs, ino);
+        return ret;
+    }
+
+    if (parent_raw.links_count < 0xffffU)
+    {
+        parent_raw.links_count++;
+        if (ext4_write_inode_raw(fs, dir->ino, &parent_raw))
+        {
+            return -EIO;
+        }
+    }
+
+    if (out)
+    {
+        return ext4_fill_vfs_inode(fs, ino, out);
+    }
+    return 0;
+}
+
+static int ext4_unlink(struct vfs_inode *dir, const int8_t *name, bool dir_only)
+{
+    struct ext4_fs *fs;
+    struct ext4_inode_disk parent_raw;
+    struct ext4_inode_disk child_raw;
+    struct ext4_dir_loc loc;
+    struct ext4_inode_disk cleared;
+    uint16_t type;
+    bool empty;
+    int ret;
+
+    if (!dir || !name || name[0] == '\0')
+    {
+        return -EINVAL;
+    }
+    if (strlen((int8_t *)name) > VFS_NAME_MAX)
+    {
+        return -ENAMETOOLONG;
+    }
+
+    fs = (struct ext4_fs *)dir->fs_private;
+    if (ext4_read_inode_raw(fs, dir->ino, &parent_raw))
+    {
+        return -EIO;
+    }
+    if ((parent_raw.mode & VFS_S_IFMT) != VFS_S_IFDIR)
+    {
+        return -ENOTDIR;
+    }
+
+    ret = ext4_dir_find_entry(fs, &parent_raw, name, &loc);
+    if (ret)
+    {
+        return ret;
+    }
+    if (ext4_read_inode_raw(fs, loc.inode, &child_raw))
+    {
+        return -EIO;
+    }
+
+    type = child_raw.mode & VFS_S_IFMT;
+    if (dir_only)
+    {
+        if (type != VFS_S_IFDIR)
+        {
+            return -ENOTDIR;
+        }
+        ret = ext4_dir_is_empty(fs, &child_raw, &empty);
+        if (ret)
+        {
+            return ret;
+        }
+        if (!empty)
+        {
+            return -ENOTEMPTY;
+        }
+    }
+    else
+    {
+        if (type == VFS_S_IFDIR)
+        {
+            return -EISDIR;
+        }
+    }
+
+    ret = ext4_dir_remove_entry(fs, &loc);
+    if (ret)
+    {
+        return ret;
+    }
+
+    if (dir_only && parent_raw.links_count > 0)
+    {
+        parent_raw.links_count--;
+        if (ext4_write_inode_raw(fs, dir->ino, &parent_raw))
+        {
+            return -EIO;
+        }
+    }
+
+    ret = ext4_free_inode_data_blocks(fs, &child_raw);
+    if (ret)
+    {
+        return ret;
+    }
+
+    memset((int8_t *)&cleared, 0, sizeof(cleared));
+    if (ext4_write_inode_raw(fs, loc.inode, &cleared))
+    {
+        return -EIO;
+    }
+
+    return ext4_free_inode(fs, loc.inode);
+}
+
+static int ext4_rename(struct vfs_inode *old_dir, const int8_t *old_name,
+                       struct vfs_inode *new_dir, const int8_t *new_name)
+{
+    struct ext4_fs *fs;
+    struct ext4_inode_disk old_parent_raw;
+    struct ext4_inode_disk new_parent_raw;
+    struct ext4_inode_disk child_raw;
+    struct ext4_dir_loc old_loc;
+    struct ext4_dir_loc new_loc;
+    int ret;
+    uint8_t file_type;
+
+    if (!old_dir || !new_dir || !old_name || !new_name ||
+        old_name[0] == '\0' || new_name[0] == '\0')
+    {
+        return -EINVAL;
+    }
+    if (strlen((int8_t *)old_name) > VFS_NAME_MAX || strlen((int8_t *)new_name) > VFS_NAME_MAX)
+    {
+        return -ENAMETOOLONG;
+    }
+
+    if (old_dir->sb != new_dir->sb)
+    {
+        return -EXDEV;
+    }
+    if (strcmp((int8_t *)old_name, (int8_t *)new_name) == 0 && old_dir->ino == new_dir->ino)
+    {
+        return 0;
+    }
+
+    fs = (struct ext4_fs *)old_dir->fs_private;
+    if (ext4_read_inode_raw(fs, old_dir->ino, &old_parent_raw) ||
+        ext4_read_inode_raw(fs, new_dir->ino, &new_parent_raw))
+    {
+        return -EIO;
+    }
+    if ((old_parent_raw.mode & VFS_S_IFMT) != VFS_S_IFDIR ||
+        (new_parent_raw.mode & VFS_S_IFMT) != VFS_S_IFDIR)
+    {
+        return -ENOTDIR;
+    }
+
+    ret = ext4_dir_find_entry(fs, &old_parent_raw, old_name, &old_loc);
+    if (ret)
+    {
+        return ret;
+    }
+    ret = ext4_dir_find_entry(fs, &new_parent_raw, new_name, &new_loc);
+    if (ret == 0)
+    {
+        return -EEXIST;
+    }
+    if (ret != -ENOENT)
+    {
+        return ret;
+    }
+
+    if (ext4_read_inode_raw(fs, old_loc.inode, &child_raw))
+    {
+        return -EIO;
+    }
+
+    if ((child_raw.mode & VFS_S_IFMT) == VFS_S_IFDIR && old_dir->ino != new_dir->ino)
+    {
+        /*
+         * 先保证稳定语义：目录跨父目录移动需要维护 ".." 和 link 计数，
+         * 当前这条路径先显式拒绝，避免生成不一致目录结构。
+         */
+        return -EXDEV;
+    }
+
+    file_type = old_loc.file_type;
+    if (file_type == EXT4_FT_UNKNOWN)
+    {
+        file_type = ext4_file_type_from_mode(child_raw.mode);
+    }
+
+    ret = ext4_dir_add_entry(fs, new_dir->ino, &new_parent_raw, old_loc.inode, new_name, file_type);
+    if (ret)
+    {
+        return ret;
+    }
+
+    if (ext4_read_inode_raw(fs, old_dir->ino, &old_parent_raw))
+    {
+        return -EIO;
+    }
+    ret = ext4_dir_find_entry(fs, &old_parent_raw, old_name, &old_loc);
+    if (ret)
+    {
+        return ret;
+    }
+    ret = ext4_dir_remove_entry(fs, &old_loc);
+    if (ret)
+    {
+        /*
+         * 尝试回滚新目录项，避免 rename 失败后出现“双名指向”。
+         */
+        if (ext4_read_inode_raw(fs, new_dir->ino, &new_parent_raw) == 0 &&
+            ext4_dir_find_entry(fs, &new_parent_raw, new_name, &new_loc) == 0)
+        {
+            (void)ext4_dir_remove_entry(fs, &new_loc);
+        }
+        return ret;
+    }
+
+    return 0;
+}
+
+static int ext4_truncate(struct vfs_inode *inode, uint64_t size)
+{
+    struct ext4_fs *fs;
+    struct ext4_inode_disk raw_inode;
+
+    if (!inode)
+    {
+        return -EINVAL;
+    }
+
+    fs = (struct ext4_fs *)inode->fs_private;
+    if (ext4_read_inode_raw(fs, inode->ino, &raw_inode))
+    {
+        return -EIO;
+    }
+    if ((raw_inode.mode & VFS_S_IFMT) != VFS_S_IFREG)
+    {
+        return -EISDIR;
+    }
+
+    /*
+     * 最小 truncate 语义（中文）：
+     * 目前仅保证 size<=原大小时元数据可更新，不释放块，避免把“根分区可写”目标拖慢。
+     * 后续可继续补真实块回收。
+     */
+    if (size > ext4_inode_size(&raw_inode))
+    {
+        return -ENOTSUP;
+    }
+
+    ext4_set_inode_size(&raw_inode, size);
+    if (ext4_write_inode_raw(fs, inode->ino, &raw_inode))
+    {
+        return -EIO;
+    }
+    inode->size = size;
+    return 0;
 }
 
 int ext4_mount_root(void)

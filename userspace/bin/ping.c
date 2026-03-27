@@ -212,6 +212,41 @@ static int ping_parse_ipv4(const int8_t *str, uint32_t *out)
     return 0;
 }
 
+static int ping_resolve_host(const int8_t *host, uint32_t *out)
+{
+    int8_t host_buf[128];
+    uint32_t resolved;
+    size_t len;
+
+    if (!host || !out)
+    {
+        return -1;
+    }
+
+    len = u_strnlen(host, sizeof(host_buf) - 1U);
+    if (len == 0 || len >= sizeof(host_buf))
+    {
+        return -1;
+    }
+
+    u_memcpy(host_buf, host, len);
+    host_buf[len] = '\0';
+
+    if (ping_parse_ipv4(host_buf, &resolved) == 0)
+    {
+        *out = resolved;
+        return 0;
+    }
+
+    if (u_dns_lookup(host_buf, &resolved, 3000U) == 0)
+    {
+        *out = resolved;
+        return 0;
+    }
+
+    return -1;
+}
+
 static void ping_sleep_ms(uint32_t ms)
 {
     if (!ms)
@@ -229,7 +264,7 @@ static void ping_sleep_ms(uint32_t ms)
 
 static void ping_usage(void)
 {
-    ping_puts((const int8_t *)"usage: ping [-c count] [-i interval] <ipv4>\n");
+    ping_puts((const int8_t *)"usage: ping [-c count] [-i interval] <host|ipv4>\n");
     ping_puts((const int8_t *)"  -c count     number of probes, default 4\n");
     ping_puts((const int8_t *)"  -i interval  interval in seconds, default 1\n");
 }
@@ -298,7 +333,7 @@ int main(int argc, char **argv)
             return 1;
         }
 
-        if (ping_parse_ipv4((const int8_t *)argv[i], &target_ip))
+        if (ping_resolve_host((const int8_t *)argv[i], &target_ip))
         {
             ping_usage();
             return 1;

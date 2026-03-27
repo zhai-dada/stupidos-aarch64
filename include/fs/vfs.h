@@ -23,6 +23,7 @@
 #define VFS_S_IFREG         0x8000
 #define VFS_S_IFDIR         0x4000
 #define VFS_S_IFCHR         0x2000
+#define VFS_S_IFSOCK        0xC000
 
 #define VFS_S_IRUSR         0x0100
 #define VFS_S_IWUSR         0x0080
@@ -40,6 +41,19 @@
 #define VFS_F_SETFL         4
 #define VFS_F_DUPFD         0
 #define VFS_F_DUPFD_CLOEXEC 1030
+
+/*
+ * 内核内建的伪字符设备类型。
+ * 这些设备不依赖真实磁盘上的 /dev 目录项，
+ * 但能给用户态提供 Linux 风格的基础设备入口：
+ * - /dev/tty   当前控制终端
+ * - /dev/null  空设备
+ * - /dev/zero  只读时持续返回 0
+ */
+#define VFS_SPECIAL_DEV_NONE 0
+#define VFS_SPECIAL_DEV_TTY  1
+#define VFS_SPECIAL_DEV_NULL 2
+#define VFS_SPECIAL_DEV_ZERO 3
 
 struct vfs_inode;
 struct vfs_superblock;
@@ -143,5 +157,6 @@ int vfs_rename(const int8_t *old_path, const int8_t *new_path);
 int vfs_truncate(const int8_t *path, uint64_t size);
 int vfs_ftruncate(int fd, uint64_t size);
 int vfs_utimens(const int8_t *path, const struct vfs_timespec *atime, const struct vfs_timespec *mtime);
+int vfs_isatty_fd(int fd);
 
 #endif

@@ -116,32 +116,13 @@ static void ls_join_path(int8_t *out, size_t out_len, const int8_t *base, const 
     out[pos] = '\0';
 }
 
-int main(int argc, char **argv)
+static int ls_list_dir(const int8_t *path)
 {
     struct stupidos_dirent ent;
     struct stupidos_stat st;
     int8_t full_path[STUPIDOS_PATH_MAX * 2];
-    int8_t cwd_buf[STUPIDOS_PATH_MAX];
-    const int8_t *path;
     int ret;
     uint32_t index;
-
-    if (argc > 1 && argv[1] && argv[1][0] != '\0')
-    {
-        path = (const int8_t *)argv[1];
-    }
-    else
-    {
-        u_memset(cwd_buf, 0, sizeof(cwd_buf));
-        if (u_getcwd(cwd_buf, sizeof(cwd_buf)) < 0 || cwd_buf[0] == '\0')
-        {
-            path = (const int8_t *)"/";
-        }
-        else
-        {
-            path = cwd_buf;
-        }
-    }
 
     index = 0;
     while (1)
@@ -149,7 +130,7 @@ int main(int argc, char **argv)
         ret = u_readdir(path, index, &ent);
         if (ret == -STUPIDOS_ENOENT)
         {
-            break;
+            return 0;
         }
         if (ret < 0)
         {
@@ -172,6 +153,79 @@ int main(int argc, char **argv)
         ls_print_long(path, ent.name, &st);
         index++;
     }
+}
 
-    return 0;
+/*
+ * 兼容 Linux 常见 ls 行为：
+ * - 目标是普通文件时直接打印文件信息
+ * - 目标是目录时列出目录内容
+ */
+static int ls_list_target(const int8_t *path)
+{
+    struct stupidos_stat st;
+
+    if (!path || path[0] == '\0')
+    {
+        path = (const int8_t *)".";
+    }
+
+    if (u_stat(path, &st) < 0)
+    {
+        u_puts((const int8_t *)"ls: cannot access ");
+        u_puts(path);
+        u_puts((const int8_t *)"\n");
+        return 1;
+    }
+
+    if ((st.mode & STUPIDOS_VFS_S_IFMT) != STUPIDOS_VFS_S_IFDIR)
+    {
+        ls_print_long(path, path, &st);
+        return 0;
+    }
+
+    return ls_list_dir(path);
+}
+
+int main(int argc, char **argv)
+{
+    int8_t cwd_buf[STUPIDOS_PATH_MAX];
+    int rc;
+    int i;
+
+    rc = 0;
+    if (argc <= 1)
+    {
+        u_memset(cwd_buf, 0, sizeof(cwd_buf));
+        if (u_getcwd(cwd_buf, sizeof(cwd_buf)) < 0 || cwd_buf[0] == '\0')
+        {
+            return ls_list_target((const int8_t *)"/");
+        }
+        return ls_list_target(cwd_buf);
+    }
+
+    for (i = 1; i < argc; i++)
+    {
+        if (!argv[i] || argv[i][0] == '\0')
+        {
+            continue;
+        }
+
+        if (argc > 2)
+        {
+            u_puts((const int8_t *)argv[i]);
+            u_puts((const int8_t *)":\n");
+        }
+
+        if (ls_list_target((const int8_t *)argv[i]) != 0)
+        {
+            rc = 1;
+        }
+
+        if (argc > 2 && i + 1 < argc)
+        {
+            u_puts((const int8_t *)"\n");
+        }
+    }
+
+    return rc;
 }

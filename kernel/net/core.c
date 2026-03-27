@@ -53,6 +53,24 @@ struct net_icmp_hdr
     uint16_t seq;
 } __attribute__((packed));
 
+struct net_udp_hdr
+{
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint16_t len;
+    uint16_t checksum;
+} __attribute__((packed));
+
+struct net_dns_hdr
+{
+    uint16_t id;
+    uint16_t flags;
+    uint16_t qdcount;
+    uint16_t ancount;
+    uint16_t nscount;
+    uint16_t arcount;
+} __attribute__((packed));
+
 struct net_probe_state
 {
     spinlock_t lock;
@@ -68,9 +86,24 @@ struct net_probe_state
     uint64_t done_cycles;
 };
 
+struct net_dns_state
+{
+    spinlock_t lock;
+    bool active;
+    bool done;
+    int result;
+    uint16_t txid;
+    uint16_t src_port;
+    uint32_t resolved_ip;
+    uint64_t start_cycles;
+};
+
 static struct net_device net_devices[NET_MAX_DEVICES];
 static struct net_device *net_default;
 static struct net_probe_state net_probe = {
+    .lock = SPINLOCK_INIT,
+};
+static struct net_dns_state net_dns = {
     .lock = SPINLOCK_INIT,
 };
 static uint32_t net_rx_packet_seen;
@@ -308,6 +341,41 @@ static void net_gateway_proxy_mac(const struct net_device *dev, uint8_t mac[6])
     mac[5] = 0x02;
 }
 
+static bool net_ipv4_is_onlink(const struct net_device *dev, uint32_t ip)
+{
+    if (!dev)
+    {
+        return false;
+    }
+
+    return ((ip ^ dev->ipv4) & dev->netmask) == 0;
+}
+
+static bool net_ipv4_is_slirp_subnet(uint32_t ip)
+{
+    return (ip & 0xffffff00U) == ((10U << 24) | (0U << 16) | (2U << 8));
+}
+
+static uint32_t net_next_hop_ipv4(const struct net_device *dev, uint32_t ip)
+{
+    if (!dev)
+    {
+        return ip;
+    }
+
+    if (net_ipv4_is_onlink(dev, ip))
+    {
+        return ip;
+    }
+
+    if (dev->gateway)
+    {
+        return dev->gateway;
+    }
+
+    return ip;
+}
+
 static void net_probe_begin(uint32_t target_ip, bool expect_icmp, uint16_t icmp_id, uint16_t icmp_seq)
 {
     /*
@@ -351,6 +419,75 @@ static int net_probe_finish(uint32_t target_ip, int result, const uint8_t *mac)
     }
     spin_unlock(&net_probe.lock);
     return ret;
+}
+
+static void net_dns_begin(uint16_t txid, uint16_t src_port)
+{
+    spin_lock(&net_dns.lock);
+    net_dns.active = true;
+    net_dns.done = false;
+    net_dns.result = -ETIMEDOUT;
+    net_dns.txid = txid;
+    net_dns.src_port = src_port;
+    net_dns.resolved_ip = 0;
+    net_dns.start_cycles = net_clock_cycles();
+    spin_unlock(&net_dns.lock);
+}
+
+static int net_dns_finish(int result, uint32_t resolved_ip)
+{
+    int ret;
+
+    ret = 0;
+    spin_lock(&net_dns.lock);
+    if (net_dns.active)
+    {
+        net_dns.result = result;
+        net_dns.done = true;
+        net_dns.resolved_ip = resolved_ip;
+        sev();
+        ret = 1;
+    }
+    spin_unlock(&net_dns.lock);
+    return ret;
+}
+
+static int net_dns_wait(uint32_t timeout_ms, uint32_t *out_ip)
+{
+    uint64_t deadline;
+    int result;
+
+    deadline = net_clock_cycles() + net_ms_to_cycles(timeout_ms ? timeout_ms : 1000U);
+    while (net_clock_cycles() < deadline)
+    {
+        spin_lock(&net_dns.lock);
+        if (!net_dns.active)
+        {
+            spin_unlock(&net_dns.lock);
+            return -EINVAL;
+        }
+        if (net_dns.done)
+        {
+            result = net_dns.result;
+            if (out_ip)
+            {
+                *out_ip = net_dns.resolved_ip;
+            }
+            net_dns.active = false;
+            spin_unlock(&net_dns.lock);
+            return result;
+        }
+        spin_unlock(&net_dns.lock);
+        virtio_net_poll();
+        enable_irq();
+        wfe();
+        disable_irq();
+    }
+
+    spin_lock(&net_dns.lock);
+    net_dns.active = false;
+    spin_unlock(&net_dns.lock);
+    return -ETIMEDOUT;
 }
 
 static int net_probe_wait(uint32_t target_ip, uint64_t timeout_cycles, uint8_t mac[6], uint64_t *elapsed_cycles)
@@ -482,6 +619,163 @@ static ssize_t net_send_icmp_echo(struct net_device *dev, const uint8_t dst_mac[
 
     icmp->checksum = net_bswap16(net_checksum16(icmp, sizeof(*icmp) + payload_len));
     return net_send_frame(dev, dst_mac, NET_ETHERTYPE_IPV4, packet, total_len);
+}
+
+static ssize_t net_send_udp_datagram(struct net_device *dev, uint32_t dst_ip, const uint8_t dst_mac[6],
+                                     uint16_t src_port, uint16_t dst_port,
+                                     const void *payload, size_t payload_len)
+{
+    uint8_t packet[1500];
+    struct net_ipv4_hdr *ip;
+    struct net_udp_hdr *udp;
+    uint16_t udp_len;
+    size_t total_len;
+
+    if (!dev || !dst_mac)
+    {
+        return -EINVAL;
+    }
+
+    total_len = sizeof(*ip) + sizeof(*udp) + payload_len;
+    if (total_len > sizeof(packet))
+    {
+        return -EMSGSIZE;
+    }
+
+    memset((int8_t *)packet, 0, sizeof(packet));
+    ip = (struct net_ipv4_hdr *)packet;
+    udp = (struct net_udp_hdr *)(packet + sizeof(*ip));
+
+    ip->version_ihl = (uint8_t)((4U << 4) | 5U);
+    ip->tos = 0;
+    udp_len = (uint16_t)(sizeof(*udp) + payload_len);
+    ip->total_len = net_bswap16((uint16_t)(sizeof(*ip) + udp_len));
+    ip->id = 0;
+    ip->frag_off = net_bswap16(0x4000U);
+    ip->ttl = 64;
+    ip->proto = NET_IPV4_PROTO_UDP;
+    ip->checksum = 0;
+    net_ipv4_to_bytes(dev->ipv4, ip->src);
+    net_ipv4_to_bytes(dst_ip, ip->dst);
+    ip->checksum = net_bswap16(net_checksum16(ip, sizeof(*ip)));
+
+    udp->src_port = net_bswap16(src_port);
+    udp->dst_port = net_bswap16(dst_port);
+    udp->len = net_bswap16(udp_len);
+    udp->checksum = 0;
+
+    if (payload_len && payload)
+    {
+        memcpy((int8_t *)packet + sizeof(*ip) + sizeof(*udp), payload, payload_len);
+    }
+
+    return net_send_frame(dev, dst_mac, NET_ETHERTYPE_IPV4, packet, total_len);
+}
+
+static size_t net_dns_skip_name(const uint8_t *buf, size_t len, size_t off)
+{
+    while (off < len)
+    {
+        uint8_t n;
+
+        n = buf[off++];
+        if (n == 0)
+        {
+            return off;
+        }
+        if ((n & 0xc0U) == 0xc0U)
+        {
+            if (off >= len)
+            {
+                return len;
+            }
+            return off + 1U;
+        }
+        if ((n & 0xc0U) != 0U)
+        {
+            return len;
+        }
+        off += n;
+    }
+
+    return len;
+}
+
+static int net_dns_parse_answer(const uint8_t *buf, size_t len, uint16_t txid, uint32_t *out_ip)
+{
+    struct net_dns_hdr hdr;
+    size_t off;
+    uint16_t qdcount;
+    uint16_t ancount;
+    uint32_t i;
+
+    if (!buf || len < sizeof(hdr))
+    {
+        return -EINVAL;
+    }
+
+    memcpy((int8_t *)&hdr, (const int8_t *)buf, sizeof(hdr));
+    if (net_bswap16(hdr.id) != txid)
+    {
+        return -EINVAL;
+    }
+
+    off = sizeof(hdr);
+    qdcount = net_bswap16(hdr.qdcount);
+    ancount = net_bswap16(hdr.ancount);
+
+    for (i = 0; i < qdcount; i++)
+    {
+        off = net_dns_skip_name(buf, len, off);
+        if (off + 4U > len)
+        {
+            return -EINVAL;
+        }
+        off += 4U;
+    }
+
+    for (i = 0; i < ancount; i++)
+    {
+        uint16_t type;
+        uint16_t class_;
+        uint16_t rdlen;
+        uint16_t field16;
+
+        off = net_dns_skip_name(buf, len, off);
+        if (off + 10U > len)
+        {
+            return -EINVAL;
+        }
+
+        memcpy((int8_t *)&field16, (const int8_t *)(buf + off), sizeof(field16));
+        type = net_bswap16(field16);
+        memcpy((int8_t *)&field16, (const int8_t *)(buf + off + 2U), sizeof(field16));
+        class_ = net_bswap16(field16);
+        memcpy((int8_t *)&field16, (const int8_t *)(buf + off + 8U), sizeof(field16));
+        rdlen = net_bswap16(field16);
+        off += 10U;
+
+        if (off + rdlen > len)
+        {
+            return -EINVAL;
+        }
+
+        if (type == 1U && class_ == 1U && rdlen == 4U)
+        {
+            if (out_ip)
+            {
+                *out_ip = ((uint32_t)buf[off + 0] << 24) |
+                          ((uint32_t)buf[off + 1] << 16) |
+                          ((uint32_t)buf[off + 2] << 8) |
+                          (uint32_t)buf[off + 3];
+            }
+            return 0;
+        }
+
+        off += rdlen;
+    }
+
+    return -ENOENT;
 }
 
 static void net_loopback_arp_test(struct net_device *dev)
@@ -674,6 +968,49 @@ static void net_handle_icmp(struct net_device *dev, const struct net_eth_hdr *et
     }
 }
 
+static void net_handle_udp(struct net_device *dev, const struct net_eth_hdr *eth, const struct net_ipv4_hdr *ip,
+                           const uint8_t *payload, size_t len)
+{
+    struct net_udp_hdr udp;
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint16_t udp_len;
+    bool dns_match;
+    uint16_t txid;
+
+    (void)eth;
+
+    if (len < sizeof(udp))
+    {
+        return;
+    }
+
+    memcpy((int8_t *)&udp, (const int8_t *)payload, sizeof(udp));
+    src_port = net_bswap16(udp.src_port);
+    dst_port = net_bswap16(udp.dst_port);
+    udp_len = net_bswap16(udp.len);
+    if (udp_len < sizeof(udp) || udp_len > len)
+    {
+        return;
+    }
+
+    spin_lock(&net_dns.lock);
+    dns_match = net_dns.active && src_port == 53U && dst_port == net_dns.src_port;
+    txid = net_dns.txid;
+    spin_unlock(&net_dns.lock);
+
+    if (dns_match)
+    {
+        uint32_t resolved_ip;
+        int dns_ret;
+
+        resolved_ip = 0;
+        dns_ret = net_dns_parse_answer(payload + sizeof(udp), udp_len - sizeof(udp), txid, &resolved_ip);
+        net_dns_finish(dns_ret, resolved_ip);
+    }
+    (void)ip;
+}
+
 static void net_handle_ipv4(struct net_device *dev, const struct net_eth_hdr *eth, const uint8_t *payload, size_t len)
 {
     struct net_ipv4_hdr ip;
@@ -721,6 +1058,18 @@ static void net_handle_ipv4(struct net_device *dev, const struct net_eth_hdr *et
     if (ip.proto == NET_IPV4_PROTO_ICMP)
     {
         net_handle_icmp(dev, eth, &ip, l4, l4_len);
+        return;
+    }
+
+    if (ip.proto == NET_IPV4_PROTO_TCP)
+    {
+        net_tcp_input(dev, l4, l4_len, net_ipv4_from_bytes(ip.src), net_ipv4_from_bytes(ip.dst));
+        return;
+    }
+
+    if (ip.proto == NET_IPV4_PROTO_UDP)
+    {
+        net_handle_udp(dev, eth, &ip, l4, l4_len);
         return;
     }
 
@@ -947,19 +1296,36 @@ int net_arp_resolve(struct net_device *dev, uint32_t target_ip, uint8_t out_mac[
 {
     ssize_t ret;
     int probe_ret;
+    uint32_t route_ip;
 
     if (!dev)
     {
         return -ENODEV;
     }
 
-    if (net_arp_cache_lookup(target_ip, out_mac) == 0)
+    route_ip = net_next_hop_ipv4(dev, target_ip);
+
+    /*
+     * QEMU usernet/slirp 场景下，10.0.2.0/24 的“网关/宿主代理”本质上是
+     * 一个虚拟二层后端，不必每次都完整等 ARP 超时。
+     *
+     * 这里直接给出代理 MAC，可以把 SSH / HTTP 这类首次连接前的
+     * 3 秒空白等待明显压缩掉。
+     */
+    if (route_ip == dev->gateway || net_ipv4_is_slirp_subnet(route_ip) || net_ipv4_is_slirp_subnet(dev->gateway))
+    {
+        net_gateway_proxy_mac(dev, out_mac);
+        net_arp_cache_update(route_ip, out_mac);
+        return 0;
+    }
+
+    if (net_arp_cache_lookup(route_ip, out_mac) == 0)
     {
         return 0;
     }
 
-    net_probe_begin(target_ip, false, 0, 0);
-    ret = net_send_arp_request(dev, target_ip);
+    net_probe_begin(route_ip, false, 0, 0);
+    ret = net_send_arp_request(dev, route_ip);
     if (ret < 0)
     {
         spin_lock(&net_probe.lock);
@@ -968,17 +1334,17 @@ int net_arp_resolve(struct net_device *dev, uint32_t target_ip, uint8_t out_mac[
         return (int)ret;
     }
 
-    probe_ret = net_probe_wait(target_ip, net_ms_to_cycles(3000), out_mac, 0);
+    probe_ret = net_probe_wait(route_ip, net_ms_to_cycles(3000), out_mac, 0);
     if (probe_ret)
     {
-        if (target_ip == dev->gateway)
+        if (route_ip == dev->gateway || net_ipv4_is_slirp_subnet(route_ip))
         {
             /*
              * 如果 ARP 仍旧拿不到网关，先退回到“尽量继续运行”的策略。
              * 这样不会因为网络后端细节卡住 shell；后续再继续补更完整的二层/路由支持。
              */
             net_gateway_proxy_mac(dev, out_mac);
-            net_arp_cache_update(target_ip, out_mac);
+            net_arp_cache_update(route_ip, out_mac);
             printk("[net\tarp ]: gateway arp fallback mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
                    out_mac[0], out_mac[1], out_mac[2], out_mac[3], out_mac[4], out_mac[5]);
             return 0;
@@ -987,12 +1353,176 @@ int net_arp_resolve(struct net_device *dev, uint32_t target_ip, uint8_t out_mac[
         return probe_ret;
     }
 
-    if (target_ip == dev->gateway)
+    net_arp_cache_update(route_ip, out_mac);
+
+    if (route_ip == dev->gateway)
     {
         printk("[net\tarp ]: gateway resolved mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
                out_mac[0], out_mac[1], out_mac[2], out_mac[3], out_mac[4], out_mac[5]);
     }
 
+    return 0;
+}
+
+static bool net_dns_hostname_valid(const int8_t *hostname)
+{
+    size_t i;
+    bool has_label;
+
+    if (!hostname || hostname[0] == '\0')
+    {
+        return false;
+    }
+
+    has_label = false;
+    for (i = 0; hostname[i] != '\0'; i++)
+    {
+        char ch;
+
+        ch = (char)hostname[i];
+        if ((ch >= 'a' && ch <= 'z') ||
+            (ch >= 'A' && ch <= 'Z') ||
+            (ch >= '0' && ch <= '9') ||
+            ch == '-' || ch == '.')
+        {
+            has_label = true;
+            continue;
+        }
+        return false;
+    }
+
+    return has_label;
+}
+
+static size_t net_dns_encode_name(const int8_t *hostname, uint8_t *out, size_t out_len)
+{
+    size_t pos;
+    size_t label_start;
+    size_t i;
+
+    if (!hostname || !out || out_len < 2)
+    {
+        return 0;
+    }
+
+    pos = 0;
+    label_start = 0;
+    for (i = 0; ; i++)
+    {
+        char ch;
+
+        ch = (char)hostname[i];
+        if (ch == '.' || ch == '\0')
+        {
+            size_t label_len;
+
+            label_len = i - label_start;
+            if (label_len == 0 || label_len > 63U || pos + label_len + 2U > out_len)
+            {
+                return 0;
+            }
+            out[pos++] = (uint8_t)label_len;
+            memcpy((int8_t *)&out[pos], (const int8_t *)&hostname[label_start], label_len);
+            pos += label_len;
+            if (ch == '\0')
+            {
+                break;
+            }
+            label_start = i + 1U;
+        }
+    }
+
+    if (pos >= out_len)
+    {
+        return 0;
+    }
+    out[pos++] = 0;
+    return pos;
+}
+
+int64_t net_dns_lookup(struct net_device *dev, const int8_t *hostname, uint32_t *out_ipv4, uint32_t timeout_ms)
+{
+    uint8_t packet[512];
+    uint8_t dns_mac[6];
+    struct net_dns_hdr *hdr;
+    uint8_t *question;
+    uint16_t txid;
+    uint16_t src_port;
+    size_t qname_len;
+    size_t payload_len;
+    ssize_t ret;
+    int probe_ret;
+    uint32_t dns_server;
+    uint32_t resolved_ip;
+
+    if (!dev || !hostname || !out_ipv4)
+    {
+        return -EINVAL;
+    }
+
+    if (!net_dns_hostname_valid(hostname))
+    {
+        return -EINVAL;
+    }
+
+    if (net_ipv4_is_slirp_subnet(dev->gateway))
+    {
+        dns_server = ((uint32_t)10 << 24) | ((uint32_t)0 << 16) | ((uint32_t)2 << 8) | 3U;
+    }
+    else if (dev->gateway)
+    {
+        dns_server = dev->gateway;
+    }
+    else
+    {
+        dns_server = ((uint32_t)10 << 24) | ((uint32_t)0 << 16) | ((uint32_t)2 << 8) | 3U;
+    }
+    src_port = (uint16_t)(50000U + (net_clock_cycles() & 0x0fffU));
+    if (src_port == 53U)
+    {
+        src_port++;
+    }
+    txid = (uint16_t)(net_clock_cycles() & 0xffffU);
+
+    memset((int8_t *)packet, 0, sizeof(packet));
+    hdr = (struct net_dns_hdr *)packet;
+    qname_len = net_dns_encode_name(hostname, packet + sizeof(*hdr), sizeof(packet) - sizeof(*hdr) - 4U);
+    if (!qname_len)
+    {
+        return -EINVAL;
+    }
+    hdr->id = net_bswap16(txid);
+    hdr->flags = net_bswap16(0x0100U); /* recursion desired */
+    hdr->qdcount = net_bswap16(1);
+    question = packet + sizeof(*hdr);
+    question[qname_len + 0U] = 0;
+    question[qname_len + 1U] = 1;
+    question[qname_len + 2U] = 0;
+    question[qname_len + 3U] = 1;
+    payload_len = sizeof(*hdr) + qname_len + 4U;
+
+    if (net_arp_resolve(dev, dns_server, dns_mac) < 0)
+    {
+        return -EHOSTUNREACH;
+    }
+
+    net_dns_begin(txid, src_port);
+    ret = net_send_udp_datagram(dev, dns_server, dns_mac, src_port, 53U, packet, payload_len);
+    if (ret < 0)
+    {
+        spin_lock(&net_dns.lock);
+        net_dns.active = false;
+        spin_unlock(&net_dns.lock);
+        return ret;
+    }
+
+    probe_ret = net_dns_wait(timeout_ms ? timeout_ms : 2000U, &resolved_ip);
+    if (probe_ret < 0)
+    {
+        return probe_ret;
+    }
+
+    *out_ipv4 = resolved_ip;
     return 0;
 }
 

@@ -1,5 +1,9 @@
 #include "stupidos_user.h"
 #include "errno.h"
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <termios.h>
 
 #define SH_LINE_MAX 256
 #define SH_MAX_ARGS  16
@@ -7,6 +11,7 @@
 #define SH_CWD_MAX STUPIDOS_PATH_MAX
 #define SH_PROMPT_MAX (SH_CWD_MAX + 32)
 #define SH_HISTORY_MAX 16
+#define SH_COMPLETION_MAX 64
 
 /*
  * shell 运行在一个很低层的环境里，syscall / IRQ / 调度都会反复打断它。
@@ -21,6 +26,60 @@ static int8_t sh_cwd_buf[SH_CWD_MAX];
 static int8_t sh_prompt_buf[SH_PROMPT_MAX];
 static int8_t sh_history[SH_HISTORY_MAX][SH_LINE_MAX];
 static uint32_t sh_history_count;
+static struct termios sh_saved_termios;
+static bool sh_saved_termios_valid;
+
+struct sh_completion_entry
+{
+    int8_t text[SH_LINE_MAX];
+    bool is_dir;
+};
+
+static const int8_t *const sh_builtin_commands[] =
+{
+    (const int8_t *)"help",
+    (const int8_t *)"cd",
+    (const int8_t *)"pwd",
+    (const int8_t *)"history",
+    (const int8_t *)"clear",
+    (const int8_t *)"echo",
+    (const int8_t *)"stat",
+    (const int8_t *)"uname",
+    (const int8_t *)"time",
+    (const int8_t *)"run",
+    (const int8_t *)"ls",
+    (const int8_t *)"cat",
+    (const int8_t *)"ping",
+    (const int8_t *)"sleep",
+    (const int8_t *)"netcfg",
+    (const int8_t *)"exit",
+    (const int8_t *)"mkdir",
+    (const int8_t *)"rmdir",
+    (const int8_t *)"rm",
+    (const int8_t *)"mv",
+    (const int8_t *)"touch",
+    (const int8_t *)"wget",
+    (const int8_t *)"browser",
+    (const int8_t *)"ftp",
+    (const int8_t *)"ftpget",
+    (const int8_t *)"ftpput",
+    (const int8_t *)"tcc",
+    (const int8_t *)"vi",
+    (const int8_t *)"vim",
+    (const int8_t *)"busybox",
+    (const int8_t *)"python",
+    (const int8_t *)"python3",
+    (const int8_t *)"mkprobe",
+    (const int8_t *)"elfinfo",
+};
+
+static const int8_t *const sh_command_search_dirs[] =
+{
+    (const int8_t *)"/bin",
+    (const int8_t *)"/usr/bin",
+    (const int8_t *)"/usr/local/bin",
+    (const int8_t *)"/sbin",
+};
 
 static void sh_puts(const int8_t *str)
 {
@@ -29,6 +88,55 @@ static void sh_puts(const int8_t *str)
      * 这样即使某个字符串指针被破坏，也只是丢一段输出，不会直接把 shell 撞死。
      */
     u_putsn(str, u_strnlen(str, 4096));
+}
+
+static void sh_restore_terminal(void)
+{
+    if (!sh_saved_termios_valid)
+    {
+        return;
+    }
+
+    /*
+     * 进入 shell 时我们把终端切到 raw/noecho，方便自己做按键级回显。
+     * 退出前一定要恢复回去，不然后续命令或者父 shell 会继续吃 raw 模式。
+     */
+    (void)tcsetattr(STUPIDOS_STDIN_FILENO, TCSANOW, &sh_saved_termios);
+    sh_saved_termios_valid = false;
+}
+
+static void sh_enable_interactive_mode(void)
+{
+    struct termios raw;
+
+    if (tcgetattr(STUPIDOS_STDIN_FILENO, &sh_saved_termios) < 0)
+    {
+        sh_saved_termios_valid = false;
+        return;
+    }
+
+    raw = sh_saved_termios;
+    raw.c_iflag &= (tcflag_t)~(BRKINT | ICRNL | INPCK | ISTRIP | IXON | IXOFF);
+    raw.c_oflag &= (tcflag_t)~OPOST;
+    raw.c_cflag |= (tcflag_t)(CS8 | CREAD);
+    raw.c_lflag &= (tcflag_t)~(ECHO | ICANON | IEXTEN | ISIG);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+
+    if (tcsetattr(STUPIDOS_STDIN_FILENO, TCSANOW, &raw) == 0)
+    {
+        sh_saved_termios_valid = true;
+        /*
+         * 让 stdout/stderr 也尽量保持“看到就出”，减少命令输出的观感延迟。
+         * 即使当前 stdio 层本身已经偏向直写，这里仍然保留这层约束，
+         * 方便后续接入更完整 libc / BusyBox applet 时保持一致体验。
+         */
+        (void)setvbuf(stdout, NULL, _IONBF, 0);
+        (void)setvbuf(stderr, NULL, _IONBF, 0);
+        return;
+    }
+
+    sh_saved_termios_valid = false;
 }
 
 static int sh_exec_path(const int8_t *path, int argc, int8_t *argv[]);
@@ -153,6 +261,353 @@ static void sh_redraw_line(const int8_t *line)
     (void)u_write(STUPIDOS_STDOUT_FILENO, (const int8_t *)"\x1b[K", 3);
 }
 
+static bool sh_is_space(char ch);
+
+static size_t sh_line_token_start(const int8_t *line, size_t len)
+{
+    size_t start;
+
+    if (!line)
+    {
+        return 0;
+    }
+
+    start = len;
+    while (start > 0 && !sh_is_space((char)line[start - 1]))
+    {
+        start--;
+    }
+
+    return start;
+}
+
+static bool sh_completion_add(struct sh_completion_entry *entries, size_t *count, const int8_t *text, bool is_dir)
+{
+    size_t i;
+
+    if (!entries || !count || !text || text[0] == '\0')
+    {
+        return false;
+    }
+
+    for (i = 0; i < *count; i++)
+    {
+        if (u_strcmp(entries[i].text, text) == 0)
+        {
+            if (is_dir)
+            {
+                entries[i].is_dir = true;
+            }
+            return true;
+        }
+    }
+
+    if (*count >= SH_COMPLETION_MAX)
+    {
+        return false;
+    }
+
+    u_memset(entries[*count].text, 0, sizeof(entries[*count].text));
+    u_memcpy(entries[*count].text, text, u_strnlen(text, sizeof(entries[*count].text) - 1));
+    entries[*count].text[sizeof(entries[*count].text) - 1] = '\0';
+    entries[*count].is_dir = is_dir;
+    (*count)++;
+    return true;
+}
+
+static size_t sh_completion_common_prefix_len(const struct sh_completion_entry *entries, size_t count)
+{
+    size_t i;
+    size_t pos;
+    size_t min_len;
+
+    if (!entries || count == 0)
+    {
+        return 0;
+    }
+
+    min_len = u_strnlen(entries[0].text, sizeof(entries[0].text) - 1);
+    for (i = 1; i < count; i++)
+    {
+        size_t cur_len;
+
+        cur_len = u_strnlen(entries[i].text, sizeof(entries[i].text) - 1);
+        if (cur_len < min_len)
+        {
+            min_len = cur_len;
+        }
+    }
+
+    pos = 0;
+    while (pos < min_len)
+    {
+        int8_t ch;
+
+        ch = entries[0].text[pos];
+        for (i = 1; i < count; i++)
+        {
+            if (entries[i].text[pos] != ch)
+            {
+                return pos;
+            }
+        }
+        pos++;
+    }
+
+    return pos;
+}
+
+static void sh_completion_print_matches(const struct sh_completion_entry *entries, size_t count)
+{
+    size_t i;
+
+    if (!entries || count == 0)
+    {
+        return;
+    }
+
+    (void)u_write(STUPIDOS_STDOUT_FILENO, (const int8_t *)"\r\n", 2);
+    for (i = 0; i < count; i++)
+    {
+        sh_puts(entries[i].text);
+        if (entries[i].is_dir)
+        {
+            sh_puts((const int8_t *)"/");
+        }
+        sh_puts((const int8_t *)"\r\n");
+    }
+}
+
+static bool sh_scan_directory_matches(const int8_t *dirpath,
+                                      const int8_t *prefix,
+                                      size_t prefix_len,
+                                      const int8_t *repl_prefix,
+                                      size_t repl_prefix_len,
+                                      struct sh_completion_entry *entries,
+                                      size_t *count,
+                                      bool files_only)
+{
+    struct stupidos_dirent ent;
+    int8_t candidate[SH_LINE_MAX];
+    size_t index;
+    size_t name_len;
+    int ret;
+    bool found;
+
+    if (!dirpath || !prefix || !entries || !count)
+    {
+        return false;
+    }
+
+    found = false;
+    for (index = 0; ; index++)
+    {
+        ret = u_readdir(dirpath, (uint32_t)index, &ent);
+        if (ret == -STUPIDOS_ENOENT)
+        {
+            break;
+        }
+        if (ret < 0)
+        {
+            return found;
+        }
+
+        if (ent.name[0] == '\0')
+        {
+            continue;
+        }
+
+        if (strncmp((const char *)ent.name, (const char *)prefix, prefix_len) != 0)
+        {
+            continue;
+        }
+
+        if (files_only && ((ent.mode & STUPIDOS_VFS_S_IFMT) == STUPIDOS_VFS_S_IFDIR))
+        {
+            continue;
+        }
+
+        u_memset(candidate, 0, sizeof(candidate));
+        if (repl_prefix && repl_prefix_len > 0)
+        {
+            u_memcpy(candidate, repl_prefix, repl_prefix_len);
+        }
+
+        name_len = u_strnlen((const int8_t *)ent.name, sizeof(candidate) - repl_prefix_len - 1);
+        if (repl_prefix_len + name_len >= sizeof(candidate))
+        {
+            continue;
+        }
+
+        u_memcpy(candidate + repl_prefix_len, ent.name, name_len);
+        candidate[repl_prefix_len + name_len] = '\0';
+
+        if (!sh_completion_add(entries, count, candidate, ((ent.mode & STUPIDOS_VFS_S_IFMT) == STUPIDOS_VFS_S_IFDIR)))
+        {
+            continue;
+        }
+
+        found = true;
+    }
+
+    return found;
+}
+
+static int sh_complete_line(int8_t *line, size_t max_len, size_t *len_io)
+{
+    struct sh_completion_entry entries[SH_COMPLETION_MAX];
+    int8_t dirbuf[STUPIDOS_PATH_MAX];
+    size_t token_start;
+    size_t token_len;
+    size_t i;
+    size_t count;
+    size_t common_len;
+    const int8_t *token;
+    const char *slash;
+    const char *name_prefix;
+    size_t name_prefix_len;
+    size_t repl_prefix_len;
+    size_t dir_len;
+    bool command_mode;
+    bool any;
+
+    if (!line || !len_io)
+    {
+        return -1;
+    }
+
+    token_start = sh_line_token_start(line, *len_io);
+    token_len = *len_io - token_start;
+    token = &line[token_start];
+    slash = strchr((const char *)token, '/');
+    command_mode = (token_start == 0 && !slash);
+    count = 0;
+    any = false;
+    u_memset(entries, 0, sizeof(entries));
+    u_memset(dirbuf, 0, sizeof(dirbuf));
+
+    if (command_mode)
+    {
+        for (i = 0; i < sizeof(sh_builtin_commands) / sizeof(sh_builtin_commands[0]); i++)
+        {
+            if (strncmp((const char *)sh_builtin_commands[i], (const char *)token, token_len) == 0)
+            {
+                if (sh_completion_add(entries, &count, sh_builtin_commands[i], false))
+                {
+                    any = true;
+                }
+            }
+        }
+
+        for (i = 0; i < sizeof(sh_command_search_dirs) / sizeof(sh_command_search_dirs[0]); i++)
+        {
+            if (sh_scan_directory_matches(sh_command_search_dirs[i], token, token_len, 0, 0, entries, &count, true))
+            {
+                any = true;
+            }
+        }
+    }
+    else
+    {
+        if (slash)
+        {
+            dir_len = (size_t)((const int8_t *)slash - token) + 1U;
+            if (dir_len >= sizeof(dirbuf))
+            {
+                dir_len = sizeof(dirbuf) - 1U;
+            }
+            u_memcpy(dirbuf, token, dir_len);
+            dirbuf[dir_len] = '\0';
+            name_prefix = slash + 1;
+            name_prefix_len = token_len - dir_len;
+            repl_prefix_len = dir_len;
+        }
+        else
+        {
+            if (u_getcwd(dirbuf, sizeof(dirbuf)) < 0 || dirbuf[0] == '\0')
+            {
+                u_memcpy(dirbuf, (const int8_t *)".", 2);
+            }
+            name_prefix = (const char *)token;
+            name_prefix_len = token_len;
+            repl_prefix_len = 0;
+        }
+
+        any = sh_scan_directory_matches(dirbuf,
+                                        (const int8_t *)name_prefix,
+                                        name_prefix_len,
+                                        token,
+                                        repl_prefix_len,
+                                        entries,
+                                        &count,
+                                        false);
+    }
+
+    if (!any || count == 0)
+    {
+        return 0;
+    }
+
+    common_len = sh_completion_common_prefix_len(entries, count);
+    if (count == 1 || common_len > token_len)
+    {
+        size_t add_len;
+        size_t base_len;
+        const int8_t *extra;
+        size_t target_len;
+
+        base_len = token_start;
+        target_len = (count == 1) ? u_strnlen(entries[0].text, sizeof(entries[0].text) - 1) : common_len;
+        if (target_len < token_len)
+        {
+            return 0;
+        }
+        extra = &entries[0].text[token_len];
+        add_len = target_len - token_len;
+        if (base_len + target_len + 2U >= max_len)
+        {
+            add_len = (max_len > base_len + token_len + 1U) ? (max_len - base_len - token_len - 1U) : 0U;
+        }
+
+        if (add_len > 0)
+        {
+            u_memcpy(&line[base_len + token_len], extra, add_len);
+            token_len += add_len;
+            line[base_len + token_len] = '\0';
+            *len_io = base_len + token_len;
+        }
+
+        if (count == 1)
+        {
+            if (command_mode)
+            {
+            if (*len_io + 1 < max_len)
+            {
+                line[*len_io] = ' ';
+                (*len_io)++;
+                line[*len_io] = '\0';
+            }
+        }
+        else if (entries[0].is_dir)
+        {
+            if (*len_io + 1 < max_len)
+                {
+                    line[*len_io] = '/';
+                    (*len_io)++;
+                    line[*len_io] = '\0';
+                }
+            }
+        }
+
+        sh_redraw_line(line);
+        return 1;
+    }
+
+    sh_completion_print_matches(entries, count);
+    sh_redraw_line(line);
+    return 1;
+}
+
 static int32_t sh_history_oldest_index(void)
 {
     if (sh_history_count <= SH_HISTORY_MAX)
@@ -218,6 +673,7 @@ static int sh_read_line(int8_t *line, size_t max_len)
     size_t want;
     size_t i;
     uint8_t chunk[SH_READ_CHUNK];
+    uint8_t echo_chunk[SH_READ_CHUNK * 4];
     uint8_t ch;
     ssize_t nread;
     int32_t history_pos;
@@ -226,6 +682,9 @@ static int sh_read_line(int8_t *line, size_t max_len)
     int8_t saved_line[SH_LINE_MAX];
     uint8_t esc_state;
     bool esc_seq_active;
+    size_t echo_len_total;
+
+    echo_len_total = 0;
 
     /*
      * 每轮先清空输入缓冲，避免上一条命令残留在空输入或异常中断后
@@ -383,12 +842,41 @@ static int sh_read_line(int8_t *line, size_t max_len)
                 continue;
             }
 
+            if (ch == '\t')
+            {
+                size_t new_len;
+
+                esc_state = 0;
+                esc_seq_active = false;
+                new_len = len;
+                if (sh_complete_line(line, max_len, &new_len) > 0)
+                {
+                    len = new_len;
+                }
+                continue;
+            }
+
             /*
              * tty 层已经在内核里接好了中断输入，这里只做最小行编辑。
              * shell 不需要知道底层是 UART 还是 virtio keyboard。
              */
             if (ch == '\r' || ch == '\n')
             {
+                /*
+                 * 终端输入的最后一击也要立刻回显。
+                 * 之前很多环境里内核并不会替我们做好行回显，
+                 * 所以这里主动补一行换行，确保“按回车就有反馈”。
+                 */
+                if (echo_len_total + 2 <= sizeof(echo_chunk))
+                {
+                    echo_chunk[echo_len_total++] = '\r';
+                    echo_chunk[echo_len_total++] = '\n';
+                }
+                if (echo_len_total > 0)
+                {
+                    (void)u_write(STUPIDOS_STDOUT_FILENO, (const int8_t *)echo_chunk, echo_len_total);
+                    echo_len_total = 0;
+                }
                 line[len] = '\0';
                 esc_seq_active = false;
                 return (int)len;
@@ -400,6 +888,16 @@ static int sh_read_line(int8_t *line, size_t max_len)
                 {
                     len--;
                     line[len] = '\0';
+                    /*
+                     * 本地回显退格：擦掉上一字符，保持 shell 的输入反馈即时。
+                     * 这里也进入批量缓冲，避免每个字符都立即做一次系统调用。
+                     */
+                    if (echo_len_total + 3 <= sizeof(echo_chunk))
+                    {
+                        echo_chunk[echo_len_total++] = '\b';
+                        echo_chunk[echo_len_total++] = ' ';
+                        echo_chunk[echo_len_total++] = '\b';
+                    }
                 }
                 continue;
             }
@@ -416,6 +914,20 @@ static int sh_read_line(int8_t *line, size_t max_len)
 
             line[len++] = (int8_t)ch;
             line[len] = '\0';
+            /*
+             * 主动做一次本地回显，避免依赖内核/TTY 的 echo 行为。
+             * 这样即使底层 tty 没有打开 ECHO，用户也能立刻看到输入。
+             */
+            if (echo_len_total + 1 <= sizeof(echo_chunk))
+            {
+                echo_chunk[echo_len_total++] = ch;
+            }
+        }
+
+        if (echo_len_total > 0)
+        {
+            (void)u_write(STUPIDOS_STDOUT_FILENO, (const int8_t *)echo_chunk, echo_len_total);
+            echo_len_total = 0;
         }
     }
 }
@@ -439,6 +951,7 @@ static void sh_help(void)
     sh_puts((const int8_t *)"  ping [args]     - execute /bin/ping\r\n");
     sh_puts((const int8_t *)"  sleep [args]    - execute /bin/sleep\r\n");
     sh_puts((const int8_t *)"  netcfg ...      - execute /bin/netcfg\r\n");
+    sh_puts((const int8_t *)"  browser <url>   - open a web page in terminal UI\r\n");
     sh_puts((const int8_t *)"  exit            - exit shell\r\n");
 }
 
@@ -787,6 +1300,34 @@ static int sh_exec_search(int argc, int8_t *argv[])
         }
     }
 
+    /*
+     * BusyBox 兼容回退：
+     * 如果独立 ELF 不存在，就尝试让 /bin/busybox 代劳。
+     * 这能让后续新增 applet 时，shell 直接获得“busybox applet”体验，
+     * 不需要每个命令都单独落一个二进制。
+     */
+    if (u_strcmp(argv[0], (const int8_t *)"busybox") == 0)
+    {
+        return -ENOENT;
+    }
+    if (argc + 1 < SH_MAX_ARGS + 2)
+    {
+        int8_t *busybox_argv[SH_MAX_ARGS + 2];
+
+        busybox_argv[0] = (int8_t *)"busybox";
+        busybox_argv[1] = argv[0];
+        for (i = 1; i < argc && i + 1 < (int)(sizeof(busybox_argv) / sizeof(busybox_argv[0])); i++)
+        {
+            busybox_argv[i + 1] = argv[i];
+        }
+        busybox_argv[argc + 1] = NULL;
+        ret = sh_exec_path((const int8_t *)"/bin/busybox", argc + 1, busybox_argv);
+        if (ret >= 0 || ret != -ENOENT)
+        {
+            return ret;
+        }
+    }
+
     return -ENOENT;
 }
 
@@ -794,9 +1335,12 @@ static int sh_exec_path(const int8_t *path, int argc, int8_t *argv[])
 {
     int pid;
 
+    sh_restore_terminal();
+    (void)fflush(NULL);
     pid = u_exec(path, argc, (const int8_t **)argv);
     if (pid < 0)
     {
+        sh_enable_interactive_mode();
         return pid;
     }
 
@@ -806,6 +1350,7 @@ static int sh_exec_path(const int8_t *path, int argc, int8_t *argv[])
      * 用户看起来就像“程序没输出，等 exit 才一起出来”。
      */
     (void)u_waitpid((int32_t)pid);
+    sh_enable_interactive_mode();
     return pid;
 }
 
@@ -816,9 +1361,19 @@ int main(void)
     size_t cmd_len;
     size_t prompt_len;
 
+    (void)atexit(sh_restore_terminal);
+
     (void)u_write(STUPIDOS_STDOUT_FILENO,
                   (const int8_t *)"\r\nstupidos userspace shell\r\n",
                   sizeof("\r\nstupidos userspace shell\r\n") - 1);
+
+    /*
+     * 把终端切到 shell 自己接管输入的模式（中文）：
+     * - 禁用 canonical，按键立即送到 shell；
+     * - 禁用 echo，由 shell 自己做即时回显；
+     * - 这样输入响应不会卡在“等整行提交”的 tty 层。
+     */
+    sh_enable_interactive_mode();
 
     /*
      * 默认工作目录切到可写的 /tmp（中文）：
@@ -911,6 +1466,7 @@ int main(void)
         if (u_strcmp(sh_cmd_buf, (const int8_t *)"exit") == 0)
         {
             sh_history_add(sh_line_buf);
+            sh_restore_terminal();
             u_exit(0);
         }
 

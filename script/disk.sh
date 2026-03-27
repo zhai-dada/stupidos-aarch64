@@ -15,6 +15,7 @@ P1_OFFSET=$((P1_START * SECTOR_SIZE))
 PYTHON_BIN="${PYTHON_BIN:-}"
 PYTHON_LIB_DIR="${PYTHON_LIB_DIR:-}"
 TCC_SRC_DIR="${TCC_SRC_DIR:-}"
+TCC_LIBTCC1="${TCC_LIBTCC1:-}"
 USER_BINS_LIST="${USER_BINS_LIST:-}"
 USER_INC_DIR="${USER_INC_DIR:-}"
 USER_RUNTIME_LIB="${USER_RUNTIME_LIB:-}"
@@ -31,7 +32,7 @@ trap cleanup EXIT
 dd if=/dev/zero of="$DISK_IMG" bs=512M count=6 status=none
 cat fdisk.args | fdisk "$DISK_IMG" >/dev/null
 
-mkdir -p "$TMP_ROOT/etc" "$TMP_ROOT/boot" "$TMP_ROOT/bin" "$TMP_ROOT/usr/share/examples"
+mkdir -p "$TMP_ROOT/etc" "$TMP_ROOT/boot" "$TMP_ROOT/bin" "$TMP_ROOT/usr/bin" "$TMP_ROOT/usr/share/examples"
 printf "hello from ext4 root\n" > "$TMP_ROOT/hello.txt"
 printf "rewrite me via kernel vfs\n" > "$TMP_ROOT/rw-demo.txt"
 printf "nested file\n" > "$TMP_ROOT/etc/info.txt"
@@ -74,6 +75,26 @@ int main(void)
     return 0;
 }
 EOF
+cat > "$TMP_ROOT/usr/share/examples/hello_write.c" <<'EOF'
+#include <fcntl.h>
+#include <unistd.h>
+
+int main(void)
+{
+    static const char msg[] = "hello from tcc+write\n";
+    int fd;
+
+    fd = open("/tmp/tcc_probe.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0)
+    {
+        (void)write(fd, msg, sizeof(msg) - 1U);
+        (void)close(fd);
+    }
+
+    (void)write(1, msg, sizeof(msg) - 1U);
+    return 0;
+}
+EOF
 
 if [ -n "$USER_BINS_LIST" ]; then
     for bin in $USER_BINS_LIST; do
@@ -87,9 +108,20 @@ fi
 
 if [ -d "$TMP_ROOT/bin" ]; then
     find "$TMP_ROOT/bin" -maxdepth 1 -type f -exec chmod 755 {} \;
+    # 兼容常见 Linux 布局：把用户程序同步到 /usr/bin，便于脚本按标准路径调用。
+    find "$TMP_ROOT/bin" -maxdepth 1 -type f -exec cp {} "$TMP_ROOT/usr/bin/" \;
+    find "$TMP_ROOT/usr/bin" -maxdepth 1 -type f -exec chmod 755 {} \;
     if [ -f "$TMP_ROOT/bin/python3" ] && [ ! -f "$TMP_ROOT/bin/python" ]; then
         cp "$TMP_ROOT/bin/python3" "$TMP_ROOT/bin/python"
         chmod 755 "$TMP_ROOT/bin/python"
+    fi
+    if [ -f "$TMP_ROOT/bin/ftp" ]; then
+        cp "$TMP_ROOT/bin/ftp" "$TMP_ROOT/bin/ftpget"
+        cp "$TMP_ROOT/bin/ftp" "$TMP_ROOT/bin/ftpput"
+        chmod 755 "$TMP_ROOT/bin/ftpget" "$TMP_ROOT/bin/ftpput"
+        cp "$TMP_ROOT/bin/ftpget" "$TMP_ROOT/usr/bin/ftpget"
+        cp "$TMP_ROOT/bin/ftpput" "$TMP_ROOT/usr/bin/ftpput"
+        chmod 755 "$TMP_ROOT/usr/bin/ftpget" "$TMP_ROOT/usr/bin/ftpput"
     fi
 fi
 
@@ -114,7 +146,7 @@ fi
 if [ -n "$PYTHON_LIB_DIR" ] && [ -d "$PYTHON_LIB_DIR" ]; then
     # 标准库目录直接复制到 /usr/local/lib/python3.10。
     # Python 启动和最基本的 import 需要这里的纯 Python 模块。
-    mkdir -p "$TMP_ROOT/usr/local/lib/python3.10"
+    mkdir -p "$TMP_ROOT/usr/local/lib/python3.10" "$TMP_ROOT/usr/local/lib/lib-dynload"
     cp -a "$PYTHON_LIB_DIR"/. "$TMP_ROOT/usr/local/lib/python3.10/"
     find "$TMP_ROOT/usr/local/lib/python3.10" -type d -name "__pycache__" -prune -exec rm -rf {} +
     rm -rf "$TMP_ROOT/usr/local/lib/python3.10/test" \
@@ -127,6 +159,14 @@ if [ -n "$TCC_SRC_DIR" ] && [ -d "$TCC_SRC_DIR/include" ]; then
     # 为 tinycc 提供运行时私有头文件目录，修复 guest 内 `tccdefs.h` 缺失。
     mkdir -p "$TMP_ROOT/usr/local/lib/tcc"
     cp -a "$TCC_SRC_DIR/include" "$TMP_ROOT/usr/local/lib/tcc/"
+fi
+
+if [ -n "$TCC_LIBTCC1" ] && [ -f "$TCC_LIBTCC1" ]; then
+    # tinycc 运行时库是 guest 内编译与链接的重要依赖。
+    # 这里安装 ARM64 版本的 libtcc1.a，避免 tcc 在 link 阶段找不到自身 helper。
+    mkdir -p "$TMP_ROOT/usr/local/lib/tcc"
+    cp "$TCC_LIBTCC1" "$TMP_ROOT/usr/local/lib/tcc/$(basename "$TCC_LIBTCC1")"
+    cp "$TCC_LIBTCC1" "$TMP_ROOT/usr/local/lib/tcc/libtcc1.a"
 fi
 
 if [ -n "$USER_INC_DIR" ] && [ -d "$USER_INC_DIR" ]; then

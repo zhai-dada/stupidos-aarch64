@@ -258,6 +258,7 @@ int exec_program(const int8_t *path, int argc, const int8_t *argv[])
     uint32_t image_order;
     size_t arg_off;
     struct task_struct *task;
+    bool prefer_low_entry;
 
     if (!page_alloc_is_ready())
     {
@@ -268,6 +269,19 @@ int exec_program(const int8_t *path, int argc, const int8_t *argv[])
     {
         return -EINVAL;
     }
+
+    /*
+     * 兼容策略（中文）：
+     * 目前内核仍是“全局地址空间 + 低地址 alias”模型。
+     * 对 Python 这类大量依赖静态对象指针一致性的程序，优先走低地址入口，
+     * 避免高地址执行时出现“PC 相对高地址符号 vs .data 低地址常量”不一致。
+     *
+     * 其它用户程序暂保持原高地址入口，避免与 shell 的前台 exec/wait 流程
+     * 在全局 alias 重映射下互相踩代码页。
+     */
+    prefer_low_entry =
+        strcmp(path, (const int8_t *)"/bin/python3") == 0 ||
+        strcmp(path, (const int8_t *)"/bin/python") == 0;
 
 
     fd = vfs_open(path, VFS_O_RDONLY);
@@ -448,7 +462,17 @@ int exec_program(const int8_t *path, int argc, const int8_t *argv[])
     }
 
     image->argc = argc;
-    image->entry = (int (*)(int, char **))(load_base + ehdr->e_entry);
+    if (prefer_low_entry &&
+        image->has_alias &&
+        ehdr->e_entry >= image->alias_base &&
+        ehdr->e_entry < image->alias_end)
+    {
+        image->entry = (int (*)(int, char **))(uint64_t)ehdr->e_entry;
+    }
+    else
+    {
+        image->entry = (int (*)(int, char **))(load_base + ehdr->e_entry);
+    }
     memset((int8_t *)image->path, 0, sizeof(image->path));
     memcpy((int8_t *)image->path, (int8_t *)path, strlen((int8_t *)path) + 1);
 

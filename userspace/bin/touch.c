@@ -37,13 +37,13 @@ static int touch_one(const char *path)
         return -1;
     }
 
-    /* 先尝试更新时间戳，不存在再尝试创建。 */
+    /* 先尝试更新时间戳，不存在或暂不支持时再尝试创建。 */
     if (utimensat(AT_FDCWD, path, 0, 0) == 0)
     {
         return 0;
     }
 
-    if (errno != ENOENT)
+    if (errno != ENOENT && errno != ENOTSUP && errno != ENOSYS)
     {
         return -1;
     }

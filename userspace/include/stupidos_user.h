@@ -87,6 +87,16 @@ typedef int pid_t;
 #define SYS_TRUNCATE    62
 #define SYS_FTRUNCATE   63
 #define SYS_UTIMENSAT   64
+#define SYS_HTTPGET     65
+#define SYS_DNSLOOKUP   66
+#define SYS_SOCKET      67
+#define SYS_CONNECT     68
+#define SYS_SHUTDOWN    69
+#define SYS_GETSOCKOPT  70
+#define SYS_FBINFO      71
+#define SYS_FBFILL      72
+#define SYS_FBTEXT      73
+#define SYS_PIPE2       74
 
 #define STUPIDOS_PATH_MAX       256
 
@@ -109,6 +119,7 @@ typedef int pid_t;
 #define STUPIDOS_VFS_S_IFREG    0x8000
 #define STUPIDOS_VFS_S_IFDIR    0x4000
 #define STUPIDOS_VFS_S_IFCHR    0x2000
+#define STUPIDOS_VFS_S_IFSOCK   0xC000
 
 #define STUPIDOS_VFS_S_IRUSR    0x0100
 #define STUPIDOS_VFS_S_IWUSR    0x0080
@@ -201,6 +212,17 @@ struct stupidos_utsname
     int8_t domainname[32];
 };
 
+struct stupidos_fbinfo
+{
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride;
+    uint32_t bpp;
+    uint32_t x_charsize;
+    uint32_t y_charsize;
+    uint64_t total_bytes;
+};
+
 struct stupidos_linux_dirent64
 {
     uint64_t d_ino;
@@ -274,6 +296,16 @@ int u_rename(const int8_t *old_path, const int8_t *new_path);
 int u_truncate(const int8_t *path, uint64_t length);
 int u_ftruncate(int fd, uint64_t length);
 int u_utimensat(int dirfd, const int8_t *path, const struct stupidos_timespec *times, int flags);
+int64_t u_http_get(uint32_t ipv4, uint16_t port, const int8_t *path, int out_fd, uint32_t timeout_ms);
+int64_t u_dns_lookup(const int8_t *hostname, uint32_t *ipv4_out, uint32_t timeout_ms);
+int u_socket(int domain, int type, int protocol);
+int u_connect(int fd, const void *addr, unsigned int addrlen);
+int u_shutdown(int fd, int how);
+int u_getsockopt(int fd, int level, int optname, void *optval, unsigned int *optlen);
+int64_t u_pipe2(int fds[2], int flags);
+int u_fbinfo(struct stupidos_fbinfo *out);
+int u_fbfill(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color);
+int u_fbtext(uint32_t x, uint32_t y, uint32_t fg, uint32_t bg, const int8_t *s);
 void u_exit(int code) __attribute__((noreturn));
 
 size_t u_strlen(const int8_t *str);

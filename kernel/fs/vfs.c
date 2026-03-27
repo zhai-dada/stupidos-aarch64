@@ -3,6 +3,7 @@
 #include "sched.h"
 #include "lib/libmem.h"
 #include "printk.h"
+#include "tty.h"
 
 /*
  * 这是一个最小可用的 VFS 层。
@@ -35,6 +36,31 @@ static struct
     struct vfs_file files[VFS_MAX_FILES];
 } vfs_state;
 
+static ssize_t vfs_dev_tty_read(struct vfs_inode *inode, uint64_t offset, void *buf, size_t len);
+static ssize_t vfs_dev_tty_write(struct vfs_inode *inode, uint64_t offset, const void *buf, size_t len);
+static ssize_t vfs_dev_null_read(struct vfs_inode *inode, uint64_t offset, void *buf, size_t len);
+static ssize_t vfs_dev_null_write(struct vfs_inode *inode, uint64_t offset, const void *buf, size_t len);
+static ssize_t vfs_dev_zero_read(struct vfs_inode *inode, uint64_t offset, void *buf, size_t len);
+static ssize_t vfs_dev_zero_write(struct vfs_inode *inode, uint64_t offset, const void *buf, size_t len);
+
+static const struct vfs_inode_ops vfs_tty_ops =
+{
+    .read = vfs_dev_tty_read,
+    .write = vfs_dev_tty_write,
+};
+
+static const struct vfs_inode_ops vfs_null_ops =
+{
+    .read = vfs_dev_null_read,
+    .write = vfs_dev_null_write,
+};
+
+static const struct vfs_inode_ops vfs_zero_ops =
+{
+    .read = vfs_dev_zero_read,
+    .write = vfs_dev_zero_write,
+};
+
 static bool vfs_is_dir(struct vfs_inode *inode)
 {
     return (inode->mode & VFS_S_IFMT) == VFS_S_IFDIR;
@@ -43,6 +69,174 @@ static bool vfs_is_dir(struct vfs_inode *inode)
 static bool vfs_is_reg(struct vfs_inode *inode)
 {
     return (inode->mode & VFS_S_IFMT) == VFS_S_IFREG;
+}
+
+static bool vfs_is_chr(struct vfs_inode *inode)
+{
+    return (inode->mode & VFS_S_IFMT) == VFS_S_IFCHR;
+}
+
+static bool vfs_is_special_device(struct vfs_inode *inode, uint64_t kind)
+{
+    if (!inode || !vfs_is_chr(inode))
+    {
+        return false;
+    }
+
+    return inode->private_data[0] == kind;
+}
+
+static void vfs_fill_special_inode(struct vfs_inode *inode, uint64_t kind)
+{
+    if (!inode)
+    {
+        return;
+    }
+
+    memset((int8_t *)inode, 0, sizeof(*inode));
+    inode->mode = VFS_S_IFCHR | 0666;
+    inode->nlink = 1;
+    inode->uid = 0;
+    inode->gid = 0;
+    inode->blksize = 4096;
+    inode->private_data[0] = kind;
+
+    switch (kind)
+    {
+    case VFS_SPECIAL_DEV_TTY:
+        inode->ino = 3;
+        inode->ops = &vfs_tty_ops;
+        break;
+    case VFS_SPECIAL_DEV_NULL:
+        inode->ino = 4;
+        inode->ops = &vfs_null_ops;
+        break;
+    case VFS_SPECIAL_DEV_ZERO:
+        inode->ino = 5;
+        inode->ops = &vfs_zero_ops;
+        break;
+    default:
+        inode->ino = 0;
+        inode->ops = 0;
+        break;
+    }
+}
+
+static int vfs_lookup_special_path(const int8_t *path, struct vfs_inode *out)
+{
+    if (!path || !out)
+    {
+        return -EINVAL;
+    }
+
+    if (strcmp((const char *)path, "/dev/tty") == 0)
+    {
+        vfs_fill_special_inode(out, VFS_SPECIAL_DEV_TTY);
+        return 0;
+    }
+
+    if (strcmp((const char *)path, "/dev/null") == 0)
+    {
+        vfs_fill_special_inode(out, VFS_SPECIAL_DEV_NULL);
+        return 0;
+    }
+
+    if (strcmp((const char *)path, "/dev/zero") == 0)
+    {
+        vfs_fill_special_inode(out, VFS_SPECIAL_DEV_ZERO);
+        return 0;
+    }
+
+    return -ENOENT;
+}
+
+static ssize_t vfs_dev_tty_read(struct vfs_inode *inode, uint64_t offset, void *buf, size_t len)
+{
+    uint8_t *bytes;
+    size_t i;
+    int32_t ch;
+
+    (void)inode;
+    (void)offset;
+
+    if (!buf)
+    {
+        return -EINVAL;
+    }
+
+    bytes = (uint8_t *)buf;
+    for (i = 0; i < len; i++)
+    {
+        /*
+         * /dev/tty 直接挂到当前控制终端。
+         * 这里使用 tty_getc()，让字符输入、termios 语义、IRQ 唤醒全部复用同一条路径。
+         */
+        ch = tty_getc();
+        if (ch < 0)
+        {
+            return (i > 0) ? (ssize_t)i : ch;
+        }
+        bytes[i] = (uint8_t)ch;
+        if (ch == '\n')
+        {
+            return (ssize_t)(i + 1U);
+        }
+    }
+
+    return (ssize_t)i;
+}
+
+static ssize_t vfs_dev_tty_write(struct vfs_inode *inode, uint64_t offset, const void *buf, size_t len)
+{
+    (void)inode;
+    (void)offset;
+
+    if (!buf && len)
+    {
+        return -EINVAL;
+    }
+
+    tty_write_bytes(buf, len);
+    return (ssize_t)len;
+}
+
+static ssize_t vfs_dev_null_read(struct vfs_inode *inode, uint64_t offset, void *buf, size_t len)
+{
+    (void)inode;
+    (void)offset;
+    (void)buf;
+    (void)len;
+    return 0;
+}
+
+static ssize_t vfs_dev_null_write(struct vfs_inode *inode, uint64_t offset, const void *buf, size_t len)
+{
+    (void)inode;
+    (void)offset;
+    (void)buf;
+    return (ssize_t)len;
+}
+
+static ssize_t vfs_dev_zero_read(struct vfs_inode *inode, uint64_t offset, void *buf, size_t len)
+{
+    (void)inode;
+    (void)offset;
+
+    if (!buf && len)
+    {
+        return -EINVAL;
+    }
+
+    memset((int8_t *)buf, 0, len);
+    return (ssize_t)len;
+}
+
+static ssize_t vfs_dev_zero_write(struct vfs_inode *inode, uint64_t offset, const void *buf, size_t len)
+{
+    (void)inode;
+    (void)offset;
+    (void)buf;
+    return (ssize_t)len;
 }
 
 static uint8_t vfs_dtype_from_mode(uint16_t mode)
@@ -419,6 +613,17 @@ static int vfs_lookup_path(const int8_t *path, struct vfs_inode *out)
         return ret;
     }
 
+    /*
+     * 伪字符设备优先走内建路径。
+     * 这样即使根分区里没有 /dev 目录，Dropbear / BusyBox / Python
+     * 仍然可以通过 Linux 风格路径访问当前终端和标准空设备。
+     */
+    ret = vfs_lookup_special_path(resolved, out);
+    if (ret == 0)
+    {
+        return 0;
+    }
+
     ret = vfs_resolve_mount(resolved, &mnt, &subpath);
     if (ret)
     {
@@ -426,6 +631,117 @@ static int vfs_lookup_path(const int8_t *path, struct vfs_inode *out)
     }
 
     return vfs_lookup_path_from(&mnt->root, subpath, out);
+}
+
+static bool vfs_mount_top_level_name(const struct vfs_mount *mnt, const int8_t **name, size_t *name_len)
+{
+    size_t i;
+
+    if (!mnt || !mnt->used || !name || !name_len)
+    {
+        return false;
+    }
+
+    if (mnt->path_len <= 1 || mnt->path[0] != '/')
+    {
+        return false;
+    }
+
+    for (i = 1; i < mnt->path_len; i++)
+    {
+        if (mnt->path[i] == '/')
+        {
+            return false;
+        }
+    }
+
+    *name = &mnt->path[1];
+    *name_len = mnt->path_len - 1;
+    return *name_len > 0;
+}
+
+static bool vfs_root_contains_name(struct vfs_inode *root, const int8_t *name)
+{
+    struct vfs_inode dummy;
+
+    if (!root || !name || !root->ops || !root->ops->lookup)
+    {
+        return false;
+    }
+
+    return root->ops->lookup(root, name, &dummy) == 0;
+}
+
+static int vfs_readdir_root_mountpoint(uint32_t index, struct vfs_inode *root, struct vfs_dirent *out)
+{
+    uint32_t base_count;
+    uint32_t mount_count;
+    int mount_id;
+    int ret;
+
+    if (!root || !out || !root->ops || !root->ops->readdir)
+    {
+        return -EINVAL;
+    }
+
+    base_count = 0;
+    while (1)
+    {
+        struct vfs_dirent tmp;
+
+        ret = root->ops->readdir(root, base_count, &tmp);
+        if (ret == -ENOENT)
+        {
+            break;
+        }
+        if (ret < 0)
+        {
+            return ret;
+        }
+        base_count++;
+    }
+
+    if (index < base_count)
+    {
+        return -ENOENT;
+    }
+
+    mount_count = index - base_count;
+    for (mount_id = 0; mount_id < VFS_MAX_MOUNTS; mount_id++)
+    {
+        const int8_t *name;
+        size_t name_len;
+        const struct vfs_mount *mnt = &vfs_state.mounts[mount_id];
+
+        if (!vfs_mount_top_level_name(mnt, &name, &name_len))
+        {
+            continue;
+        }
+
+        if (vfs_root_contains_name(root, name))
+        {
+            continue;
+        }
+
+        if (mount_count == 0)
+        {
+            memset((int8_t *)out, 0, sizeof(*out));
+            out->ino = mnt->root.ino;
+            out->mode = (mnt->root.mode & VFS_S_IFMT) ? mnt->root.mode : (uint16_t)(VFS_S_IFDIR | 0755);
+            out->size = mnt->root.size;
+            if (name_len > VFS_NAME_MAX)
+            {
+                name_len = VFS_NAME_MAX;
+            }
+            memcpy(out->name, (int8_t *)name, name_len);
+            out->name[name_len] = '\0';
+            return 0;
+        }
+
+        mount_count--;
+    }
+
+    return -ENOENT;
 }
 
 static int vfs_split_parent_path(const int8_t *path,
@@ -568,6 +884,9 @@ int vfs_chdir(const int8_t *path)
 
 int vfs_readdir(const int8_t *path, uint32_t index, struct vfs_dirent *out)
 {
+    int8_t resolved[VFS_PATH_MAX];
+    struct vfs_mount *mnt;
+    const int8_t *subpath;
     struct vfs_inode inode;
     int ret;
 
@@ -578,7 +897,19 @@ int vfs_readdir(const int8_t *path, uint32_t index, struct vfs_dirent *out)
 
     memset((int8_t *)out, 0, sizeof(*out));
 
-    ret = vfs_lookup_path(path, &inode);
+    ret = vfs_canonicalize_path(path, resolved, sizeof(resolved));
+    if (ret)
+    {
+        return ret;
+    }
+
+    ret = vfs_resolve_mount(resolved, &mnt, &subpath);
+    if (ret)
+    {
+        return ret;
+    }
+
+    ret = vfs_lookup_path_from(&mnt->root, subpath, &inode);
     if (ret)
     {
         return ret;
@@ -598,6 +929,18 @@ int vfs_readdir(const int8_t *path, uint32_t index, struct vfs_dirent *out)
     if (!ret && !vfs_is_valid_dirent(out))
     {
         return -ENOENT;
+    }
+
+    /*
+     * 根目录挂载点可见性（中文）：
+     * rootfs 本身的 readdir 看不到 overlay mount（例如 /tmp ramfs），
+     * 这里在“/”目录遍历末尾补一层挂载点目录项，让用户态 ls 能看到 /tmp。
+     */
+    if (ret == -ENOENT &&
+        resolved[0] == '/' &&
+        resolved[1] == '\0')
+    {
+        return vfs_readdir_root_mountpoint(index, &inode, out);
     }
 
     return ret;
@@ -649,12 +992,16 @@ int vfs_open(const int8_t *path, int flags)
         }
     }
 
-    if (!vfs_is_reg(&inode))
+    if (vfs_is_chr(&inode))
+    {
+        /* 字符设备不支持 truncate，直接保留 inode 即可。 */
+    }
+    else if (!vfs_is_reg(&inode))
     {
         return -EISDIR;
     }
 
-    if (flags & VFS_O_TRUNC)
+    if ((flags & VFS_O_TRUNC) && vfs_is_reg(&inode))
     {
         if (!inode.ops || !inode.ops->truncate)
         {
@@ -737,6 +1084,16 @@ int vfs_fstat(int fd, struct vfs_stat *out)
 
     vfs_fill_stat_from_inode(&vfs_state.files[fd].inode, out);
     return 0;
+}
+
+int vfs_isatty_fd(int fd)
+{
+    if (fd < 0 || fd >= VFS_MAX_FILES || !vfs_state.files[fd].used)
+    {
+        return 0;
+    }
+
+    return vfs_is_special_device(&vfs_state.files[fd].inode, VFS_SPECIAL_DEV_TTY) ? 1 : 0;
 }
 
 ssize_t vfs_read(int fd, void *buf, size_t len)

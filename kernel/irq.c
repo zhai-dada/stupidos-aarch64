@@ -161,6 +161,16 @@ void do_sync(void *stack, uint32_t esr)
         printk("[irq\ttrace]: fault-task state pid=%d exec=%u pc=%#lx lowpc=%u linearmap=%u\n",
                curr->pid, curr->has_exec_image ? 1 : 0, regs->s_pc,
                low_user_pc ? 1U : 0U, likely_user_pc ? 1U : 0U);
+        /*
+         * 仅在异常路径输出 exec 镜像边界，帮助把运行时 PC 精确映射回 ELF 虚拟地址。
+         * 这条日志不影响常规用户体验，后续稳定后可按需降级。
+         */
+        printk("[irq\ttrace]: exec-range base=%#lx end=%#lx alias=%#lx..%#lx pc-off=%#lx\n",
+               curr->exec_base,
+               curr->exec_end,
+               curr->exec_alias_base,
+               curr->exec_alias_end,
+               regs->s_pc - curr->exec_base);
         printk("[irq\ttrace]: fault-reg x0=%#lx x1=%#lx x2=%#lx x8=%#lx lr=%#lx sp=%#lx\n",
                regs->s_reg[0], regs->s_reg[1], regs->s_reg[2], regs->s_reg[8], regs->s_lr, regs->s_sp);
         printk("[irq trace] fp=%lx bt0=%lx bt1=%lx\n", regs->s_fp, bt_lr0, bt_lr1);

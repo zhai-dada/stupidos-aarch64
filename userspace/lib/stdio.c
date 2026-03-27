@@ -689,6 +689,16 @@ void setbuf(FILE *fp, char *buf)
     (void)buf;
 }
 
+void flockfile(FILE *fp)
+{
+    (void)fp;
+}
+
+void funlockfile(FILE *fp)
+{
+    (void)fp;
+}
+
 char *fgets(char *s, int size, FILE *fp)
 {
     int ch;

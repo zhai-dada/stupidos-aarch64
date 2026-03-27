@@ -18,11 +18,18 @@ PYTHON_BUILD_DIR := third_party/cpython310-build
 PYTHON_LIBPY    :=  $(PYTHON_BUILD_DIR)/libpython3.10.a
 PYTHON_LIB_DIR  :=  third_party/cpython310/Lib
 PYTHON_INC_DIR  :=  third_party/cpython310/Include
+TCC_LIBTCC1_SRC :=  $(TCC_SRC_DIR)/arm64-libtcc1.a
 ENABLE_PYTHON   ?=  0
-USER_PROGRAMS   :=  hello ls cat echo mkdir rm mv touch ping sleep netcfg sh tcc mkprobe
+DROPBEAR_BUILD_DIR := third_party/dropbear-build
+DROPBEAR_CLIENT_OBJS := $(wildcard $(DROPBEAR_BUILD_DIR)/obj/*.o)
+DROPBEAR_CLIENT_LIBS := $(DROPBEAR_BUILD_DIR)/libtomcrypt/libtomcrypt.a $(DROPBEAR_BUILD_DIR)/libtommath/libtommath.a
+SSH_BIN         :=  $(USER_BIN_DIR)/ssh
+DBCLIENT_BIN    :=  $(USER_BIN_DIR)/dbclient
+USER_PROGRAMS   :=  hello ls cat echo mkdir rmdir rm mv touch ping sleep netcfg wget browser ftp sh ssh tcc mkprobe elfinfo vi vim
 ifeq ($(ENABLE_PYTHON),1)
 USER_PROGRAMS   += python3
 endif
+BUSYBOX_BIN     :=  $(USER_BIN_DIR)/busybox
 
 # 防止默认目标被自动依赖文件中的“首个对象规则”抢走。
 .DEFAULT_GOAL := all
@@ -88,12 +95,18 @@ USER_CRT0_OBJ  :=  $(BUILD_DIR)/$(USER_DIR)/crt0.o
 USER_RUNTIME_OBJS := $(filter-out $(USER_CRT0_OBJ),$(USER_CRT_OBJ)) $(USER_LIB_OBJS)
 USER_RUNTIME_LIB := $(BUILD_DIR)/$(USER_DIR)/lib/libstupidos.a
 USER_BINS      :=  $(addprefix $(USER_BIN_DIR)/,$(USER_PROGRAMS))
+BUSYBOX_OBJ    :=  $(BUILD_DIR)/$(USER_DIR)/bin/busybox.o
+BUSYBOX_WGET_OBJ := $(BUILD_DIR)/$(USER_DIR)/bin/busybox_wget.o
 TCC_REAL_OBJ   :=  $(BUILD_DIR)/third_party/tinycc/tcc-real.o
 TCC_REAL_BIN   :=  $(USER_BIN_DIR)/tcc.real
 USER_EXTRA_BINS := $(TCC_REAL_BIN)
+USER_EXTRA_BINS += $(BUSYBOX_BIN)
+USER_EXTRA_BINS += $(SSH_BIN)
+USER_EXTRA_BINS += $(DBCLIENT_BIN)
 USER_BINS_ALL  :=  $(USER_BINS) $(USER_EXTRA_BINS)
 TCC_REAL_CFLAGS := $(USER_CFLAGS) -I$(TCC_SRC_DIR) -I$(TCC_SRC_DIR)/include -DTCC_USING_DOUBLE_FOR_LDOUBLE=1 -DCONFIG_TCC_SEMLOCK=0
 DEPS           +=  $(USER_LIB_OBJS:.o=.d) $(USER_BIN_OBJS:.o=.d) $(USER_CRT_OBJ:.o=.d)
+DEPS           +=  $(BUSYBOX_OBJ:.o=.d) $(BUSYBOX_WGET_OBJ:.o=.d)
 
 -include $(DEPS)
 
@@ -132,9 +145,17 @@ $(BUILD_DIR)/$(USER_DIR)/%.o: $(USER_DIR)/%.S
 	$(CC) $(USER_CFLAGS) -E -P $< -o $(@:.o=.i)
 	$(AS) $(USER_ASFLAGS) $(@:.o=.i) -o $@
 
+$(BUSYBOX_WGET_OBJ): $(USER_DIR)/bin/wget.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) $(DEPFLAGS) -DBUSYBOX_WGET_APPLET_ONLY=1 -c $< -o $@
+
 $(USER_BIN_DIR)/%: $(BUILD_DIR)/$(USER_DIR)/bin/%.o $(USER_LIB_OBJS) $(USER_CRT_OBJ) $(USER_LD_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD) -nostdlib -z max-page-size=0x1000 $(USER_CRT_OBJ) $(USER_LIB_OBJS) $< $(USER_LIBGCC) -o $@ -T $(USER_LD_SCRIPT)
+
+$(BUSYBOX_BIN): $(BUSYBOX_OBJ) $(BUSYBOX_WGET_OBJ) $(USER_LIB_OBJS) $(USER_CRT_OBJ) $(USER_LD_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD) -nostdlib -z max-page-size=0x1000 $(USER_CRT_OBJ) $(USER_LIB_OBJS) $(BUSYBOX_OBJ) $(BUSYBOX_WGET_OBJ) $(USER_LIBGCC) -o $@ -T $(USER_LD_SCRIPT)
 
 $(USER_BIN_DIR)/python3: $(BUILD_DIR)/$(USER_DIR)/bin/python3.o $(USER_LIB_OBJS) $(USER_CRT_OBJ) $(USER_LD_SCRIPT) $(PYTHON_LIBPY)
 	@mkdir -p $(dir $@)
@@ -143,6 +164,12 @@ $(USER_BIN_DIR)/python3: $(BUILD_DIR)/$(USER_DIR)/bin/python3.o $(USER_LIB_OBJS)
 $(USER_RUNTIME_LIB): $(USER_RUNTIME_OBJS)
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $(USER_RUNTIME_OBJS)
+
+$(DBCLIENT_BIN): $(DROPBEAR_CLIENT_OBJS) $(USER_RUNTIME_LIB) $(DROPBEAR_CLIENT_LIBS) $(USER_CRT_OBJ) $(USER_LD_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD) -nostdlib -z max-page-size=0x1000 $(USER_CRT_OBJ) \
+		--start-group $(DROPBEAR_CLIENT_OBJS) $(USER_RUNTIME_LIB) $(DROPBEAR_CLIENT_LIBS) $(USER_LIBGCC) --end-group \
+		-o $@ -T $(USER_LD_SCRIPT)
 
 $(PYTHON_LIBPY):
 	@$(MAKE) -C $(PYTHON_BUILD_DIR) -j2 V=1 libpython3.10.a
@@ -153,6 +180,10 @@ $(TCC_SRC_DIR)/config.h: $(TCC_SRC_DIR)/configure $(TCC_SRC_DIR)/VERSION
 $(TCC_REAL_OBJ): $(TCC_SRC_DIR)/tcc.c $(TCC_SRC_DIR)/config.h
 	@mkdir -p $(dir $@)
 	$(CC) $(TCC_REAL_CFLAGS) -c $< -o $@
+
+$(TCC_LIBTCC1_SRC): $(TCC_SRC_DIR)/config.h
+	@echo "Building tinycc runtime library for arm64..."
+	@$(MAKE) -C $(TCC_SRC_DIR)/lib CROSS_TARGET=arm64 arm64-libtcc1-usegcc=yes -j2
 
 $(TCC_REAL_BIN): $(TCC_REAL_OBJ) $(USER_LIB_OBJS) $(USER_CRT_OBJ) $(USER_LD_SCRIPT)
 	@mkdir -p $(dir $@)
@@ -220,6 +251,7 @@ $(DISK_IMG): $(USER_BINS_ALL) $(USER_RUNTIME_LIB) script/disk.sh script/Makefile
 		USER_RUNTIME_LIB="$(abspath $(USER_RUNTIME_LIB))" \
 		USER_CRT0_OBJ="$(abspath $(USER_CRT0_OBJ))" \
 		USER_LIBGCC="$(abspath $(USER_LIBGCC))" \
+		TCC_LIBTCC1="$(abspath $(TCC_LIBTCC1_SRC))" \
 		PYTHON_BIN="$(abspath $(USER_BIN_DIR)/python3)" \
 		PYTHON_LIB_DIR="$(abspath $(PYTHON_LIB_DIR))" \
 		TCC_SRC_DIR="$(abspath $(TCC_SRC_DIR))"
@@ -285,7 +317,7 @@ run: $(KERNEL_BIN) $(QEMU_DTB) $(DISK_IMG)
 	-device virtio-blk-device,drive=hd0 \
 	-device virtio-keyboard-device -device virtio-tablet-device \
 	-device ramfb \
-	-display gtk \
+	-display gtk,zoom-to-fit=on \
 	$(QEMU_NET_DUMP) \
 	$(QEMU_NET_ARGS) \
 	-kernel $(KERNEL_BIN) \

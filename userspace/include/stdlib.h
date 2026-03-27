@@ -7,10 +7,10 @@
 #include "signal.h"
 
 extern char **environ;
-extern int errno;
 
 void exit(int code) __attribute__((noreturn));
 void _exit(int code) __attribute__((noreturn));
 void abort(void) __attribute__((noreturn));
+int atexit(void (*func)(void));
 
 #endif

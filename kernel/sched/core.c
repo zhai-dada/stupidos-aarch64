@@ -44,6 +44,9 @@ static void init_idle_task(struct task_struct *idle, uint32_t cpu)
     idle->heap_base = 0;
     idle->heap_brk = 0;
     idle->heap_end = 0;
+    idle->stdio_fd[0] = -1;
+    idle->stdio_fd[1] = -1;
+    idle->stdio_fd[2] = -1;
     copy_task_cwd(idle->cwd, (const int8_t *)"/");
     copy_task_name(idle->comm, (const int8_t *)"idle");
 }
@@ -61,6 +64,9 @@ static void init_boot_task(struct task_struct *task, uint32_t cpu)
     task->exec_base = 0;
     task->exec_end = 0;
     task->has_exec_image = false;
+    task->stdio_fd[0] = -1;
+    task->stdio_fd[1] = -1;
+    task->stdio_fd[2] = -1;
     task_runtime_init(task);
     copy_task_cwd(task->cwd, (const int8_t *)"/");
     copy_task_name(task->comm, (const int8_t *)"boot");
@@ -644,6 +650,9 @@ int kthread_create(const int8_t *name, task_entry_t entry, void *arg)
     task->exec_base = 0;
     task->exec_end = 0;
     task->has_exec_image = false;
+    task->stdio_fd[0] = -1;
+    task->stdio_fd[1] = -1;
+    task->stdio_fd[2] = -1;
     task_runtime_init(task);
     copy_task_cwd(task->cwd, task_cwd());
     copy_task_name(task->comm, name);

@@ -85,6 +85,13 @@ struct task_struct
     } mmaps[TASK_MAX_MMAPS];
     int8_t cwd[TASK_CWD_LEN];
     int8_t comm[TASK_COMM_LEN];
+    /*
+     * stdio 重定向表（中文）：
+     * - 默认值为 -1，表示继续走内核 tty 路径
+     * - 当进程通过 dup2 把 pipe / file / socket 绑定到 0/1/2 时，
+     *   这里记录真实目标 fd，让 read/write/ioctl/fcntl/close 都能按重定向生效
+     */
+    int32_t stdio_fd[3];
     struct cpu_context cpu_ctx;
     uint8_t stack[TASK_STACK_SIZE] __attribute__((aligned(16)));
 };
