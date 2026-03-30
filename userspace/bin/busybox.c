@@ -21,11 +21,13 @@ static const int8_t *const busybox_known_applets[] =
     (const int8_t *)"ftpput",
     (const int8_t *)"echo",
     (const int8_t *)"cat",
+    (const int8_t *)"readlink",
     (const int8_t *)"ls",
     (const int8_t *)"mkdir",
     (const int8_t *)"rmdir",
     (const int8_t *)"rm",
     (const int8_t *)"mv",
+    (const int8_t *)"ln",
     (const int8_t *)"touch",
     (const int8_t *)"ping",
     (const int8_t *)"sleep",
@@ -38,6 +40,7 @@ static const int8_t *const busybox_known_applets[] =
     (const int8_t *)"python3",
     (const int8_t *)"vi",
     (const int8_t *)"vim",
+    (const int8_t *)"ui",
 };
 
 static const int8_t *busybox_basename(const int8_t *path)

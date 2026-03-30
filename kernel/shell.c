@@ -139,7 +139,8 @@ static void shell_ls(const int8_t *path)
             return;
         }
 
-        shell_puts((const int8_t *)((ent.mode & VFS_S_IFMT) == VFS_S_IFDIR ? "[d] " : "[-] "));
+        shell_puts((const int8_t *)((ent.mode & VFS_S_IFMT) == VFS_S_IFDIR ? "[d] " :
+                                    ((ent.mode & VFS_S_IFMT) == VFS_S_IFLNK ? "[l] " : "[-] ")));
         shell_puts((const int8_t *)ent.name);
         shell_puts((const int8_t *)"\r\n");
     }

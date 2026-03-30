@@ -1,4 +1,13 @@
 #include "stupidos_user.h"
+#include <sys/stat.h>
+#include <unistd.h>
+
+#ifndef AT_FDCWD
+#define AT_FDCWD -100
+#endif
+#ifndef AT_SYMLINK_NOFOLLOW
+#define AT_SYMLINK_NOFOLLOW 0x100
+#endif
 
 static int8_t ls_mode_type_char(uint32_t mode)
 {
@@ -8,6 +17,8 @@ static int8_t ls_mode_type_char(uint32_t mode)
         return 'd';
     case STUPIDOS_VFS_S_IFCHR:
         return 'c';
+    case STUPIDOS_VFS_S_IFLNK:
+        return 'l';
     case STUPIDOS_VFS_S_IFREG:
         return '-';
     default:
@@ -56,6 +67,8 @@ static void ls_print_u64(uint64_t value)
 static void ls_print_long(const int8_t *path, const int8_t *name, const struct stupidos_stat *st)
 {
     int8_t perm[11];
+    int8_t link_target[STUPIDOS_PATH_MAX];
+    ssize_t link_len;
 
     ls_mode_perm_string((uint32_t)st->mode, perm);
     u_puts(perm);
@@ -69,6 +82,17 @@ static void ls_print_long(const int8_t *path, const int8_t *name, const struct s
     ls_print_u64(st->size);
     u_puts((const int8_t *)" ");
     u_puts(name);
+    if ((st->mode & STUPIDOS_VFS_S_IFMT) == STUPIDOS_VFS_S_IFLNK)
+    {
+        u_memset(link_target, 0, sizeof(link_target));
+        link_len = u_readlink(path, link_target, sizeof(link_target) - 1U);
+        if (link_len >= 0)
+        {
+            link_target[(size_t)link_len] = '\0';
+            u_puts((const int8_t *)" -> ");
+            u_puts(link_target);
+        }
+    }
     (void)path;
     u_puts((const int8_t *)"\n");
 }
@@ -120,6 +144,7 @@ static int ls_list_dir(const int8_t *path)
 {
     struct stupidos_dirent ent;
     struct stupidos_stat st;
+    struct stat lst;
     int8_t full_path[STUPIDOS_PATH_MAX * 2];
     int ret;
     uint32_t index;
@@ -139,7 +164,7 @@ static int ls_list_dir(const int8_t *path)
         }
 
         ls_join_path(full_path, sizeof(full_path), path, ent.name);
-        if (u_stat(full_path, &st) < 0)
+        if (lstat((const char *)full_path, &lst) < 0)
         {
             u_memset(&st, 0, sizeof(st));
             st.mode = ent.mode;
@@ -149,8 +174,17 @@ static int ls_list_dir(const int8_t *path)
             st.gid = 0;
             st.blksize = 4096;
         }
+        else
+        {
+            st.mode = (uint32_t)lst.st_mode;
+            st.nlink = (uint32_t)lst.st_nlink;
+            st.uid = (uint32_t)lst.st_uid;
+            st.gid = (uint32_t)lst.st_gid;
+            st.size = (uint64_t)lst.st_size;
+            st.blksize = (uint32_t)lst.st_blksize;
+        }
 
-        ls_print_long(path, ent.name, &st);
+        ls_print_long(full_path, ent.name, &st);
         index++;
     }
 }

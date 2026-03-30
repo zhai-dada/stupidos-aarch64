@@ -74,7 +74,11 @@
 #define SYS_FBINFO     71
 #define SYS_FBFILL     72
 #define SYS_FBTEXT     73
-#define SYS_PIPE2      74
+#define SYS_MOUSEINFO  74
+#define SYS_PIPE2      75
+#define SYS_WAITPID_STATUS 76
+#define SYS_LINK      77
+#define SYS_SYMLINK   78
 
 .section .text
 
@@ -160,6 +164,24 @@ FUNC_GLOBAL(u_waitpid)
 	svc #0
 	ret
 FUNC_END(u_waitpid)
+
+FUNC_GLOBAL(u_waitpid_status)
+	mov x8, #SYS_WAITPID_STATUS
+	svc #0
+	ret
+FUNC_END(u_waitpid_status)
+
+FUNC_GLOBAL(u_link)
+	mov x8, #SYS_LINK
+	svc #0
+	ret
+FUNC_END(u_link)
+
+FUNC_GLOBAL(u_symlink)
+	mov x8, #SYS_SYMLINK
+	svc #0
+	ret
+FUNC_END(u_symlink)
 
 FUNC_GLOBAL(u_sleep_ms)
 	mov x8, #SYS_SLEEP
@@ -527,6 +549,12 @@ FUNC_GLOBAL(u_fbtext)
 	svc #0
 	ret
 FUNC_END(u_fbtext)
+
+FUNC_GLOBAL(u_mouseinfo)
+	mov x8, #SYS_MOUSEINFO
+	svc #0
+	ret
+FUNC_END(u_mouseinfo)
 
 FUNC_GLOBAL(u_exit)
 	mov x8, #SYS_EXIT

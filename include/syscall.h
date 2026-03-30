@@ -85,7 +85,11 @@ enum syscall_no
     SYS_FBINFO,
     SYS_FBFILL,
     SYS_FBTEXT,
+    SYS_MOUSEINFO,
     SYS_PIPE2,
+    SYS_WAITPID_STATUS,
+    SYS_LINK,
+    SYS_SYMLINK,
     SYS_MAX,
 };
 
@@ -134,6 +138,13 @@ struct stupidos_timeval
 {
     int64_t tv_sec;
     int64_t tv_usec;
+};
+
+struct stupidos_mouseinfo
+{
+    int32_t x;
+    int32_t y;
+    uint32_t buttons;
 };
 
 struct stupidos_timespec

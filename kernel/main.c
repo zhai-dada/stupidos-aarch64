@@ -279,6 +279,14 @@ int32_t kernel_main(uint64_t dtb_phys)
     memset((int8_t *)&__bss_start, 0, (uint64_t)&__bss_end - (uint64_t)&__bss_start);
 
     early_uart_init();
+    /*
+     * 默认进入“安静启动”模式（中文）：
+     * - 正常启动路径不再刷屏，串口更像可直接交互的终端
+     * - 包含 failed/error/fault/panic 等关键词的关键日志仍会保留
+     *
+     * 这样在真实使用场景里，用户看到的是 shell，而不是成百上千行 init trace。
+     */
+    uart_set_quiet(true);
     current_el = read_sysreg(CurrentEL);
     printk("[boot\tinit]: CurrentEL=%lu\n", current_el >> 2);
     if (!dtb_phys)

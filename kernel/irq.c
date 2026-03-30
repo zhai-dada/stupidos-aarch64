@@ -179,6 +179,11 @@ void do_sync(void *stack, uint32_t esr)
         printk("[irq\ttrace]: fault pc=%#lx inst=%08x\n",
                regs->s_pc,
                sync_fault_inst_safe(regs->s_pc));
+        /*
+         * 用户态异常按 Linux 习惯回报 128 + SIGSEGV(11) = 139，
+         * 这样父进程 wait 后能拿到非 0 退出码，便于脚本判断失败。
+         */
+        task_set_exit_code(139);
         task_exit();
     }
 

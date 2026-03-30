@@ -16,7 +16,7 @@
  *
  * 当前明确不支持：
  * - 完整 ext4 元数据校验和更新（metadata_csum）
- * - unlink / rename / 多级 extent 树修改
+ * - unlink / link / rename / 多级 extent 树修改
  * - journal 回放与提交
  */
 #define GPT_SIGNATURE               "EFI PART"
@@ -30,6 +30,7 @@
 #define EXT4_FT_UNKNOWN             0
 #define EXT4_FT_REG_FILE            1
 #define EXT4_FT_DIR                 2
+#define EXT4_FT_SYMLINK             7
 #define EXT4_DIR_REC_LEN(name_len)  (((uint16_t)(8 + (name_len)) + 3U) & ~3U)
 
 struct gpt_header
@@ -258,7 +259,10 @@ static int ext4_lookup(struct vfs_inode *dir, const int8_t *name, struct vfs_ino
 static int ext4_readdir(struct vfs_inode *dir, uint32_t index, struct vfs_dirent *out);
 static ssize_t ext4_read(struct vfs_inode *inode, uint64_t offset, void *buf, size_t len);
 static ssize_t ext4_write(struct vfs_inode *inode, uint64_t offset, const void *buf, size_t len);
+static ssize_t ext4_readlink(struct vfs_inode *inode, int8_t *buf, size_t len);
 static int ext4_create(struct vfs_inode *dir, const int8_t *name, uint16_t mode, struct vfs_inode *out);
+static int ext4_link(struct vfs_inode *old_inode, struct vfs_inode *new_dir, const int8_t *new_name);
+static int ext4_symlink(struct vfs_inode *dir, const int8_t *name, const int8_t *target, struct vfs_inode *out);
 static int ext4_mkdir(struct vfs_inode *dir, const int8_t *name, uint16_t mode, struct vfs_inode *out);
 static int ext4_unlink(struct vfs_inode *dir, const int8_t *name, bool dir_only);
 static int ext4_rename(struct vfs_inode *old_dir, const int8_t *old_name,
@@ -284,7 +288,10 @@ static void ext4_init_inode_ops(void)
     ext4_inode_ops.readdir = ext4_readdir;
     ext4_inode_ops.read = ext4_read;
     ext4_inode_ops.write = ext4_write;
+    ext4_inode_ops.readlink = ext4_readlink;
     ext4_inode_ops.create = ext4_create;
+    ext4_inode_ops.link = ext4_link;
+    ext4_inode_ops.symlink = ext4_symlink;
     ext4_inode_ops.mkdir = ext4_mkdir;
     ext4_inode_ops.unlink = ext4_unlink;
     ext4_inode_ops.rename = ext4_rename;
@@ -1000,6 +1007,31 @@ static int ext4_init_new_inode(struct ext4_inode_disk *inode, uint16_t mode, uin
     return 0;
 }
 
+static int ext4_init_new_symlink_inode(struct ext4_inode_disk *inode, const int8_t *target, size_t target_len)
+{
+    if (!inode || !target)
+    {
+        return -EINVAL;
+    }
+
+    if (target_len >= sizeof(inode->block))
+    {
+        return -ENAMETOOLONG;
+    }
+
+    memset((int8_t *)inode, 0, sizeof(*inode));
+    inode->mode = (uint16_t)(VFS_S_IFLNK | 0777U);
+    inode->uid = 0;
+    inode->gid = 0;
+    inode->links_count = 1;
+    inode->flags = 0;
+    inode->blocks_lo = 0;
+    ext4_set_inode_size(inode, (uint64_t)target_len);
+    memcpy((int8_t *)inode->block, (const int8_t *)target, target_len);
+    inode->block[target_len] = '\0';
+    return 0;
+}
+
 static int ext4_map_extent_block(const struct ext4_fs *fs, const struct ext4_inode_disk *inode,
                                  uint32_t logical, uint64_t *phys)
 {
@@ -1312,6 +1344,10 @@ static uint8_t ext4_file_type_from_mode(uint16_t mode)
     if ((mode & VFS_S_IFMT) == VFS_S_IFDIR)
     {
         return EXT4_FT_DIR;
+    }
+    if ((mode & VFS_S_IFMT) == VFS_S_IFLNK)
+    {
+        return EXT4_FT_SYMLINK;
     }
     if ((mode & VFS_S_IFMT) == VFS_S_IFREG)
     {
@@ -1914,6 +1950,208 @@ static int ext4_create(struct vfs_inode *dir, const int8_t *name, uint16_t mode,
     return 0;
 }
 
+static int ext4_link(struct vfs_inode *old_inode, struct vfs_inode *new_dir, const int8_t *new_name)
+{
+    struct ext4_fs *fs;
+    struct ext4_inode_disk old_raw;
+    struct ext4_inode_disk new_parent_raw;
+    struct vfs_inode exists;
+    uint8_t file_type;
+    int ret;
+
+    if (!old_inode || !new_dir || !new_name || new_name[0] == '\0')
+    {
+        return -EINVAL;
+    }
+    if (strlen((int8_t *)new_name) > VFS_NAME_MAX)
+    {
+        return -ENAMETOOLONG;
+    }
+
+    if (old_inode->sb != new_dir->sb)
+    {
+        return -EXDEV;
+    }
+
+    fs = (struct ext4_fs *)new_dir->fs_private;
+    ret = ext4_lookup(new_dir, new_name, &exists);
+    if (ret == 0)
+    {
+        return -EEXIST;
+    }
+    if (ret != -ENOENT)
+    {
+        return ret;
+    }
+
+    if (ext4_read_inode_raw(fs, old_inode->ino, &old_raw))
+    {
+        return -EIO;
+    }
+    if ((old_raw.mode & VFS_S_IFMT) == VFS_S_IFDIR)
+    {
+        return -EPERM;
+    }
+
+    if (ext4_read_inode_raw(fs, new_dir->ino, &new_parent_raw))
+    {
+        return -EIO;
+    }
+    if ((new_parent_raw.mode & VFS_S_IFMT) != VFS_S_IFDIR)
+    {
+        return -ENOTDIR;
+    }
+
+    file_type = ext4_file_type_from_mode(old_raw.mode);
+    if (file_type == EXT4_FT_UNKNOWN)
+    {
+        file_type = EXT4_FT_REG_FILE;
+    }
+
+    ret = ext4_dir_add_entry(fs, new_dir->ino, &new_parent_raw, old_inode->ino, new_name, file_type);
+    if (ret)
+    {
+        return ret;
+    }
+
+    if (old_raw.links_count >= 0xffffU)
+    {
+        return -EMLINK;
+    }
+    old_raw.links_count++;
+    if (ext4_write_inode_raw(fs, old_inode->ino, &old_raw))
+    {
+        struct ext4_dir_loc loc;
+        struct ext4_inode_disk rollback_parent;
+
+        if (ext4_read_inode_raw(fs, new_dir->ino, &rollback_parent) == 0 &&
+            ext4_dir_find_entry(fs, &rollback_parent, new_name, &loc) == 0)
+        {
+            (void)ext4_dir_remove_entry(fs, &loc);
+        }
+        return -EIO;
+    }
+
+    return 0;
+}
+
+static ssize_t ext4_readlink(struct vfs_inode *inode, int8_t *buf, size_t len)
+{
+    struct ext4_fs *fs;
+    struct ext4_inode_disk raw_inode;
+    size_t target_len;
+
+    if (!inode || !buf || len == 0)
+    {
+        return -EINVAL;
+    }
+
+    fs = (struct ext4_fs *)inode->fs_private;
+    if (ext4_read_inode_raw(fs, inode->ino, &raw_inode))
+    {
+        return -EIO;
+    }
+
+    if ((raw_inode.mode & VFS_S_IFMT) != VFS_S_IFLNK)
+    {
+        return -EINVAL;
+    }
+
+    target_len = (size_t)ext4_inode_size(&raw_inode);
+    if (target_len >= sizeof(raw_inode.block))
+    {
+        return -EOVERFLOW;
+    }
+
+    if (target_len >= len)
+    {
+        target_len = len - 1U;
+    }
+
+    memcpy(buf, (int8_t *)raw_inode.block, target_len);
+    buf[target_len] = '\0';
+    return (ssize_t)target_len;
+}
+
+static int ext4_symlink(struct vfs_inode *dir, const int8_t *name, const int8_t *target, struct vfs_inode *out)
+{
+    struct ext4_fs *fs;
+    struct ext4_inode_disk parent_raw;
+    struct ext4_inode_disk child_raw;
+    struct vfs_inode exists;
+    uint32_t ino;
+    size_t target_len;
+    int ret;
+
+    if (!dir || !name || !target || name[0] == '\0' || target[0] == '\0')
+    {
+        return -EINVAL;
+    }
+
+    if (strlen((int8_t *)name) > VFS_NAME_MAX)
+    {
+        return -ENAMETOOLONG;
+    }
+
+    fs = (struct ext4_fs *)dir->fs_private;
+    ret = ext4_lookup(dir, name, &exists);
+    if (ret == 0)
+    {
+        return -EEXIST;
+    }
+    if (ret != -ENOENT)
+    {
+        return ret;
+    }
+
+    if (ext4_read_inode_raw(fs, dir->ino, &parent_raw))
+    {
+        return -EIO;
+    }
+    if ((parent_raw.mode & VFS_S_IFMT) != VFS_S_IFDIR)
+    {
+        return -ENOTDIR;
+    }
+
+    target_len = strlen((int8_t *)target);
+    if (target_len == 0 || target_len >= sizeof(child_raw.block))
+    {
+        return -ENAMETOOLONG;
+    }
+
+    ret = ext4_alloc_inode(fs, &ino);
+    if (ret)
+    {
+        return ret;
+    }
+
+    ret = ext4_init_new_symlink_inode(&child_raw, target, target_len);
+    if (ret)
+    {
+        ext4_free_inode(fs, ino);
+        return ret;
+    }
+
+    if (ext4_write_inode_raw(fs, ino, &child_raw))
+    {
+        ext4_free_inode(fs, ino);
+        return -EIO;
+    }
+
+    ret = ext4_dir_add_entry(fs, dir->ino, &parent_raw, ino, name, EXT4_FT_SYMLINK);
+    if (ret)
+    {
+        ext4_free_inode(fs, ino);
+        return ret;
+    }
+
+    if (out)
+    {
+        return ext4_fill_vfs_inode(fs, ino, out);
+    }
+    return 0;
+}
+
 static int ext4_mkdir(struct vfs_inode *dir, const int8_t *name, uint16_t mode, struct vfs_inode *out)
 {
     struct ext4_fs *fs;
@@ -2087,6 +2325,23 @@ static int ext4_unlink(struct vfs_inode *dir, const int8_t *name, bool dir_only)
     if (ret)
     {
         return ret;
+    }
+
+    /*
+     * 对普通文件先做“链接数递减”，只有最后一个名字被删掉时才真正
+     * 回收数据块和 inode。这样 hardlink 才能符合 Linux 习惯。
+     */
+    if (!dir_only && type != VFS_S_IFDIR)
+    {
+        if (child_raw.links_count > 1U)
+        {
+            child_raw.links_count--;
+            if (ext4_write_inode_raw(fs, loc.inode, &child_raw))
+            {
+                return -EIO;
+            }
+            return 0;
+        }
     }
 
     if (dir_only && parent_raw.links_count > 0)

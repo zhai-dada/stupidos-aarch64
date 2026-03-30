@@ -32,6 +32,7 @@ int pipe2(int fds[2], int flags);
  */
 
 int chroot(const char *path);
+int link(const char *oldpath, const char *newpath);
 int rename(const char *oldpath, const char *newpath);
 int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath);
 int unlinkat(int dirfd, const char *path, int flags);

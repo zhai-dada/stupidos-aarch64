@@ -42,6 +42,12 @@
 #ifndef AT_FDCWD
 #define AT_FDCWD (-100)
 #endif
+#ifndef AT_SYMLINK_NOFOLLOW
+#define AT_SYMLINK_NOFOLLOW 0x100
+#endif
+#ifndef AT_REMOVEDIR
+#define AT_REMOVEDIR 0x200
+#endif
 
 int open(const char *path, int flags, ...);
 int openat(int dirfd, const char *path, int flags, ...);

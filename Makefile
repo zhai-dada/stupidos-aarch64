@@ -25,7 +25,7 @@ DROPBEAR_CLIENT_OBJS := $(wildcard $(DROPBEAR_BUILD_DIR)/obj/*.o)
 DROPBEAR_CLIENT_LIBS := $(DROPBEAR_BUILD_DIR)/libtomcrypt/libtomcrypt.a $(DROPBEAR_BUILD_DIR)/libtommath/libtommath.a
 SSH_BIN         :=  $(USER_BIN_DIR)/ssh
 DBCLIENT_BIN    :=  $(USER_BIN_DIR)/dbclient
-USER_PROGRAMS   :=  hello ls cat echo mkdir rmdir rm mv touch ping sleep netcfg wget browser ftp sh ssh tcc mkprobe elfinfo vi vim
+USER_PROGRAMS   :=  hello ls cat echo mkdir rmdir rm mv ln readlink touch ping sleep netcfg wget browser ftp sh ssh tcc mkprobe elfinfo vi vim ui
 ifeq ($(ENABLE_PYTHON),1)
 USER_PROGRAMS   += python3
 endif

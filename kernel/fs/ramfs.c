@@ -24,6 +24,8 @@ struct ramfs_node
     void *data;
     uint32_t data_order;
     uint64_t size;
+    int8_t link_target[VFS_PATH_MAX];
+    uint16_t link_len;
 
     uint64_t atime_sec;
     uint64_t atime_nsec;
@@ -46,7 +48,10 @@ static int ramfs_lookup(struct vfs_inode *dir, const int8_t *name, struct vfs_in
 static int ramfs_readdir(struct vfs_inode *dir, uint32_t index, struct vfs_dirent *out);
 static ssize_t ramfs_read(struct vfs_inode *inode, uint64_t offset, void *buf, size_t len);
 static ssize_t ramfs_write(struct vfs_inode *inode, uint64_t offset, const void *buf, size_t len);
+static ssize_t ramfs_readlink(struct vfs_inode *inode, int8_t *buf, size_t len);
 static int ramfs_create(struct vfs_inode *dir, const int8_t *name, uint16_t mode, struct vfs_inode *out);
+static int ramfs_link(struct vfs_inode *old_inode, struct vfs_inode *new_dir, const int8_t *new_name);
+static int ramfs_symlink(struct vfs_inode *dir, const int8_t *name, const int8_t *target, struct vfs_inode *out);
 static int ramfs_mkdir(struct vfs_inode *dir, const int8_t *name, uint16_t mode, struct vfs_inode *out);
 static int ramfs_unlink(struct vfs_inode *dir, const int8_t *name, bool dir_only);
 static int ramfs_rename(struct vfs_inode *old_dir, const int8_t *old_name,
@@ -60,7 +65,10 @@ static struct vfs_inode_ops ramfs_inode_ops =
     .readdir = ramfs_readdir,
     .read = ramfs_read,
     .write = ramfs_write,
+    .readlink = ramfs_readlink,
     .create = ramfs_create,
+    .link = ramfs_link,
+    .symlink = ramfs_symlink,
     .mkdir = ramfs_mkdir,
     .unlink = ramfs_unlink,
     .rename = ramfs_rename,
@@ -172,6 +180,8 @@ static struct ramfs_node *ramfs_node_alloc(struct ramfs_node *parent, const int8
     node->data_order = 0;
     node->data = 0;
     node->size = 0;
+    node->link_target[0] = '\0';
+    node->link_len = 0;
     ramfs_touch_now(node, true, true);
 
     if (parent)
@@ -474,6 +484,38 @@ static ssize_t ramfs_write(struct vfs_inode *inode, uint64_t offset, const void 
     return (ssize_t)len;
 }
 
+static ssize_t ramfs_readlink(struct vfs_inode *inode, int8_t *buf, size_t len)
+{
+    struct ramfs_node *node;
+    size_t copy_len;
+
+    if (!inode || !buf || len == 0)
+    {
+        return -EINVAL;
+    }
+
+    node = ramfs_node_from_inode(inode);
+    if (!node)
+    {
+        return -ENOENT;
+    }
+
+    if ((node->mode & VFS_S_IFMT) != VFS_S_IFLNK)
+    {
+        return -EINVAL;
+    }
+
+    copy_len = node->link_len;
+    if (copy_len >= len)
+    {
+        copy_len = len - 1U;
+    }
+
+    memcpy(buf, node->link_target, copy_len);
+    buf[copy_len] = '\0';
+    return (ssize_t)copy_len;
+}
+
 static int ramfs_create(struct vfs_inode *dir, const int8_t *name, uint16_t mode, struct vfs_inode *out)
 {
     struct ramfs_node *dir_node;
@@ -500,6 +542,66 @@ static int ramfs_create(struct vfs_inode *dir, const int8_t *name, uint16_t mode
     {
         return -ENOSPC;
     }
+
+    if (out)
+    {
+        ramfs_fill_inode(node, out);
+    }
+
+    return 0;
+}
+
+static int ramfs_link(struct vfs_inode *old_inode, struct vfs_inode *new_dir, const int8_t *new_name)
+{
+    (void)old_inode;
+    (void)new_dir;
+    (void)new_name;
+    return -ENOTSUP;
+}
+
+static int ramfs_symlink(struct vfs_inode *dir, const int8_t *name, const int8_t *target, struct vfs_inode *out)
+{
+    struct ramfs_node *dir_node;
+    struct ramfs_node *node;
+    size_t target_len;
+
+    dir_node = ramfs_node_from_inode(dir);
+    if (!dir_node)
+    {
+        return -ENOENT;
+    }
+
+    if ((dir_node->mode & VFS_S_IFMT) != VFS_S_IFDIR)
+    {
+        return -ENOTDIR;
+    }
+
+    if (!name || name[0] == '\0' || !target || target[0] == '\0')
+    {
+        return -EINVAL;
+    }
+
+    if (ramfs_child_lookup(dir_node, name))
+    {
+        return -EEXIST;
+    }
+
+    target_len = strlen((int8_t *)target);
+    if (target_len == 0 || target_len >= sizeof(((struct ramfs_node *)0)->link_target))
+    {
+        return -ENAMETOOLONG;
+    }
+
+    node = ramfs_node_alloc(dir_node, name, (uint16_t)(VFS_S_IFLNK | 0777));
+    if (!node)
+    {
+        return -ENOSPC;
+    }
+
+    memcpy(node->link_target, (int8_t *)target, target_len);
+    node->link_target[target_len] = '\0';
+    node->link_len = (uint16_t)target_len;
+    node->size = target_len;
 
     if (out)
     {

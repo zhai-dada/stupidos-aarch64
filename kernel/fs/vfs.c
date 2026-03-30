@@ -17,6 +17,7 @@ struct vfs_file
     bool used;
     int flags;
     uint64_t pos;
+    int8_t path[VFS_PATH_MAX];
     struct vfs_inode inode;
 };
 
@@ -36,13 +37,14 @@ static struct
     struct vfs_file files[VFS_MAX_FILES];
 } vfs_state;
 
+#define VFS_SYMLINK_MAX  8
+
 static ssize_t vfs_dev_tty_read(struct vfs_inode *inode, uint64_t offset, void *buf, size_t len);
 static ssize_t vfs_dev_tty_write(struct vfs_inode *inode, uint64_t offset, const void *buf, size_t len);
 static ssize_t vfs_dev_null_read(struct vfs_inode *inode, uint64_t offset, void *buf, size_t len);
 static ssize_t vfs_dev_null_write(struct vfs_inode *inode, uint64_t offset, const void *buf, size_t len);
 static ssize_t vfs_dev_zero_read(struct vfs_inode *inode, uint64_t offset, void *buf, size_t len);
 static ssize_t vfs_dev_zero_write(struct vfs_inode *inode, uint64_t offset, const void *buf, size_t len);
-
 static const struct vfs_inode_ops vfs_tty_ops =
 {
     .read = vfs_dev_tty_read,
@@ -74,6 +76,11 @@ static bool vfs_is_reg(struct vfs_inode *inode)
 static bool vfs_is_chr(struct vfs_inode *inode)
 {
     return (inode->mode & VFS_S_IFMT) == VFS_S_IFCHR;
+}
+
+static bool vfs_is_lnk(struct vfs_inode *inode)
+{
+    return (inode->mode & VFS_S_IFMT) == VFS_S_IFLNK;
 }
 
 static bool vfs_is_special_device(struct vfs_inode *inode, uint64_t kind)
@@ -249,6 +256,8 @@ static uint8_t vfs_dtype_from_mode(uint16_t mode)
         return 2; /* DT_CHR */
     case VFS_S_IFREG:
         return 8; /* DT_REG */
+    case VFS_S_IFLNK:
+        return 10; /* DT_LNK */
     default:
         return 0; /* DT_UNKNOWN */
     }
@@ -257,6 +266,28 @@ static uint8_t vfs_dtype_from_mode(uint16_t mode)
 static bool vfs_is_valid_dirent(const struct vfs_dirent *dirent)
 {
     return dirent && dirent->name[0] != '\0';
+}
+
+static void vfs_copy_path_checked(int8_t *dst, size_t dst_len, const int8_t *src)
+{
+    size_t i;
+
+    if (!dst || dst_len == 0)
+    {
+        return;
+    }
+
+    dst[0] = '\0';
+    if (!src)
+    {
+        return;
+    }
+
+    for (i = 0; i + 1 < dst_len && src[i] != '\0'; i++)
+    {
+        dst[i] = src[i];
+    }
+    dst[i] = '\0';
 }
 
 static void vfs_fill_stat_from_inode(const struct vfs_inode *inode, struct vfs_stat *out)
@@ -423,6 +454,221 @@ static int vfs_path_apply(int8_t *path, size_t out_len, const int8_t *src)
     return 0;
 }
 
+static int vfs_readlink_inode(const struct vfs_inode *inode, int8_t *buf, size_t len)
+{
+    if (!inode || !buf || len == 0)
+    {
+        return -EINVAL;
+    }
+
+    if (!vfs_is_lnk((struct vfs_inode *)inode))
+    {
+        return -EINVAL;
+    }
+
+    if (!inode->ops || !inode->ops->readlink)
+    {
+        return -ENOSYS;
+    }
+
+    return (int)inode->ops->readlink((struct vfs_inode *)inode, buf, len);
+}
+
+static int vfs_lookup_path_flags(const int8_t *path, struct vfs_inode *out, bool follow_final, uint32_t depth);
+static int vfs_resolve_mount(const int8_t *path, struct vfs_mount **out_mount, const int8_t **out_subpath);
+
+static int vfs_lookup_path_from_mount(struct vfs_inode *root, const int8_t *mount_path,
+                                      const int8_t *path, struct vfs_inode *out,
+                                      bool follow_final, uint32_t depth)
+{
+    struct vfs_inode current;
+    int8_t prefix[VFS_PATH_MAX];
+    int8_t name[VFS_NAME_MAX + 1];
+    int8_t composed[VFS_PATH_MAX];
+    int8_t target[VFS_PATH_MAX];
+    int ret;
+    size_t i;
+    size_t n;
+
+    if (!root || !path || !out || !mount_path || path[0] != '/')
+    {
+        return -EINVAL;
+    }
+
+    if (depth > VFS_SYMLINK_MAX)
+    {
+        return -ELOOP;
+    }
+
+    current = *root;
+    memset(prefix, 0, sizeof(prefix));
+    ret = vfs_canonicalize_path(mount_path, prefix, sizeof(prefix));
+    if (ret)
+    {
+        return ret;
+    }
+
+    if (path[1] == '\0')
+    {
+        *out = current;
+        return 0;
+    }
+
+    i = 1;
+    while (path[i] != '\0')
+    {
+        while (path[i] == '/')
+        {
+            i++;
+        }
+
+        if (path[i] == '\0')
+        {
+            break;
+        }
+
+        if (!vfs_is_dir(&current) || !current.ops || !current.ops->lookup)
+        {
+            return -ENOTDIR;
+        }
+
+        n = 0;
+        while (path[i] != '\0' && path[i] != '/')
+        {
+            if (n >= VFS_NAME_MAX)
+            {
+                return -ENAMETOOLONG;
+            }
+            name[n++] = path[i++];
+        }
+        name[n] = '\0';
+
+        ret = current.ops->lookup(&current, name, &current);
+        if (ret)
+        {
+            return ret;
+        }
+
+        if (vfs_is_lnk(&current))
+        {
+            if (path[i] != '\0' || follow_final)
+            {
+                size_t target_len;
+
+                memset(target, 0, sizeof(target));
+                ret = vfs_readlink_inode(&current, target, sizeof(target));
+                if (ret < 0)
+                {
+                    return ret;
+                }
+                target_len = strlen(target);
+                if (target_len == 0)
+                {
+                    return -ENOENT;
+                }
+
+                memset(composed, 0, sizeof(composed));
+                composed[0] = '\0';
+
+                if (target[0] == '/')
+                {
+                    ret = vfs_path_apply(composed, sizeof(composed), target);
+                    if (ret)
+                    {
+                        return ret;
+                    }
+                }
+                else
+                {
+                    ret = vfs_path_apply(composed, sizeof(composed), prefix);
+                    if (ret)
+                    {
+                        return ret;
+                    }
+                    ret = vfs_path_apply(composed, sizeof(composed), target);
+                    if (ret)
+                    {
+                        return ret;
+                    }
+                }
+
+                if (path[i] != '\0')
+                {
+                    ret = vfs_path_apply(composed, sizeof(composed), &path[i]);
+                    if (ret)
+                    {
+                        return ret;
+                    }
+                }
+
+                return vfs_lookup_path_flags(composed, out, follow_final, depth + 1U);
+            }
+        }
+
+        ret = vfs_path_push(prefix, sizeof(prefix), name, n);
+        if (ret)
+        {
+            return ret;
+        }
+
+        if (path[i] == '\0')
+        {
+            break;
+        }
+    }
+
+    *out = current;
+    return 0;
+}
+
+static int vfs_lookup_path_flags(const int8_t *path, struct vfs_inode *out, bool follow_final, uint32_t depth)
+{
+    int8_t resolved[VFS_PATH_MAX];
+    struct vfs_mount *mnt;
+    const int8_t *subpath;
+    int ret;
+
+    if (!vfs_state.mounted)
+    {
+        return -ENODEV;
+    }
+
+    if (!path || !out)
+    {
+        return -EINVAL;
+    }
+
+    if (depth > VFS_SYMLINK_MAX)
+    {
+        return -ELOOP;
+    }
+
+    ret = vfs_canonicalize_path(path, resolved, sizeof(resolved));
+    if (ret)
+    {
+        return ret;
+    }
+
+    /*
+     * 伪字符设备优先走内建路径。
+     * 这样即使根分区里没有 /dev 目录，Dropbear / BusyBox / Python
+     * 仍然可以通过 Linux 风格路径访问当前终端和标准空设备。
+     */
+    ret = vfs_lookup_special_path(resolved, out);
+    if (ret == 0)
+    {
+        return 0;
+    }
+
+    ret = vfs_resolve_mount(resolved, &mnt, &subpath);
+    if (ret)
+    {
+        return ret;
+    }
+
+    return vfs_lookup_path_from_mount(&mnt->root, mnt->path, subpath, out, follow_final, depth);
+}
+
 int vfs_canonicalize_path(const int8_t *path, int8_t *out, size_t out_len)
 {
     const int8_t *cwd;
@@ -528,109 +774,14 @@ static int vfs_resolve_mount(const int8_t *path, struct vfs_mount **out_mount, c
     return 0;
 }
 
-static int vfs_lookup_path_from(struct vfs_inode *root, const int8_t *path, struct vfs_inode *out)
+static int vfs_lookup_path_follow(const int8_t *path, struct vfs_inode *out)
 {
-    struct vfs_inode current;
-    int8_t name[VFS_NAME_MAX + 1];
-    int ret;
-    size_t i;
-    size_t n;
-
-    if (!path || path[0] != '/')
-    {
-        return -EINVAL;
-    }
-
-    current = *root;
-
-    if (path[1] == '\0')
-    {
-        *out = current;
-        return 0;
-    }
-
-    i = 1;
-    while (path[i] != '\0')
-    {
-        while (path[i] == '/')
-        {
-            i++;
-        }
-
-        if (path[i] == '\0')
-        {
-            break;
-        }
-
-        if (!vfs_is_dir(&current) || !current.ops || !current.ops->lookup)
-        {
-            return -ENOTDIR;
-        }
-
-        n = 0;
-        while (path[i] != '\0' && path[i] != '/')
-        {
-            if (n >= VFS_NAME_MAX)
-            {
-                return -ENAMETOOLONG;
-            }
-
-            name[n++] = path[i++];
-        }
-        name[n] = '\0';
-
-        ret = current.ops->lookup(&current, name, &current);
-        if (ret)
-        {
-            return ret;
-        }
-    }
-
-    *out = current;
-    return 0;
+    return vfs_lookup_path_flags(path, out, true, 0);
 }
 
-static int vfs_lookup_path(const int8_t *path, struct vfs_inode *out)
+static int vfs_lookup_path_nofollow(const int8_t *path, struct vfs_inode *out)
 {
-    int8_t resolved[VFS_PATH_MAX];
-    struct vfs_mount *mnt;
-    const int8_t *subpath;
-    int ret;
-
-    if (!vfs_state.mounted)
-    {
-        return -ENODEV;
-    }
-
-    if (!path)
-    {
-        return -EINVAL;
-    }
-
-    ret = vfs_canonicalize_path(path, resolved, sizeof(resolved));
-    if (ret)
-    {
-        return ret;
-    }
-
-    /*
-     * 伪字符设备优先走内建路径。
-     * 这样即使根分区里没有 /dev 目录，Dropbear / BusyBox / Python
-     * 仍然可以通过 Linux 风格路径访问当前终端和标准空设备。
-     */
-    ret = vfs_lookup_special_path(resolved, out);
-    if (ret == 0)
-    {
-        return 0;
-    }
-
-    ret = vfs_resolve_mount(resolved, &mnt, &subpath);
-    if (ret)
-    {
-        return ret;
-    }
-
-    return vfs_lookup_path_from(&mnt->root, subpath, out);
+    return vfs_lookup_path_flags(path, out, false, 0);
 }
 
 static bool vfs_mount_top_level_name(const struct vfs_mount *mnt, const int8_t **name, size_t *name_len)
@@ -868,7 +1019,7 @@ int vfs_chdir(const int8_t *path)
         return ret;
     }
 
-    ret = vfs_lookup_path(resolved, &inode);
+    ret = vfs_lookup_path_follow(resolved, &inode);
     if (ret)
     {
         return ret;
@@ -909,7 +1060,7 @@ int vfs_readdir(const int8_t *path, uint32_t index, struct vfs_dirent *out)
         return ret;
     }
 
-    ret = vfs_lookup_path_from(&mnt->root, subpath, &inode);
+    ret = vfs_lookup_path_from_mount(&mnt->root, mnt->path, subpath, &inode, true, 0);
     if (ret)
     {
         return ret;
@@ -950,12 +1101,19 @@ int vfs_open(const int8_t *path, int flags)
 {
     struct vfs_inode parent;
     struct vfs_inode inode;
+    int8_t resolved[VFS_PATH_MAX];
     int8_t parent_path[VFS_PATH_MAX];
     int8_t name[VFS_NAME_MAX + 1];
     int ret;
     int fd;
 
-    ret = vfs_lookup_path(path, &inode);
+    ret = vfs_canonicalize_path(path, resolved, sizeof(resolved));
+    if (ret)
+    {
+        return ret;
+    }
+
+    ret = vfs_lookup_path_follow(resolved, &inode);
     if (ret)
     {
         if (!(flags & VFS_O_CREAT) || ret != -ENOENT)
@@ -963,13 +1121,13 @@ int vfs_open(const int8_t *path, int flags)
             return ret;
         }
 
-        ret = vfs_split_parent_path(path, parent_path, sizeof(parent_path), name, sizeof(name));
+        ret = vfs_split_parent_path(resolved, parent_path, sizeof(parent_path), name, sizeof(name));
         if (ret)
         {
             return ret;
         }
 
-        ret = vfs_lookup_path(parent_path, &parent);
+        ret = vfs_lookup_path_follow(parent_path, &parent);
         if (ret)
         {
             return ret;
@@ -996,7 +1154,12 @@ int vfs_open(const int8_t *path, int flags)
     {
         /* 字符设备不支持 truncate，直接保留 inode 即可。 */
     }
-    else if (!vfs_is_reg(&inode))
+    else if (!vfs_is_reg(&inode) && !vfs_is_dir(&inode))
+    {
+        return -EISDIR;
+    }
+
+    if (vfs_is_dir(&inode) && (flags & (VFS_O_WRONLY | VFS_O_RDWR | VFS_O_TRUNC | VFS_O_APPEND)))
     {
         return -EISDIR;
     }
@@ -1024,6 +1187,7 @@ int vfs_open(const int8_t *path, int flags)
             vfs_state.files[fd].flags = flags;
             vfs_state.files[fd].pos = (flags & VFS_O_APPEND) ? inode.size : 0;
             vfs_state.files[fd].inode = inode;
+            vfs_copy_path_checked(vfs_state.files[fd].path, sizeof(vfs_state.files[fd].path), resolved);
             return fd;
         }
     }
@@ -1042,7 +1206,7 @@ int vfs_stat(const int8_t *path, struct vfs_stat *out)
     }
 
     memset((int8_t *)out, 0, sizeof(*out));
-    ret = vfs_lookup_path(path, &inode);
+    ret = vfs_lookup_path_follow(path, &inode);
     if (ret)
     {
         return ret;
@@ -1050,6 +1214,52 @@ int vfs_stat(const int8_t *path, struct vfs_stat *out)
 
     vfs_fill_stat_from_inode(&inode, out);
     return 0;
+}
+
+int vfs_lstat(const int8_t *path, struct vfs_stat *out)
+{
+    struct vfs_inode inode;
+    int ret;
+
+    if (!out)
+    {
+        return -EINVAL;
+    }
+
+    memset((int8_t *)out, 0, sizeof(*out));
+    ret = vfs_lookup_path_nofollow(path, &inode);
+    if (ret)
+    {
+        return ret;
+    }
+
+    vfs_fill_stat_from_inode(&inode, out);
+    return 0;
+}
+
+ssize_t vfs_readlink(const int8_t *path, int8_t *buf, size_t len)
+{
+    struct vfs_inode inode;
+    int ret;
+
+    if (!buf || len == 0)
+    {
+        return -EINVAL;
+    }
+
+    ret = vfs_lookup_path_nofollow(path, &inode);
+    if (ret)
+    {
+        return ret;
+    }
+
+    ret = vfs_readlink_inode(&inode, buf, len);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    return (ssize_t)ret;
 }
 
 int vfs_fstat(int fd, struct vfs_stat *out)
@@ -1330,6 +1540,27 @@ int vfs_dup2(int oldfd, int newfd)
     return newfd;
 }
 
+int vfs_fd_path(int fd, int8_t *out, size_t len)
+{
+    if (!out || len == 0)
+    {
+        return -EINVAL;
+    }
+
+    if (fd < 0 || fd >= VFS_MAX_FILES || !vfs_state.files[fd].used)
+    {
+        return -EBADF;
+    }
+
+    if (vfs_state.files[fd].path[0] == '\0')
+    {
+        return -ENOENT;
+    }
+
+    vfs_copy_path_checked(out, len, vfs_state.files[fd].path);
+    return 0;
+}
+
 int vfs_fcntl(int fd, int cmd, uint64_t arg)
 {
     struct vfs_file *file;
@@ -1467,7 +1698,7 @@ int vfs_mkdir(const int8_t *path, uint16_t mode)
     int8_t name[VFS_NAME_MAX + 1];
     int ret;
 
-    ret = vfs_lookup_path(path, &existing);
+    ret = vfs_lookup_path_nofollow(path, &existing);
     if (ret == 0)
     {
         return -EEXIST;
@@ -1483,7 +1714,7 @@ int vfs_mkdir(const int8_t *path, uint16_t mode)
         return ret;
     }
 
-    ret = vfs_lookup_path(parent_path, &parent);
+    ret = vfs_lookup_path_follow(parent_path, &parent);
     if (ret)
     {
         return ret;
@@ -1503,6 +1734,98 @@ int vfs_mkdir(const int8_t *path, uint16_t mode)
     return ret;
 }
 
+int vfs_link(const int8_t *old_path, const int8_t *new_path)
+{
+    struct vfs_inode old_inode;
+    struct vfs_inode new_parent;
+    int8_t new_parent_path[VFS_PATH_MAX];
+    int8_t new_name[VFS_NAME_MAX + 1];
+    int ret;
+
+    ret = vfs_lookup_path_nofollow(old_path, &old_inode);
+    if (ret)
+    {
+        return ret;
+    }
+
+    if ((old_inode.mode & VFS_S_IFMT) == VFS_S_IFDIR)
+    {
+        return -EPERM;
+    }
+
+    ret = vfs_split_parent_path(new_path, new_parent_path, sizeof(new_parent_path), new_name, sizeof(new_name));
+    if (ret)
+    {
+        return ret;
+    }
+
+    ret = vfs_lookup_path_follow(new_parent_path, &new_parent);
+    if (ret)
+    {
+        return ret;
+    }
+
+    if (!vfs_is_dir(&new_parent))
+    {
+        return -ENOTDIR;
+    }
+
+    if (!new_parent.ops || !new_parent.ops->link)
+    {
+        return -EROFS;
+    }
+
+    return new_parent.ops->link(&old_inode, &new_parent, new_name);
+}
+
+int vfs_symlink(const int8_t *target, const int8_t *new_path)
+{
+    struct vfs_inode parent;
+    struct vfs_inode existing;
+    int8_t parent_path[VFS_PATH_MAX];
+    int8_t name[VFS_NAME_MAX + 1];
+    int ret;
+
+    if (!target || target[0] == '\0' || !new_path)
+    {
+        return -EINVAL;
+    }
+
+    ret = vfs_lookup_path_nofollow(new_path, &existing);
+    if (ret == 0)
+    {
+        return -EEXIST;
+    }
+    if (ret != -ENOENT)
+    {
+        return ret;
+    }
+
+    ret = vfs_split_parent_path(new_path, parent_path, sizeof(parent_path), name, sizeof(name));
+    if (ret)
+    {
+        return ret;
+    }
+
+    ret = vfs_lookup_path_follow(parent_path, &parent);
+    if (ret)
+    {
+        return ret;
+    }
+
+    if (!vfs_is_dir(&parent))
+    {
+        return -ENOTDIR;
+    }
+
+    if (!parent.ops || !parent.ops->symlink)
+    {
+        return -EROFS;
+    }
+
+    return parent.ops->symlink(&parent, name, target, 0);
+}
+
 int vfs_unlink(const int8_t *path, bool dir_only)
 {
     struct vfs_inode parent;
@@ -1516,7 +1839,7 @@ int vfs_unlink(const int8_t *path, bool dir_only)
         return ret;
     }
 
-    ret = vfs_lookup_path(parent_path, &parent);
+    ret = vfs_lookup_path_follow(parent_path, &parent);
     if (ret)
     {
         return ret;
@@ -1557,13 +1880,13 @@ int vfs_rename(const int8_t *old_path, const int8_t *new_path)
         return ret;
     }
 
-    ret = vfs_lookup_path(old_parent_path, &old_parent);
+    ret = vfs_lookup_path_follow(old_parent_path, &old_parent);
     if (ret)
     {
         return ret;
     }
 
-    ret = vfs_lookup_path(new_parent_path, &new_parent);
+    ret = vfs_lookup_path_follow(new_parent_path, &new_parent);
     if (ret)
     {
         return ret;
@@ -1587,7 +1910,7 @@ int vfs_truncate(const int8_t *path, uint64_t size)
     struct vfs_inode inode;
     int ret;
 
-    ret = vfs_lookup_path(path, &inode);
+    ret = vfs_lookup_path_follow(path, &inode);
     if (ret)
     {
         return ret;
@@ -1642,7 +1965,7 @@ int vfs_utimens(const int8_t *path, const struct vfs_timespec *atime, const stru
     struct vfs_inode inode;
     int ret;
 
-    ret = vfs_lookup_path(path, &inode);
+    ret = vfs_lookup_path_follow(path, &inode);
     if (ret)
     {
         return ret;

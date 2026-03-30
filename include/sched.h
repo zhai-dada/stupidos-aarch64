@@ -55,6 +55,7 @@ struct task_struct
 {
     int32_t pid;
     int32_t ppid;
+    int32_t exit_code;
     uint32_t cpu;
     bool is_idle;
     enum task_state state;
@@ -120,6 +121,8 @@ void sched_sleep_ms(uint32_t sleep_ms);
 void scheduler_tick(void);
 void sched_maybe_resched(void);
 void sched_show_tasks(void);
+void task_set_exit_code(int32_t code);
+int sched_wait_child(int32_t parent_pid, int32_t target_pid, int32_t *out_pid, int32_t *out_status);
 void task_exit(void) __attribute__((noreturn));
 struct task_struct *task_current(void);
 struct task_struct *task_by_pid(int32_t pid);

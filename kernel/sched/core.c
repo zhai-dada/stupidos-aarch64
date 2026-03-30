@@ -1,5 +1,6 @@
 #include "sched.h"
 #include "asm/barrier.h"
+#include "errno.h"
 #include "lib/libirq.h"
 #include "lib/libasm.h"
 #include "lib/libmem.h"
@@ -32,6 +33,7 @@ static void init_idle_task(struct task_struct *idle, uint32_t cpu)
     memset((int8_t *)idle, 0, sizeof(*idle));
     idle->pid = -1;
     idle->ppid = -1;
+    idle->exit_code = 0;
     idle->cpu = cpu;
     idle->is_idle = true;
     idle->state = TASK_RUNNING;
@@ -56,6 +58,7 @@ static void init_boot_task(struct task_struct *task, uint32_t cpu)
     memset((int8_t *)task, 0, sizeof(*task));
     task->pid = 0;
     task->ppid = -1;
+    task->exit_code = 0;
     task->cpu = cpu;
     task->is_idle = false;
     task->state = TASK_RUNNING;
@@ -497,6 +500,7 @@ static void task_trampoline(void)
 
     task = task_current();
     task->entry(task->arg);
+    task_set_exit_code(0);
     task_exit();
 }
 
@@ -519,6 +523,98 @@ void task_set_cleanup(task_cleanup_t cleanup, void *arg)
         task->cleanup_arg = arg;
     }
     write_daif(daif);
+}
+
+void task_set_exit_code(int32_t code)
+{
+    struct task_struct *task;
+    uint64_t daif;
+
+    daif = read_daif();
+    disable_irq();
+    task = task_current();
+    if (task)
+    {
+        task->exit_code = code;
+    }
+    write_daif(daif);
+}
+
+int sched_wait_child(int32_t parent_pid, int32_t target_pid, int32_t *out_pid, int32_t *out_status)
+{
+    struct task_struct *child;
+    uint64_t daif;
+    int32_t slot;
+    bool has_child;
+    int ret;
+
+    if (parent_pid < 0)
+    {
+        return -EINVAL;
+    }
+
+    daif = read_daif();
+    disable_irq();
+    spin_lock(&sched_state.lock);
+
+    child = 0;
+    has_child = false;
+    for (slot = 0; slot < CONFIG_MAX_TASKS; slot++)
+    {
+        struct task_struct *task;
+
+        task = &sched_state.tasks[slot];
+        if (task->state == TASK_UNUSED)
+        {
+            continue;
+        }
+
+        if (task->ppid != parent_pid)
+        {
+            continue;
+        }
+
+        if (target_pid >= 0 && task->pid != target_pid)
+        {
+            continue;
+        }
+
+        has_child = true;
+        if (task->state == TASK_DEAD)
+        {
+            child = task;
+            break;
+        }
+    }
+
+    if (child)
+    {
+        if (out_pid)
+        {
+            *out_pid = child->pid;
+        }
+        if (out_status)
+        {
+            /*
+             * 对齐 Linux wait status 编码（中文）：
+             * 正常退出统一写成 (exit_code & 0xff) << 8，
+             * userspace 直接用 WEXITSTATUS(status) 就能拿到返回值。
+             */
+            *out_status = (child->exit_code & 0xff) << 8;
+        }
+
+        memset((int8_t *)child, 0, sizeof(*child));
+        child->state = TASK_UNUSED;
+        ret = 0;
+    }
+    else
+    {
+        ret = has_child ? -EAGAIN : -ECHILD;
+    }
+
+    spin_unlock(&sched_state.lock);
+    write_daif(daif);
+    return ret;
 }
 
 const int8_t *task_cwd(void)
@@ -642,6 +738,7 @@ int kthread_create(const int8_t *name, task_entry_t entry, void *arg)
     pid = sched_state.next_pid++;
     task->pid = pid;
     task->ppid = task_current() ? task_current()->pid : 0;
+    task->exit_code = 0;
     task->cpu = sched_pick_target_cpu();
     task->state = TASK_RUNNABLE;
     task->weight = 1024;

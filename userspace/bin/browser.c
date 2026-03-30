@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <poll.h>
 #include <netinet/in.h>
@@ -29,7 +30,17 @@
 #define BROWSER_WRAP_WIDTH       78
 #define BROWSER_VIEW_ROWS        18
 #define BROWSER_MAX_REDIRECTS    5
-#define BROWSER_RECV_TIMEOUT_MS  2500
+#define BROWSER_RECV_TIMEOUT_MS  800
+#define BROWSER_CONNECT_TIMEOUT_MS 2500
+#define BROWSER_PAGE_TITLE_MAX   128
+#define BROWSER_LINK_MAX         48
+
+struct browser_line_item
+{
+    char *text;
+    char href[BROWSER_URL_MAX];
+    bool has_link;
+};
 
 struct browser_url
 {
@@ -49,7 +60,7 @@ struct browser_buffer
 
 struct browser_lines
 {
-    char **items;
+    struct browser_line_item *items;
     size_t count;
     size_t cap;
 };
@@ -197,7 +208,7 @@ static void browser_lines_free(struct browser_lines *lines)
 
     for (i = 0; i < lines->count; i++)
     {
-        free(lines->items[i]);
+        free(lines->items[i].text);
     }
     free(lines->items);
     lines->items = NULL;
@@ -205,11 +216,12 @@ static void browser_lines_free(struct browser_lines *lines)
     lines->cap = 0;
 }
 
-static int browser_lines_push_copy(struct browser_lines *lines, const char *line, size_t len)
+static int browser_lines_push_copy(struct browser_lines *lines, const char *line, size_t len, const char *href)
 {
     char *copy;
-    char **items;
+    struct browser_line_item *items;
     size_t cap;
+    struct browser_line_item *item;
 
     if (!lines || !line)
     {
@@ -219,7 +231,7 @@ static int browser_lines_push_copy(struct browser_lines *lines, const char *line
     if (lines->count + 1U > lines->cap)
     {
         cap = lines->cap ? lines->cap * 2U : 128U;
-        items = (char **)realloc(lines->items, cap * sizeof(lines->items[0]));
+        items = (struct browser_line_item *)realloc(lines->items, cap * sizeof(lines->items[0]));
         if (!items)
         {
             return -1;
@@ -235,11 +247,20 @@ static int browser_lines_push_copy(struct browser_lines *lines, const char *line
     }
     memcpy(copy, line, len);
     copy[len] = '\0';
-    lines->items[lines->count++] = copy;
+    item = &lines->items[lines->count++];
+    item->text = copy;
+    item->has_link = false;
+    item->href[0] = '\0';
+    if (href && href[0] != '\0')
+    {
+        strncpy(item->href, href, sizeof(item->href) - 1U);
+        item->href[sizeof(item->href) - 1U] = '\0';
+        item->has_link = true;
+    }
     return 0;
 }
 
-static int browser_lines_append_text(struct browser_lines *lines, const char *text, size_t len, size_t width)
+static int browser_lines_append_text(struct browser_lines *lines, const char *text, size_t len, size_t width, const char *href)
 {
     char line[BROWSER_LINE_MAX];
     size_t pos;
@@ -265,7 +286,7 @@ static int browser_lines_append_text(struct browser_lines *lines, const char *te
         {
             if (pos > 0U)
             {
-                if (browser_lines_push_copy(lines, line, pos) < 0)
+                if (browser_lines_push_copy(lines, line, pos, href) < 0)
                 {
                     return -1;
                 }
@@ -286,7 +307,7 @@ static int browser_lines_append_text(struct browser_lines *lines, const char *te
             line[pos++] = ' ';
             if (pos >= width)
             {
-                if (browser_lines_push_copy(lines, line, pos) < 0)
+                if (browser_lines_push_copy(lines, line, pos, href) < 0)
                 {
                     return -1;
                 }
@@ -297,7 +318,7 @@ static int browser_lines_append_text(struct browser_lines *lines, const char *te
 
         if (pos + 1U >= sizeof(line))
         {
-            if (browser_lines_push_copy(lines, line, pos) < 0)
+            if (browser_lines_push_copy(lines, line, pos, href) < 0)
             {
                 return -1;
             }
@@ -307,7 +328,7 @@ static int browser_lines_append_text(struct browser_lines *lines, const char *te
         line[pos++] = ch;
         if (pos >= width)
         {
-            if (browser_lines_push_copy(lines, line, pos) < 0)
+            if (browser_lines_push_copy(lines, line, pos, href) < 0)
             {
                 return -1;
             }
@@ -317,7 +338,7 @@ static int browser_lines_append_text(struct browser_lines *lines, const char *te
 
     if (pos > 0U)
     {
-        if (browser_lines_push_copy(lines, line, pos) < 0)
+        if (browser_lines_push_copy(lines, line, pos, href) < 0)
         {
             return -1;
         }
@@ -325,7 +346,7 @@ static int browser_lines_append_text(struct browser_lines *lines, const char *te
 
     if (lines->count == 0U)
     {
-        (void)browser_lines_push_copy(lines, "(empty page)", strlen("(empty page)"));
+        (void)browser_lines_push_copy(lines, "(empty page)", strlen("(empty page)"), 0);
     }
 
     return 0;
@@ -563,6 +584,331 @@ static void browser_handle_tag(const char *tag, struct browser_buffer *out, bool
     }
 }
 
+static void browser_parse_tag_href(const char *tag, char *href_out, size_t href_out_len)
+{
+    const char *p;
+
+    if (!tag || !href_out || href_out_len == 0U)
+    {
+        return;
+    }
+
+    href_out[0] = '\0';
+    p = tag;
+    while (*p && isspace((unsigned char)*p))
+    {
+        p++;
+    }
+    if (*p == '/')
+    {
+        return;
+    }
+
+    while (*p)
+    {
+        if ((p[0] == 'h' || p[0] == 'H') &&
+            (p[1] == 'r' || p[1] == 'R') &&
+            (p[2] == 'e' || p[2] == 'E') &&
+            (p[3] == 'f' || p[3] == 'F'))
+        {
+            const char *q = p + 4;
+
+            while (*q && isspace((unsigned char)*q))
+            {
+                q++;
+            }
+            if (*q != '=')
+            {
+                p++;
+                continue;
+            }
+            q++;
+            while (*q && isspace((unsigned char)*q))
+            {
+                q++;
+            }
+
+            if (*q == '"' || *q == '\'')
+            {
+                char quote = *q++;
+                size_t i = 0;
+
+                while (*q && *q != quote && i + 1U < href_out_len)
+                {
+                    href_out[i++] = *q++;
+                }
+                href_out[i] = '\0';
+                return;
+            }
+
+            {
+                size_t i = 0;
+                while (*q && !isspace((unsigned char)*q) && *q != '>' && i + 1U < href_out_len)
+                {
+                    href_out[i++] = *q++;
+                }
+                href_out[i] = '\0';
+                return;
+            }
+        }
+        p++;
+    }
+}
+
+static void browser_handle_tag_with_link(const char *tag,
+                                         struct browser_buffer *out,
+                                         bool *in_script,
+                                         bool *in_style,
+                                         char *current_link,
+                                         size_t current_link_len)
+{
+    char buf[64];
+    size_t i;
+    size_t j;
+    bool closing;
+    char href[BROWSER_URL_MAX];
+
+    if (!tag || !in_script || !in_style || !current_link || current_link_len == 0U)
+    {
+        return;
+    }
+
+    i = 0;
+    while (tag[i] && isspace((unsigned char)tag[i]))
+    {
+        i++;
+    }
+
+    closing = false;
+    if (tag[i] == '/')
+    {
+        closing = true;
+        i++;
+    }
+
+    j = 0;
+    while (tag[i] && !isspace((unsigned char)tag[i]) && tag[i] != '>' && tag[i] != '/' && j + 1U < sizeof(buf))
+    {
+        buf[j++] = (char)tolower((unsigned char)tag[i]);
+        i++;
+    }
+    buf[j] = '\0';
+
+    if (strcmp(buf, "a") == 0)
+    {
+        if (closing)
+        {
+            current_link[0] = '\0';
+        }
+        else
+        {
+            browser_parse_tag_href(tag, href, sizeof(href));
+            if (href[0] != '\0')
+            {
+                strncpy(current_link, href, current_link_len - 1U);
+                current_link[current_link_len - 1U] = '\0';
+            }
+            else
+            {
+                current_link[0] = '\0';
+            }
+        }
+        return;
+    }
+
+    if (strcmp(buf, "script") == 0)
+    {
+        if (closing)
+        {
+            *in_script = false;
+            if (out)
+            {
+                browser_emit_block_break(out, 1U);
+            }
+        }
+        else
+        {
+            *in_script = true;
+        }
+        return;
+    }
+
+    if (strcmp(buf, "style") == 0)
+    {
+        if (closing)
+        {
+            *in_style = false;
+        }
+        else
+        {
+            *in_style = true;
+        }
+        return;
+    }
+
+    if (strcmp(buf, "br") == 0 || strcmp(buf, "hr") == 0)
+    {
+        if (out)
+        {
+            browser_emit_block_break(out, 1U);
+        }
+        return;
+    }
+
+    if (strcmp(buf, "p") == 0 || strcmp(buf, "/p") == 0 ||
+        strcmp(buf, "div") == 0 || strcmp(buf, "/div") == 0 ||
+        strcmp(buf, "section") == 0 || strcmp(buf, "/section") == 0 ||
+        strcmp(buf, "article") == 0 || strcmp(buf, "/article") == 0 ||
+        strcmp(buf, "header") == 0 || strcmp(buf, "/header") == 0 ||
+        strcmp(buf, "footer") == 0 || strcmp(buf, "/footer") == 0 ||
+        strcmp(buf, "li") == 0 || strcmp(buf, "/li") == 0 ||
+        strcmp(buf, "tr") == 0 || strcmp(buf, "/tr") == 0 ||
+        strcmp(buf, "table") == 0 || strcmp(buf, "/table") == 0 ||
+        strcmp(buf, "h1") == 0 || strcmp(buf, "/h1") == 0 ||
+        strcmp(buf, "h2") == 0 || strcmp(buf, "/h2") == 0 ||
+        strcmp(buf, "h3") == 0 || strcmp(buf, "/h3") == 0 ||
+        strcmp(buf, "h4") == 0 || strcmp(buf, "/h4") == 0 ||
+        strcmp(buf, "h5") == 0 || strcmp(buf, "/h5") == 0 ||
+        strcmp(buf, "h6") == 0 || strcmp(buf, "/h6") == 0)
+    {
+        if (out)
+        {
+            browser_emit_block_break(out, 2U);
+        }
+        return;
+    }
+
+    if (strcmp(buf, "title") == 0)
+    {
+        if (out)
+        {
+            browser_emit_block_break(out, 1U);
+        }
+        return;
+    }
+}
+
+static unsigned browser_html_handle_tag(const char *tag,
+                                        bool *in_script,
+                                        bool *in_style,
+                                        char *current_link,
+                                        size_t current_link_len)
+{
+    char buf[64];
+    size_t i;
+    size_t j;
+    bool closing;
+    unsigned breaks;
+    char href[BROWSER_URL_MAX];
+
+    if (!tag || !in_script || !in_style || !current_link || current_link_len == 0U)
+    {
+        return 0U;
+    }
+
+    i = 0;
+    while (tag[i] && isspace((unsigned char)tag[i]))
+    {
+        i++;
+    }
+
+    closing = false;
+    if (tag[i] == '/')
+    {
+        closing = true;
+        i++;
+    }
+
+    j = 0;
+    while (tag[i] && !isspace((unsigned char)tag[i]) && tag[i] != '>' && tag[i] != '/' && j + 1U < sizeof(buf))
+    {
+        buf[j++] = (char)tolower((unsigned char)tag[i]);
+        i++;
+    }
+    buf[j] = '\0';
+    breaks = 0;
+
+    if (strcmp(buf, "a") == 0)
+    {
+        if (closing)
+        {
+            current_link[0] = '\0';
+        }
+        else
+        {
+            browser_parse_tag_href(tag, href, sizeof(href));
+            if (href[0] != '\0')
+            {
+                strncpy(current_link, href, current_link_len - 1U);
+                current_link[current_link_len - 1U] = '\0';
+            }
+            else
+            {
+                current_link[0] = '\0';
+            }
+        }
+        return 0U;
+    }
+
+    if (strcmp(buf, "script") == 0)
+    {
+        if (closing)
+        {
+            *in_script = false;
+            breaks = 1U;
+        }
+        else
+        {
+            *in_script = true;
+        }
+        return breaks;
+    }
+
+    if (strcmp(buf, "style") == 0)
+    {
+        if (closing)
+        {
+            *in_style = false;
+        }
+        else
+        {
+            *in_style = true;
+        }
+        return 0U;
+    }
+
+    if (strcmp(buf, "br") == 0 || strcmp(buf, "hr") == 0)
+    {
+        return 1U;
+    }
+
+    if (strcmp(buf, "p") == 0 || strcmp(buf, "/p") == 0 ||
+        strcmp(buf, "div") == 0 || strcmp(buf, "/div") == 0 ||
+        strcmp(buf, "section") == 0 || strcmp(buf, "/section") == 0 ||
+        strcmp(buf, "article") == 0 || strcmp(buf, "/article") == 0 ||
+        strcmp(buf, "header") == 0 || strcmp(buf, "/header") == 0 ||
+        strcmp(buf, "footer") == 0 || strcmp(buf, "/footer") == 0 ||
+        strcmp(buf, "li") == 0 || strcmp(buf, "/li") == 0 ||
+        strcmp(buf, "tr") == 0 || strcmp(buf, "/tr") == 0 ||
+        strcmp(buf, "table") == 0 || strcmp(buf, "/table") == 0 ||
+        strcmp(buf, "h1") == 0 || strcmp(buf, "/h1") == 0 ||
+        strcmp(buf, "h2") == 0 || strcmp(buf, "/h2") == 0 ||
+        strcmp(buf, "h3") == 0 || strcmp(buf, "/h3") == 0 ||
+        strcmp(buf, "h4") == 0 || strcmp(buf, "/h4") == 0 ||
+        strcmp(buf, "h5") == 0 || strcmp(buf, "/h5") == 0 ||
+        strcmp(buf, "h6") == 0 || strcmp(buf, "/h6") == 0)
+    {
+        return 2U;
+    }
+
+    if (strcmp(buf, "title") == 0)
+    {
+        return 1U;
+    }
+
+    return 0U;
+}
+
 static int browser_strip_html(const char *html, size_t html_len, struct browser_buffer *out)
 {
     char tag[128];
@@ -694,6 +1040,276 @@ static int browser_strip_html(const char *html, size_t html_len, struct browser_
     if (out->len == 0U)
     {
         (void)browser_buffer_append(out, "(no text content)", strlen("(no text content)"));
+    }
+
+    return 0;
+}
+
+static int browser_html_to_lines(const char *html, size_t html_len, struct browser_lines *lines, size_t width)
+{
+    char tag[128];
+    char entity[32];
+    char decoded[8];
+    char line[BROWSER_LINE_MAX];
+    char current_link[BROWSER_URL_MAX];
+    size_t tag_len;
+    size_t entity_len;
+    size_t i;
+    size_t pos;
+    bool in_tag;
+    bool in_entity;
+    bool in_script;
+    bool in_style;
+    bool pending_space;
+
+    if (!html || !lines || width == 0U)
+    {
+        return -1;
+    }
+
+    in_tag = false;
+    in_entity = false;
+    in_script = false;
+    in_style = false;
+    pending_space = false;
+    tag_len = 0;
+    entity_len = 0;
+    pos = 0;
+    current_link[0] = '\0';
+
+    for (i = 0; i < html_len; i++)
+    {
+        char ch = html[i];
+
+        if (in_script || in_style)
+        {
+            if (!in_tag && ch == '<')
+            {
+                in_tag = true;
+                tag_len = 0;
+                continue;
+            }
+            if (in_tag)
+            {
+                if (ch == '>')
+                {
+                    tag[tag_len] = '\0';
+                    if ((in_script && strncmp(tag, "/script", 7) == 0) ||
+                        (in_style && strncmp(tag, "/style", 6) == 0))
+                    {
+                        in_script = false;
+                        in_style = false;
+                    }
+                    in_tag = false;
+                    tag_len = 0;
+                }
+                else if (tag_len + 1U < sizeof(tag))
+                {
+                    tag[tag_len++] = ch;
+                }
+            }
+            continue;
+        }
+
+        if (in_tag)
+        {
+            if (ch == '>')
+            {
+                tag[tag_len] = '\0';
+                {
+                    unsigned breaks;
+
+                    breaks = browser_html_handle_tag(tag, &in_script, &in_style, current_link, sizeof(current_link));
+                    if (breaks > 0U)
+                    {
+                        if (pos > 0U)
+                        {
+                            if (browser_lines_push_copy(lines, line, pos, current_link[0] ? current_link : NULL) < 0)
+                            {
+                                return -1;
+                            }
+                            pos = 0;
+                        }
+                        pending_space = false;
+                        while (breaks > 0U)
+                        {
+                            (void)browser_lines_push_copy(lines, "", 0U, NULL);
+                            breaks--;
+                        }
+                    }
+                }
+                in_tag = false;
+                tag_len = 0;
+            }
+            else if (tag_len + 1U < sizeof(tag))
+            {
+                tag[tag_len++] = ch;
+            }
+            continue;
+        }
+
+        if (in_entity)
+        {
+            if (ch == ';' || entity_len + 1U >= sizeof(entity))
+            {
+                entity[entity_len] = '\0';
+                if (browser_decode_entity(entity, decoded, sizeof(decoded)) == 0)
+                {
+                    size_t dlen = strlen(decoded);
+                    size_t di;
+
+                    for (di = 0; di < dlen; di++)
+                    {
+                        if (decoded[di] == '\r')
+                        {
+                            continue;
+                        }
+                        if (decoded[di] == '\n')
+                        {
+                            if (pos > 0U)
+                            {
+                                if (browser_lines_push_copy(lines, line, pos, current_link[0] ? current_link : NULL) < 0)
+                                {
+                                    return -1;
+                                }
+                                pos = 0;
+                            }
+                            pending_space = false;
+                            continue;
+                        }
+
+                        if (isspace((unsigned char)decoded[di]))
+                        {
+                            pending_space = true;
+                            continue;
+                        }
+
+                        if (pending_space && pos > 0U && pos + 1U < sizeof(line))
+                        {
+                            line[pos++] = ' ';
+                            if (pos >= width)
+                            {
+                                if (browser_lines_push_copy(lines, line, pos, current_link[0] ? current_link : NULL) < 0)
+                                {
+                                    return -1;
+                                }
+                                pos = 0;
+                            }
+                        }
+                        pending_space = false;
+
+                        if (pos + 1U >= sizeof(line))
+                        {
+                            if (browser_lines_push_copy(lines, line, pos, current_link[0] ? current_link : NULL) < 0)
+                            {
+                                return -1;
+                            }
+                            pos = 0;
+                        }
+                        line[pos++] = decoded[di];
+                        if (pos >= width)
+                        {
+                            if (browser_lines_push_copy(lines, line, pos, current_link[0] ? current_link : NULL) < 0)
+                            {
+                                return -1;
+                            }
+                            pos = 0;
+                        }
+                    }
+                }
+                in_entity = false;
+                entity_len = 0;
+            }
+            else
+            {
+                entity[entity_len++] = ch;
+            }
+            continue;
+        }
+
+        if (ch == '<')
+        {
+            in_tag = true;
+            tag_len = 0;
+            continue;
+        }
+
+        if (ch == '&')
+        {
+            in_entity = true;
+            entity_len = 0;
+            continue;
+        }
+
+        if (ch == '\r')
+        {
+            continue;
+        }
+        if (ch == '\n')
+        {
+            if (pos > 0U)
+            {
+                if (browser_lines_push_copy(lines, line, pos, current_link[0] ? current_link : NULL) < 0)
+                {
+                    return -1;
+                }
+                pos = 0;
+            }
+            pending_space = false;
+            continue;
+        }
+
+        if (isspace((unsigned char)ch))
+        {
+            pending_space = true;
+            continue;
+        }
+
+        if (pending_space && pos > 0U && pos + 1U < sizeof(line))
+        {
+            line[pos++] = ' ';
+            if (pos >= width)
+            {
+                if (browser_lines_push_copy(lines, line, pos, current_link[0] ? current_link : NULL) < 0)
+                {
+                    return -1;
+                }
+                pos = 0;
+            }
+        }
+        pending_space = false;
+
+        if (pos + 1U >= sizeof(line))
+        {
+            if (browser_lines_push_copy(lines, line, pos, current_link[0] ? current_link : NULL) < 0)
+            {
+                return -1;
+            }
+            pos = 0;
+        }
+
+        line[pos++] = ch;
+        if (pos >= width)
+        {
+            if (browser_lines_push_copy(lines, line, pos, current_link[0] ? current_link : NULL) < 0)
+            {
+                return -1;
+            }
+            pos = 0;
+        }
+    }
+
+    if (pos > 0U)
+    {
+        if (browser_lines_push_copy(lines, line, pos, current_link[0] ? current_link : NULL) < 0)
+        {
+            return -1;
+        }
+    }
+
+    if (lines->count == 0U)
+    {
+        (void)browser_lines_push_copy(lines, "(empty page)", strlen("(empty page)"), 0);
     }
 
     return 0;
@@ -1060,6 +1676,47 @@ static int browser_socket_wait_readable(int fd, int timeout_ms)
     return 0;
 }
 
+static int browser_socket_wait_connected(int fd, int timeout_ms)
+{
+    struct pollfd pfd;
+    int so_error;
+    socklen_t so_len;
+    int ret;
+
+    pfd.fd = fd;
+    pfd.events = POLLOUT | POLLERR | POLLHUP;
+    pfd.revents = 0;
+    ret = poll(&pfd, 1, timeout_ms);
+    if (ret < 0)
+    {
+        if (errno == EINTR)
+        {
+            return 1;
+        }
+        return -1;
+    }
+
+    if (ret == 0)
+    {
+        return 0;
+    }
+
+    so_error = 0;
+    so_len = sizeof(so_error);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &so_len) < 0)
+    {
+        return -1;
+    }
+
+    if (so_error == 0)
+    {
+        return 2;
+    }
+
+    errno = so_error;
+    return -1;
+}
+
 static int browser_fetch_once(const struct browser_url *url, struct browser_buffer *response)
 {
     struct addrinfo hints;
@@ -1069,6 +1726,7 @@ static int browser_fetch_once(const struct browser_url *url, struct browser_buff
     int ret;
     int ready;
     bool received_any;
+    bool any_connect_ok;
     char portbuf[16];
     char req[2048];
     char recvbuf[BROWSER_RECV_CHUNK];
@@ -1090,10 +1748,11 @@ static int browser_fetch_once(const struct browser_url *url, struct browser_buff
     snprintf(portbuf, sizeof(portbuf), "%u", (unsigned)url->port);
     if (getaddrinfo(url->host, portbuf, &hints, &res) != 0)
     {
-        return -1;
+        return -11;
     }
 
-    ret = -1;
+    ret = -13;
+    any_connect_ok = false;
     for (ai = res; ai; ai = ai->ai_next)
     {
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
@@ -1102,11 +1761,26 @@ static int browser_fetch_once(const struct browser_url *url, struct browser_buff
             continue;
         }
 
-        if (connect(fd, ai->ai_addr, ai->ai_addrlen) < 0)
+        ret = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (ret < 0 && errno == EINPROGRESS)
+        {
+            ready = browser_socket_wait_connected(fd, BROWSER_CONNECT_TIMEOUT_MS);
+            if (ready <= 0)
+            {
+                close(fd);
+                ret = -13;
+                continue;
+            }
+            ret = 0;
+        }
+
+        if (ret < 0)
         {
             close(fd);
+            ret = -13;
             continue;
         }
+        any_connect_ok = true;
 
         snprintf(req, sizeof(req),
                  "GET %s HTTP/1.1\r\n"
@@ -1121,6 +1795,7 @@ static int browser_fetch_once(const struct browser_url *url, struct browser_buff
         if (browser_socket_send_all(fd, req, strlen(req)) < 0)
         {
             close(fd);
+            ret = -12;
             continue;
         }
 
@@ -1181,7 +1856,85 @@ static int browser_fetch_once(const struct browser_url *url, struct browser_buff
     }
 
     freeaddrinfo(res);
+    if (!any_connect_ok && ret == -13)
+    {
+        return -13;
+    }
     return ret;
+}
+
+static int browser_fetch_once_via_syscall(const struct browser_url *url,
+                                          uint32_t ipv4,
+                                          struct browser_buffer *response)
+{
+    char temp_path[128];
+    int fd;
+    int64_t ret;
+    ssize_t n;
+    char buf[BROWSER_RECV_CHUNK];
+
+    if (!url || !response)
+    {
+        return -1;
+    }
+
+    /*
+     * 这里用临时文件承接 `u_http_get` 的输出：
+     * - 避免 pipe 缓冲满了以后写端阻塞
+     * - 不要求浏览器一次性持有整页 body
+     * - 成功后再把文件内容读回到内存缓冲
+     */
+    snprintf(temp_path, sizeof(temp_path), "/tmp/.browser-http-%d.tmp", getpid());
+    fd = open(temp_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0)
+    {
+        return -1;
+    }
+
+    ret = u_http_get(ipv4, url->port, (const int8_t *)(url->path[0] ? url->path : "/"), fd, 6000U);
+    if (ret < 0)
+    {
+        close(fd);
+        (void)unlink(temp_path);
+        return (int)ret;
+    }
+
+    if (lseek(fd, 0, SEEK_SET) < 0)
+    {
+        close(fd);
+        (void)unlink(temp_path);
+        return -1;
+    }
+
+    while (1)
+    {
+        n = read(fd, buf, sizeof(buf));
+        if (n < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            close(fd);
+            (void)unlink(temp_path);
+            return -1;
+        }
+        if (n == 0)
+        {
+            break;
+        }
+
+        if (browser_buffer_append(response, buf, (size_t)n) < 0)
+        {
+            close(fd);
+            (void)unlink(temp_path);
+            return -1;
+        }
+    }
+
+    close(fd);
+    (void)unlink(temp_path);
+    return 0;
 }
 
 static int browser_extract_response(struct browser_buffer *raw,
@@ -1301,12 +2054,69 @@ static int browser_fetch_url(const struct browser_url *start_url,
     memset(&decoded, 0, sizeof(decoded));
     while (redirects <= BROWSER_MAX_REDIRECTS)
     {
+        uint32_t fallback_ipv4;
+
         browser_buffer_free(&raw);
         browser_buffer_free(&decoded);
 
         rc = browser_fetch_once(&cur, &raw);
         if (rc < 0)
         {
+            if (rc == -13)
+            {
+                struct addrinfo hints;
+                struct addrinfo *res;
+                struct addrinfo *ai;
+                char portbuf[16];
+
+                /*
+                 * socket/connect 路径失败时，回退到内核 httpget syscall。
+                 * 这条路径不依赖 userspace TCP socket 的细节，能显著提高
+                 * 实际可用性。
+                 */
+                memset(&hints, 0, sizeof(hints));
+                hints.ai_family = AF_INET;
+                hints.ai_socktype = SOCK_STREAM;
+                hints.ai_protocol = IPPROTO_TCP;
+                snprintf(portbuf, sizeof(portbuf), "%u", (unsigned)cur.port);
+                if (getaddrinfo(cur.host, portbuf, &hints, &res) == 0)
+                {
+                    fallback_ipv4 = 0;
+                    for (ai = res; ai; ai = ai->ai_next)
+                    {
+                        const struct sockaddr_in *sin;
+
+                        if (!ai->ai_addr || ai->ai_addrlen < sizeof(struct sockaddr_in))
+                        {
+                            continue;
+                        }
+                        sin = (const struct sockaddr_in *)ai->ai_addr;
+                        if (sin->sin_family != AF_INET)
+                        {
+                            continue;
+                        }
+                        fallback_ipv4 = ntohl(sin->sin_addr.s_addr);
+                        if (fallback_ipv4 != 0U)
+                        {
+                            break;
+                        }
+                    }
+                    freeaddrinfo(res);
+                    if (fallback_ipv4 != 0U)
+                    {
+                        browser_buffer_free(&raw);
+                        browser_buffer_free(&decoded);
+                        if (browser_fetch_once_via_syscall(&cur, fallback_ipv4, &decoded) == 0)
+                        {
+                            *status_code = 200;
+                            content_type[0] = '\0';
+                            *final_url = cur;
+                            *body = decoded;
+                            return 0;
+                        }
+                    }
+                }
+            }
             browser_buffer_free(&raw);
             browser_buffer_free(&decoded);
             return rc;
@@ -1434,14 +2244,21 @@ static void browser_render_terminal(const struct browser_url *url,
 
     printf("\x1b[1;44m%-78.78s\x1b[0m\r\n", header);
     printf("\x1b[1;30;47m%-78.78s\x1b[0m\r\n", status);
-    printf("\x1b[1;30;46m%-78.78s\x1b[0m\r\n", " arrows / space / PgUp / PgDn also work, browser is text-only for now ");
+    printf("\x1b[1;30;46m%-78.78s\x1b[0m\r\n", " arrows / space / PgUp / PgDn also work, blue lines are clickable links ");
 
     for (row = 0; row < visible_rows; row++)
     {
         i = scroll + row;
-        if (i < total && lines->items[i])
+        if (i < total && lines->items[i].text)
         {
-            printf("%-78.78s\r\n", lines->items[i]);
+            if (lines->items[i].has_link)
+            {
+                printf("\x1b[1;34m%-78.78s\x1b[0m\r\n", lines->items[i].text);
+            }
+            else
+            {
+                printf("%-78.78s\r\n", lines->items[i].text);
+            }
         }
         else
         {
@@ -1498,7 +2315,7 @@ static void browser_render_framebuffer(const struct browser_url *url,
              (unsigned)total,
              (unsigned)scroll,
              (unsigned)((total > view_rows) ? (total - view_rows) : 0U));
-    snprintf(hint, sizeof(hint), " q=quit  r=reload  j/k=scroll  arrows/space/PgUp/PgDn supported ");
+    snprintf(hint, sizeof(hint), " q=quit  r=reload  j/k=scroll  click blue links to navigate ");
 
     (void)u_fbtext(fb->x_charsize * 2U, fb->y_charsize / 2U, title_fg, title_bg, (const int8_t *)title);
     (void)u_fbtext(fb->x_charsize * 2U, fb->y_charsize * 2U, panel_fg, panel_bg, (const int8_t *)status);
@@ -1515,18 +2332,25 @@ static void browser_render_framebuffer(const struct browser_url *url,
             break;
         }
 
-        if (idx < total && lines->items[idx])
+        if (idx < total && lines->items[idx].text)
         {
             size_t line_len;
 
-            line_len = strnlen(lines->items[idx], sizeof(linebuf) - 1U);
+            line_len = strnlen(lines->items[idx].text, sizeof(linebuf) - 1U);
             if (line_len >= cols)
             {
                 line_len = cols - 1U;
             }
-            memcpy(linebuf, lines->items[idx], line_len);
+            memcpy(linebuf, lines->items[idx].text, line_len);
             linebuf[line_len] = '\0';
-            (void)u_fbtext(fb->x_charsize * 2U, y, body_fg, body_bg, (const int8_t *)linebuf);
+            if (lines->items[idx].has_link)
+            {
+                (void)u_fbtext(fb->x_charsize * 2U, y, 0x0000A8FF, body_bg, (const int8_t *)linebuf);
+            }
+            else
+            {
+                (void)u_fbtext(fb->x_charsize * 2U, y, body_fg, body_bg, (const int8_t *)linebuf);
+            }
         }
     }
 }
@@ -1559,9 +2383,82 @@ static void browser_render_loading_framebuffer(const struct browser_url *url,
     (void)u_fbtext(fb->x_charsize * 2U, fb->y_charsize / 2U, 0x00000000, 0x00FFB000, (const int8_t *)title);
     (void)u_fbtext(fb->x_charsize * 2U, fb->y_charsize * 2U, 0x00FFFFFF, 0x0018222D, (const int8_t *)body);
     (void)u_fbtext(fb->x_charsize * 2U, fb->y_charsize * 4U, 0x00FFFFFF, 0x0018222D,
-                   (const int8_t *)" q=quit  r=reload  j/k=scroll  arrows and PgUp/PgDn supported ");
+                   (const int8_t *)" q=quit  r=reload  j/k=scroll  blue lines can be clicked ");
     (void)u_fbtext(fb->x_charsize * 2U, fb->y_charsize * 6U, 0x00A8FFB0, 0x0018222D,
                    (const int8_t *)"waiting for http response...");
+}
+
+static bool browser_line_href_at(const struct browser_lines *lines, size_t index, char *href_out, size_t href_out_len)
+{
+    if (!lines || !href_out || href_out_len == 0U)
+    {
+        return false;
+    }
+
+    href_out[0] = '\0';
+    if (index >= lines->count)
+    {
+        return false;
+    }
+
+    if (!lines->items[index].has_link || !lines->items[index].text)
+    {
+        return false;
+    }
+
+    strncpy(href_out, lines->items[index].href, href_out_len - 1U);
+    href_out[href_out_len - 1U] = '\0';
+    return href_out[0] != '\0';
+}
+
+static int browser_open_clicked_href(const struct browser_url *base,
+                                     const struct browser_lines *lines,
+                                     const struct stupidos_fbinfo *fb,
+                                     const struct stupidos_mouseinfo *mouse,
+                                     size_t scroll,
+                                     struct browser_url *out)
+{
+    size_t body_x;
+    size_t body_y;
+    size_t row_h;
+    size_t row;
+    size_t idx;
+    char href[BROWSER_URL_MAX];
+
+    if (!base || !lines || !fb || !mouse || !out)
+    {
+        return 0;
+    }
+    if (fb->x_charsize == 0U || fb->y_charsize == 0U)
+    {
+        return 0;
+    }
+
+    body_x = fb->x_charsize * 2U;
+    body_y = fb->y_charsize * 5U;
+    row_h = fb->y_charsize;
+
+    if (mouse->x < 0 || mouse->y < 0)
+    {
+        return 0;
+    }
+    if ((size_t)mouse->x < body_x || (size_t)mouse->y < body_y)
+    {
+        return 0;
+    }
+
+    row = ((size_t)mouse->y - body_y) / row_h;
+    idx = scroll + row;
+    if (!browser_line_href_at(lines, idx, href, sizeof(href)))
+    {
+        return 0;
+    }
+
+    if (browser_resolve_url(base, href, out) < 0)
+    {
+        return -1;
+    }
+    return 1;
 }
 
 static int browser_build_text_view(const char *body,
@@ -1598,23 +2495,52 @@ static int browser_build_text_view(const char *body,
 
     if (html_like)
     {
-        rc = browser_strip_html(body, body_len, &plain);
-        if (rc < 0)
-        {
-            browser_buffer_free(&plain);
-            browser_buffer_free(&text);
-            return -1;
-        }
-        rc = browser_lines_append_text(lines, plain.data ? plain.data : "", plain.len, wrap_width);
         browser_buffer_free(&plain);
         browser_buffer_free(&text);
-        return rc;
+        return browser_html_to_lines(body, body_len, lines, wrap_width);
     }
 
-    rc = browser_lines_append_text(lines, body, body_len, wrap_width);
+    rc = browser_lines_append_text(lines, body, body_len, wrap_width, NULL);
     browser_buffer_free(&plain);
     browser_buffer_free(&text);
     return rc;
+}
+
+static int browser_load_page(const struct browser_url *start_url,
+                             struct browser_url *final_url,
+                             struct browser_buffer *body,
+                             struct browser_lines *lines,
+                             char *content_type,
+                             size_t content_type_len,
+                             int *status_code,
+                             size_t wrap_width)
+{
+    int rc;
+
+    if (!start_url || !final_url || !body || !lines || !content_type || !status_code)
+    {
+        return -1;
+    }
+
+    browser_buffer_free(body);
+    browser_lines_free(lines);
+    memset(body, 0, sizeof(*body));
+    memset(lines, 0, sizeof(*lines));
+
+    rc = browser_fetch_url(start_url, final_url, body, content_type, content_type_len, status_code);
+    if (rc < 0)
+    {
+        return rc;
+    }
+
+    rc = browser_build_text_view(body->data ? body->data : "", body->len, content_type, lines, wrap_width);
+    browser_buffer_free(body);
+    if (rc < 0)
+    {
+        return -1;
+    }
+
+    return 0;
 }
 
 static void browser_usage(void)
@@ -1625,6 +2551,7 @@ static void browser_usage(void)
 
 int main(int argc, char **argv)
 {
+    struct stupidos_mouseinfo mouse;
     struct browser_url start_url;
     struct browser_url final_url;
     struct browser_buffer body;
@@ -1636,6 +2563,8 @@ int main(int argc, char **argv)
     size_t max_scroll;
     size_t view_rows;
     size_t wrap_width;
+    bool mouse_valid;
+    bool dirty;
     int rc;
     bool have_fb;
     bool interactive;
@@ -1671,6 +2600,8 @@ int main(int argc, char **argv)
     have_fb = (u_fbinfo(&fb) == 0 && fb.width > 0U && fb.height > 0U);
     view_rows = have_fb ? browser_fb_view_rows(&fb) : BROWSER_VIEW_ROWS;
     wrap_width = have_fb ? browser_fb_wrap_cols(&fb) : BROWSER_WRAP_WIDTH;
+    mouse_valid = false;
+    memset(&mouse, 0, sizeof(mouse));
 
     if (!have_fb)
     {
@@ -1682,7 +2613,7 @@ int main(int argc, char **argv)
         browser_render_loading_framebuffer(&start_url, &fb, "drawing initial frame");
     }
 
-    rc = browser_fetch_url(&start_url, &final_url, &body, content_type, sizeof(content_type), &status_code);
+    rc = browser_load_page(&start_url, &final_url, &body, &lines, content_type, sizeof(content_type), &status_code, wrap_width);
     if (rc < 0)
     {
         if (have_fb)
@@ -1694,6 +2625,14 @@ int main(int argc, char **argv)
             else if (rc == -ETIMEDOUT)
             {
                 browser_render_loading_framebuffer(&start_url, &fb, "http recv timeout");
+            }
+            else if (rc == -11)
+            {
+                browser_render_loading_framebuffer(&start_url, &fb, "dns lookup failed");
+            }
+            else if (rc == -13)
+            {
+                browser_render_loading_framebuffer(&start_url, &fb, "tcp connect failed");
             }
             else
             {
@@ -1708,30 +2647,25 @@ int main(int argc, char **argv)
         {
             fprintf(stderr, "browser: http receive timeout\n");
         }
+        else if (rc == -11)
+        {
+            fprintf(stderr, "browser: dns lookup failed\n");
+        }
+        else if (rc == -13)
+        {
+            fprintf(stderr, "browser: tcp connect failed\n");
+        }
         else
         {
             fprintf(stderr, "browser: fetch failed (%d)\n", rc);
         }
-        browser_buffer_free(&body);
-        return 1;
-    }
-
-    rc = browser_build_text_view(body.data ? body.data : "", body.len, content_type, &lines, wrap_width);
-    browser_buffer_free(&body);
-    if (rc < 0)
-    {
-        if (have_fb)
-        {
-            browser_render_loading_framebuffer(&final_url, &fb, "failed to build text view");
-        }
-        browser_lines_free(&lines);
-        fprintf(stderr, "browser: failed to build text view\n");
         return 1;
     }
 
     interactive = isatty(STDIN_FILENO) ? true : false;
     scroll = 0;
     max_scroll = (lines.count > view_rows) ? (lines.count - view_rows) : 0U;
+    dirty = false;
     if (have_fb)
     {
         browser_render_framebuffer(&final_url, status_code, content_type, &lines, scroll, &fb);
@@ -1747,7 +2681,7 @@ int main(int argc, char **argv)
 
         for (i = 0; i < lines.count; i++)
         {
-            puts(lines.items[i]);
+            puts(lines.items[i].text ? lines.items[i].text : "");
         }
         browser_lines_free(&lines);
         return 0;
@@ -1755,116 +2689,189 @@ int main(int argc, char **argv)
 
     while (1)
     {
+        struct pollfd pfd;
+        int pret;
         char ch;
         ssize_t n;
+        struct stupidos_mouseinfo cur_mouse;
+        bool mouse_changed;
 
-        n = read(STDIN_FILENO, &ch, 1);
-        if (n <= 0)
+        pfd.fd = STDIN_FILENO;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        pret = poll(&pfd, 1, have_fb ? 16 : -1);
+        if (pret < 0)
         {
-            continue;
-        }
-
-        if (ch == 'q' || ch == 'Q' || ch == 0x03)
-        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
             break;
         }
-        else if (ch == 'j' || ch == ' ' || ch == '\x06')
-        {
-            if (scroll < max_scroll)
-            {
-                scroll++;
-            }
-        }
-        else if (ch == 'k' || ch == '\x02')
-        {
-            if (scroll > 0U)
-            {
-                scroll--;
-            }
-        }
-        else if (ch == 'g' || ch == '\x01')
-        {
-            scroll = 0;
-        }
-        else if (ch == 'G' || ch == '\x05')
-        {
-            scroll = max_scroll;
-        }
-        else if (ch == 'r' || ch == 'R')
-        {
-            browser_lines_free(&lines);
-            memset(&lines, 0, sizeof(lines));
-            memset(&body, 0, sizeof(body));
-            if (!have_fb)
-            {
-                puts("\x1b[2J\x1b[Hbrowser: reloading...");
-            }
-            rc = browser_fetch_url(&start_url, &final_url, &body, content_type, sizeof(content_type), &status_code);
-            if (rc < 0)
-            {
-                fprintf(stderr, "browser: reload failed (%d)\n", rc);
-                break;
-            }
-            rc = browser_build_text_view(body.data ? body.data : "", body.len, content_type, &lines, wrap_width);
-            browser_buffer_free(&body);
-            if (rc < 0)
-            {
-                fprintf(stderr, "browser: reload text view failed\n");
-                break;
-            }
-            max_scroll = (lines.count > view_rows) ? (lines.count - view_rows) : 0U;
-            scroll = 0;
-        }
-        else if (ch == '\x1b')
-        {
-            char seq[2];
-            ssize_t got;
 
-            got = read(STDIN_FILENO, seq, sizeof(seq));
-            if (got == 2 && seq[0] == '[')
+        if (pret > 0 && (pfd.revents & POLLIN))
+        {
+            n = read(STDIN_FILENO, &ch, 1);
+            if (n > 0)
             {
-                switch (seq[1])
+                if (ch == 'q' || ch == 'Q' || ch == 0x03)
                 {
-                case 'A':
-                    if (scroll > 0U)
-                    {
-                        scroll--;
-                    }
                     break;
-                case 'B':
+                }
+                else if (ch == 'j' || ch == ' ' || ch == '\x06')
+                {
                     if (scroll < max_scroll)
                     {
                         scroll++;
+                        dirty = true;
                     }
-                    break;
-                case '5':
+                }
+                else if (ch == 'k' || ch == '\x02')
                 {
-                    char dummy;
-                    (void)read(STDIN_FILENO, &dummy, 1);
                     if (scroll > 0U)
                     {
-                        scroll = (scroll > 5U) ? (scroll - 5U) : 0U;
+                        scroll--;
+                        dirty = true;
                     }
-                    break;
                 }
-                case '6':
+                else if (ch == 'g' || ch == '\x01')
                 {
-                    char dummy;
-                    (void)read(STDIN_FILENO, &dummy, 1);
-                    if (scroll < max_scroll)
+                    scroll = 0;
+                    dirty = true;
+                }
+                else if (ch == 'G' || ch == '\x05')
+                {
+                    scroll = max_scroll;
+                    dirty = true;
+                }
+                else if (ch == 'r' || ch == 'R')
+                {
+                    if (!have_fb)
                     {
-                        scroll += 5U;
-                        if (scroll > max_scroll)
+                        puts("\x1b[2J\x1b[Hbrowser: reloading...");
+                    }
+                    rc = browser_load_page(&start_url, &final_url, &body, &lines, content_type, sizeof(content_type), &status_code, wrap_width);
+                    if (rc < 0)
+                    {
+                        fprintf(stderr, "browser: reload failed (%d)\n", rc);
+                        break;
+                    }
+                    max_scroll = (lines.count > view_rows) ? (lines.count - view_rows) : 0U;
+                    scroll = 0;
+                    dirty = true;
+                }
+                else if (ch == '\x1b')
+                {
+                    char seq[2];
+                    ssize_t got;
+
+                    got = read(STDIN_FILENO, seq, sizeof(seq));
+                    if (got == 2 && seq[0] == '[')
+                    {
+                        switch (seq[1])
                         {
-                            scroll = max_scroll;
+                        case 'A':
+                            if (scroll > 0U)
+                            {
+                                scroll--;
+                                dirty = true;
+                            }
+                            break;
+                        case 'B':
+                            if (scroll < max_scroll)
+                            {
+                                scroll++;
+                                dirty = true;
+                            }
+                            break;
+                        case '5':
+                        {
+                            char dummy;
+                            (void)read(STDIN_FILENO, &dummy, 1);
+                            if (scroll > 0U)
+                            {
+                                scroll = (scroll > 5U) ? (scroll - 5U) : 0U;
+                                dirty = true;
+                            }
+                            break;
+                        }
+                        case '6':
+                        {
+                            char dummy;
+                            (void)read(STDIN_FILENO, &dummy, 1);
+                            if (scroll < max_scroll)
+                            {
+                                scroll += 5U;
+                                if (scroll > max_scroll)
+                                {
+                                    scroll = max_scroll;
+                                }
+                                dirty = true;
+                            }
+                            break;
+                        }
+                        default:
+                            break;
                         }
                     }
-                    break;
-                }
-                default:
-                    break;
                 }
             }
+        }
+
+        if (have_fb)
+        {
+            u_memset(&cur_mouse, 0, sizeof(cur_mouse));
+            if (u_mouseinfo(&cur_mouse) == 0)
+            {
+                bool left_now = (cur_mouse.buttons & 0x1U) != 0U;
+                bool left_prev = (mouse_valid && (mouse.buttons & 0x1U) != 0U);
+                mouse_changed = !mouse_valid ||
+                                cur_mouse.x != mouse.x ||
+                                cur_mouse.y != mouse.y ||
+                                cur_mouse.buttons != mouse.buttons;
+
+                mouse = cur_mouse;
+                mouse_valid = true;
+                if (mouse_changed)
+                {
+                    dirty = true;
+                }
+
+                if (left_now && !left_prev)
+                {
+                    struct browser_url clicked;
+                    int link_rc;
+
+                    link_rc = browser_open_clicked_href(&final_url, &lines, &fb, &mouse, scroll, &clicked);
+                    if (link_rc < 0)
+                    {
+                        fprintf(stderr, "browser: link resolve failed\n");
+                        break;
+                    }
+                    if (link_rc > 0)
+                    {
+                        start_url = clicked;
+                        rc = browser_load_page(&start_url, &final_url, &body, &lines, content_type, sizeof(content_type), &status_code, wrap_width);
+                        if (rc < 0)
+                        {
+                            fprintf(stderr, "browser: link navigation failed (%d)\n", rc);
+                            break;
+                        }
+                        max_scroll = (lines.count > view_rows) ? (lines.count - view_rows) : 0U;
+                        scroll = 0;
+                        dirty = true;
+                    }
+                }
+            }
+            else
+            {
+                mouse_valid = false;
+            }
+        }
+
+        if (!dirty)
+        {
+            continue;
         }
 
         if (have_fb)
@@ -1875,6 +2882,7 @@ int main(int argc, char **argv)
         {
             browser_render_terminal(&final_url, status_code, content_type, &lines, scroll);
         }
+        dirty = false;
     }
 
     browser_lines_free(&lines);

@@ -159,6 +159,83 @@ static struct u_sem_slot u_sem_slots[64];
 static int u_select_sleep_slice(void);
 
 /*
+ * 让 *at 系列接口真正可用：
+ * - AT_FDCWD 直接沿用传入路径
+ * - 其他 dirfd 通过 /proc/self/fd/<n> 取回目录路径
+ * - 再把相对路径拼到目录后面
+ *
+ * 这样像 BusyBox、vi、tcc 这类工具在调用 mkdirat/openat/readlinkat 时，
+ * 就不用先回退成手写绝对路径，行为会更接近 Linux。
+ */
+static int u_resolve_at_path(int dirfd, const char *path, char *out, size_t out_len)
+{
+    struct stupidos_stat st;
+    char proc[32];
+    char base[STUPIDOS_PATH_MAX];
+    ssize_t base_len;
+    size_t path_len;
+    int proc_len;
+
+    if (!path || !out || out_len < 2)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (path[0] == '/' || dirfd == AT_FDCWD)
+    {
+        path_len = strlen(path);
+        if (path_len + 1U > out_len)
+        {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        memcpy(out, path, path_len + 1U);
+        return 0;
+    }
+
+    if (u_fstat(dirfd, &st) != 0)
+    {
+        return -1;
+    }
+    if ((st.mode & STUPIDOS_VFS_S_IFMT) != STUPIDOS_VFS_S_IFDIR)
+    {
+        errno = ENOTDIR;
+        return -1;
+    }
+
+    proc_len = snprintf(proc, sizeof(proc), "/proc/self/fd/%d", dirfd);
+    if (proc_len < 0 || (size_t)proc_len >= sizeof(proc))
+    {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    base_len = u_readlink((const int8_t *)proc, (int8_t *)base, sizeof(base) - 1U);
+    if (base_len < 0)
+    {
+        return -1;
+    }
+    base[base_len] = '\0';
+
+    path_len = strlen(path);
+    base_len = (ssize_t)strlen(base);
+    if ((size_t)base_len + 1U + path_len + 1U > out_len)
+    {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    memcpy(out, base, (size_t)base_len);
+    if (base_len == 0 || out[base_len - 1] != '/')
+    {
+        out[base_len++] = '/';
+    }
+    memcpy(out + base_len, path, path_len + 1U);
+    return 0;
+}
+
+/*
  * Dropbear / BusyBox 这类程序需要最小 pipe 支持。
  * 这里先在 libc 层做一套“自管管道”：
  * - pipe() 返回一对用户态 fd
@@ -3110,16 +3187,12 @@ int fchown(int fd, uid_t owner, gid_t group)
 
 int link(const char *oldpath, const char *newpath)
 {
-    (void)oldpath;
-    (void)newpath;
-    return u_errno_rofs();
+    return u_sysret_int((int64_t)u_link((const int8_t *)oldpath, (const int8_t *)newpath));
 }
 
 int symlink(const char *oldpath, const char *newpath)
 {
-    (void)oldpath;
-    (void)newpath;
-    return u_errno_rofs();
+    return u_sysret_int((int64_t)u_symlink((const int8_t *)oldpath, (const int8_t *)newpath));
 }
 
 ssize_t readlink(const char *path, char *buf, size_t bufsiz)
@@ -3129,13 +3202,14 @@ ssize_t readlink(const char *path, char *buf, size_t bufsiz)
 
 ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz)
 {
-    if (dirfd != AT_FDCWD)
+    char resolved[STUPIDOS_PATH_MAX];
+
+    if (u_resolve_at_path(dirfd, path, resolved, sizeof(resolved)) != 0)
     {
-        errno = ENOTSUP;
         return -1;
     }
 
-    return readlink(path, buf, bufsiz);
+    return readlink(resolved, buf, bufsiz);
 }
 
 int mkdir(const char *path, mode_t mode)
@@ -3160,42 +3234,51 @@ int rename(const char *oldpath, const char *newpath)
 
 int mkdirat(int dirfd, const char *path, mode_t mode)
 {
-    if (dirfd != AT_FDCWD)
+    char resolved[STUPIDOS_PATH_MAX];
+
+    if (u_resolve_at_path(dirfd, path, resolved, sizeof(resolved)) != 0)
     {
-        errno = ENOTSUP;
         return -1;
     }
 
-    return mkdir(path, mode);
+    return mkdir(resolved, mode);
 }
 
 int unlinkat(int dirfd, const char *path, int flags)
 {
-    if (dirfd != AT_FDCWD)
+    char resolved[STUPIDOS_PATH_MAX];
+
+    if (u_resolve_at_path(dirfd, path, resolved, sizeof(resolved)) != 0)
     {
-        errno = ENOTSUP;
         return -1;
     }
 
 #ifdef AT_REMOVEDIR
     if (flags & AT_REMOVEDIR)
     {
-        return rmdir(path);
+        return rmdir(resolved);
     }
 #endif
 
-    return unlink(path);
+    return unlink(resolved);
 }
 
 int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath)
 {
-    if (olddirfd != AT_FDCWD || newdirfd != AT_FDCWD)
+    char old_resolved[STUPIDOS_PATH_MAX];
+    char new_resolved[STUPIDOS_PATH_MAX];
+
+    if (u_resolve_at_path(olddirfd, oldpath, old_resolved, sizeof(old_resolved)) != 0)
     {
-        errno = ENOTSUP;
         return -1;
     }
 
-    return rename(oldpath, newpath);
+    if (u_resolve_at_path(newdirfd, newpath, new_resolved, sizeof(new_resolved)) != 0)
+    {
+        return -1;
+    }
+
+    return rename(old_resolved, new_resolved);
 }
 
 int renameat2(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, unsigned int flags)
@@ -3237,22 +3320,31 @@ char *ctermid(char *s)
 int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, int flags)
 {
     (void)flags;
-    if (olddirfd != AT_FDCWD || newdirfd != AT_FDCWD)
+    char old_resolved[STUPIDOS_PATH_MAX];
+    char new_resolved[STUPIDOS_PATH_MAX];
+
+    if (u_resolve_at_path(olddirfd, oldpath, old_resolved, sizeof(old_resolved)) != 0)
     {
-        errno = ENOTSUP;
         return -1;
     }
-    return link(oldpath, newpath);
+
+    if (u_resolve_at_path(newdirfd, newpath, new_resolved, sizeof(new_resolved)) != 0)
+    {
+        return -1;
+    }
+
+    return link(old_resolved, new_resolved);
 }
 
 int symlinkat(const char *target, int newdirfd, const char *linkpath)
 {
-    if (newdirfd != AT_FDCWD)
+    char resolved[STUPIDOS_PATH_MAX];
+
+    if (u_resolve_at_path(newdirfd, linkpath, resolved, sizeof(resolved)) != 0)
     {
-        errno = ENOTSUP;
         return -1;
     }
-    return symlink(target, linkpath);
+    return symlink(target, resolved);
 }
 
 int lchown(const char *path, uid_t owner, gid_t group)
@@ -3269,12 +3361,13 @@ int mkfifo(const char *path, mode_t mode)
 
 int mkfifoat(int dirfd, const char *path, mode_t mode)
 {
-    if (dirfd != AT_FDCWD)
+    char resolved[STUPIDOS_PATH_MAX];
+
+    if (u_resolve_at_path(dirfd, path, resolved, sizeof(resolved)) != 0)
     {
-        errno = ENOTSUP;
         return -1;
     }
-    return mkfifo(path, mode);
+    return mkfifo(resolved, mode);
 }
 
 int futimens(int fd, const struct timespec times[2])
@@ -3301,34 +3394,42 @@ int openat64(int dirfd, const char *path, int flags, ...)
 
 int fchmodat(int dirfd, const char *path, mode_t mode, int flags)
 {
-    if (flags != 0 || dirfd != AT_FDCWD)
+    char resolved[STUPIDOS_PATH_MAX];
+
+    if (flags != 0)
     {
         errno = ENOTSUP;
         return -1;
     }
 
-    return chmod(path, mode);
+    if (u_resolve_at_path(dirfd, path, resolved, sizeof(resolved)) != 0)
+    {
+        return -1;
+    }
+
+    return chmod(resolved, mode);
 }
 
 int fchownat(int dirfd, const char *path, uid_t owner, gid_t group, int flags)
 {
-    if (flags != 0 || dirfd != AT_FDCWD)
+    char resolved[STUPIDOS_PATH_MAX];
+
+    if (flags != 0)
     {
         errno = ENOTSUP;
         return -1;
     }
 
-    return chown(path, owner, group);
+    if (u_resolve_at_path(dirfd, path, resolved, sizeof(resolved)) != 0)
+    {
+        return -1;
+    }
+
+    return chown(resolved, owner, group);
 }
 
 int utimensat(int dirfd, const char *path, const struct timespec times[2], int flags)
 {
-    if (dirfd != AT_FDCWD)
-    {
-        errno = ENOTSUP;
-        return -1;
-    }
-
     return u_sysret_int((int64_t)u_utimensat(dirfd, (const int8_t *)path,
                                               (const struct stupidos_timespec *)times, flags));
 }
@@ -3732,14 +3833,13 @@ int fstatat(int dirfd, const char *path, struct stat *out, int flags)
     struct stupidos_stat kst;
     int64_t ret;
 
-    (void)flags;
     if (!out)
     {
         errno = EINVAL;
         return -1;
     }
 
-    ret = (int64_t)u_fstatat(dirfd, (const int8_t *)path, &kst);
+    ret = (int64_t)u_fstatat(dirfd, (const int8_t *)path, &kst, flags);
     if (u_sysret_is_error(ret))
     {
         errno = (int)(-ret);
@@ -3755,14 +3855,13 @@ int fstatat64(int dirfd, const char *path, struct stat64 *out, int flags)
     struct stupidos_stat kst;
     int64_t ret;
 
-    (void)flags;
     if (!out)
     {
         errno = EINVAL;
         return -1;
     }
 
-    ret = (int64_t)u_fstatat(dirfd, (const int8_t *)path, &kst);
+    ret = (int64_t)u_fstatat(dirfd, (const int8_t *)path, &kst, flags);
     if (u_sysret_is_error(ret))
     {
         errno = (int)(-ret);
@@ -6146,9 +6245,16 @@ pid_t vfork(void)
 pid_t waitpid(pid_t pid, int *status, int options)
 {
     int64_t ret;
+    int32_t kstatus;
 
     (void)options;
-    ret = u_waitpid((int32_t)pid);
+    kstatus = 0;
+    ret = u_waitpid_status((int32_t)pid, &kstatus);
+    if (ret == -ENOSYS)
+    {
+        ret = u_waitpid((int32_t)pid);
+        kstatus = 0;
+    }
     if (ret < 0)
     {
         errno = (int)(-ret);
@@ -6157,7 +6263,7 @@ pid_t waitpid(pid_t pid, int *status, int options)
 
     if (status)
     {
-        *status = 0;
+        *status = (int)kstatus;
     }
 
     return (pid_t)ret;
@@ -6989,8 +7095,7 @@ long syscall(long number, ...)
         const char *path = va_arg(ap, const char *);
         struct stat *st = va_arg(ap, struct stat *);
         int flags = va_arg(ap, int);
-        (void)flags;
-        ret = (long)u_fstatat(dirfd, (const int8_t *)path, (struct stupidos_stat *)st);
+        ret = (long)u_fstatat(dirfd, (const int8_t *)path, (struct stupidos_stat *)st, flags);
         if (ret < 0)
         {
             errno = (int)(-ret);
@@ -7006,8 +7111,15 @@ long syscall(long number, ...)
         const char *path = va_arg(ap, const char *);
         char *buf = va_arg(ap, char *);
         size_t len = va_arg(ap, size_t);
-        (void)dirfd;
-        ret = (long)u_readlink((const int8_t *)path, (int8_t *)buf, len);
+        char resolved[STUPIDOS_PATH_MAX];
+
+        if (u_resolve_at_path(dirfd, path, resolved, sizeof(resolved)) != 0)
+        {
+            ret = -1;
+            break;
+        }
+
+        ret = (long)u_readlink((const int8_t *)resolved, (int8_t *)buf, len);
         if (ret < 0)
         {
             errno = (int)(-ret);
@@ -7022,13 +7134,14 @@ long syscall(long number, ...)
         int dirfd = va_arg(ap, int);
         const char *path = va_arg(ap, const char *);
         mode_t mode = (mode_t)va_arg(ap, int);
-        if (dirfd != AT_FDCWD)
+        char resolved[STUPIDOS_PATH_MAX];
+
+        if (u_resolve_at_path(dirfd, path, resolved, sizeof(resolved)) != 0)
         {
-            errno = ENOTSUP;
             ret = -1;
             break;
         }
-        ret = (long)mkdir(path, mode);
+        ret = (long)mkdir(resolved, mode);
         break;
     }
 #endif
@@ -7038,21 +7151,22 @@ long syscall(long number, ...)
         int dirfd = va_arg(ap, int);
         const char *path = va_arg(ap, const char *);
         int flags = va_arg(ap, int);
-        if (dirfd != AT_FDCWD)
+        char resolved[STUPIDOS_PATH_MAX];
+
+        if (u_resolve_at_path(dirfd, path, resolved, sizeof(resolved)) != 0)
         {
-            errno = ENOTSUP;
             ret = -1;
             break;
         }
 #ifdef AT_REMOVEDIR
         if (flags & AT_REMOVEDIR)
         {
-            ret = (long)rmdir(path);
+            ret = (long)rmdir(resolved);
         }
         else
 #endif
         {
-            ret = (long)unlink(path);
+            ret = (long)unlink(resolved);
         }
         break;
     }
@@ -7064,13 +7178,20 @@ long syscall(long number, ...)
         const char *oldpath = va_arg(ap, const char *);
         int newdirfd = va_arg(ap, int);
         const char *newpath = va_arg(ap, const char *);
-        if (olddirfd != AT_FDCWD || newdirfd != AT_FDCWD)
+        char old_resolved[STUPIDOS_PATH_MAX];
+        char new_resolved[STUPIDOS_PATH_MAX];
+
+        if (u_resolve_at_path(olddirfd, oldpath, old_resolved, sizeof(old_resolved)) != 0)
         {
-            errno = ENOTSUP;
             ret = -1;
             break;
         }
-        ret = (long)rename(oldpath, newpath);
+        if (u_resolve_at_path(newdirfd, newpath, new_resolved, sizeof(new_resolved)) != 0)
+        {
+            ret = -1;
+            break;
+        }
+        ret = (long)rename(old_resolved, new_resolved);
         break;
     }
 #endif
@@ -7082,19 +7203,25 @@ long syscall(long number, ...)
         int newdirfd = va_arg(ap, int);
         const char *newpath = va_arg(ap, const char *);
         unsigned int flags = va_arg(ap, unsigned int);
+        char old_resolved[STUPIDOS_PATH_MAX];
+        char new_resolved[STUPIDOS_PATH_MAX];
         if (flags != 0U)
         {
             errno = ENOTSUP;
             ret = -1;
             break;
         }
-        if (olddirfd != AT_FDCWD || newdirfd != AT_FDCWD)
+        if (u_resolve_at_path(olddirfd, oldpath, old_resolved, sizeof(old_resolved)) != 0)
         {
-            errno = ENOTSUP;
             ret = -1;
             break;
         }
-        ret = (long)rename(oldpath, newpath);
+        if (u_resolve_at_path(newdirfd, newpath, new_resolved, sizeof(new_resolved)) != 0)
+        {
+            ret = -1;
+            break;
+        }
+        ret = (long)rename(old_resolved, new_resolved);
         break;
     }
 #endif
@@ -7105,13 +7232,20 @@ long syscall(long number, ...)
         const char *path = va_arg(ap, const char *);
         mode_t mode = (mode_t)va_arg(ap, int);
         int flags = va_arg(ap, int);
-        if (flags != 0 || dirfd != AT_FDCWD)
+        char resolved[STUPIDOS_PATH_MAX];
+
+        if (flags != 0)
         {
             errno = ENOTSUP;
             ret = -1;
             break;
         }
-        ret = (long)chmod(path, mode);
+        if (u_resolve_at_path(dirfd, path, resolved, sizeof(resolved)) != 0)
+        {
+            ret = -1;
+            break;
+        }
+        ret = (long)chmod(resolved, mode);
         break;
     }
 #endif
@@ -7123,13 +7257,20 @@ long syscall(long number, ...)
         uid_t owner = (uid_t)va_arg(ap, unsigned int);
         gid_t group = (gid_t)va_arg(ap, unsigned int);
         int flags = va_arg(ap, int);
-        if (flags != 0 || dirfd != AT_FDCWD)
+        char resolved[STUPIDOS_PATH_MAX];
+
+        if (flags != 0)
         {
             errno = ENOTSUP;
             ret = -1;
             break;
         }
-        ret = (long)chown(path, owner, group);
+        if (u_resolve_at_path(dirfd, path, resolved, sizeof(resolved)) != 0)
+        {
+            ret = -1;
+            break;
+        }
+        ret = (long)chown(resolved, owner, group);
         break;
     }
 #endif
@@ -7158,14 +7299,13 @@ long syscall(long number, ...)
         const char *path = va_arg(ap, const char *);
         const struct timespec *times = va_arg(ap, const struct timespec *);
         int flags = va_arg(ap, int);
-        (void)times;
-        if (flags != 0 || dirfd != AT_FDCWD)
+        ret = (long)u_utimensat(dirfd, (const int8_t *)path,
+                                (const struct stupidos_timespec *)times, flags);
+        if (ret < 0)
         {
-            errno = ENOTSUP;
+            errno = (int)(-ret);
             ret = -1;
-            break;
         }
-        ret = (long)utime(path, 0);
         break;
     }
 #endif

@@ -12,6 +12,7 @@
 #define SH_PROMPT_MAX (SH_CWD_MAX + 32)
 #define SH_HISTORY_MAX 16
 #define SH_COMPLETION_MAX 64
+#define SH_INPUT_PENDING_MAX 512
 
 /*
  * shell 运行在一个很低层的环境里，syscall / IRQ / 调度都会反复打断它。
@@ -26,6 +27,9 @@ static int8_t sh_cwd_buf[SH_CWD_MAX];
 static int8_t sh_prompt_buf[SH_PROMPT_MAX];
 static int8_t sh_history[SH_HISTORY_MAX][SH_LINE_MAX];
 static uint32_t sh_history_count;
+static int sh_last_status;
+static uint8_t sh_input_pending[SH_INPUT_PENDING_MAX];
+static size_t sh_input_pending_len;
 static struct termios sh_saved_termios;
 static bool sh_saved_termios_valid;
 
@@ -49,6 +53,7 @@ static const int8_t *const sh_builtin_commands[] =
     (const int8_t *)"run",
     (const int8_t *)"ls",
     (const int8_t *)"cat",
+    (const int8_t *)"readlink",
     (const int8_t *)"ping",
     (const int8_t *)"sleep",
     (const int8_t *)"netcfg",
@@ -57,6 +62,7 @@ static const int8_t *const sh_builtin_commands[] =
     (const int8_t *)"rmdir",
     (const int8_t *)"rm",
     (const int8_t *)"mv",
+    (const int8_t *)"ln",
     (const int8_t *)"touch",
     (const int8_t *)"wget",
     (const int8_t *)"browser",
@@ -66,6 +72,7 @@ static const int8_t *const sh_builtin_commands[] =
     (const int8_t *)"tcc",
     (const int8_t *)"vi",
     (const int8_t *)"vim",
+    (const int8_t *)"ui",
     (const int8_t *)"busybox",
     (const int8_t *)"python",
     (const int8_t *)"python3",
@@ -79,6 +86,36 @@ static const int8_t *const sh_command_search_dirs[] =
     (const int8_t *)"/usr/bin",
     (const int8_t *)"/usr/local/bin",
     (const int8_t *)"/sbin",
+};
+
+static const int8_t *const sh_busybox_applets[] =
+{
+    (const int8_t *)"wget",
+    (const int8_t *)"ftp",
+    (const int8_t *)"ftpget",
+    (const int8_t *)"ftpput",
+    (const int8_t *)"echo",
+    (const int8_t *)"cat",
+    (const int8_t *)"readlink",
+    (const int8_t *)"ls",
+    (const int8_t *)"mkdir",
+    (const int8_t *)"rmdir",
+    (const int8_t *)"rm",
+    (const int8_t *)"mv",
+    (const int8_t *)"ln",
+    (const int8_t *)"touch",
+    (const int8_t *)"ping",
+    (const int8_t *)"sleep",
+    (const int8_t *)"netcfg",
+    (const int8_t *)"sh",
+    (const int8_t *)"tcc",
+    (const int8_t *)"mkprobe",
+    (const int8_t *)"elfinfo",
+    (const int8_t *)"hello",
+    (const int8_t *)"python3",
+    (const int8_t *)"vi",
+    (const int8_t *)"vim",
+    (const int8_t *)"ui",
 };
 
 static void sh_puts(const int8_t *str)
@@ -141,6 +178,56 @@ static void sh_enable_interactive_mode(void)
 
 static int sh_exec_path(const int8_t *path, int argc, int8_t *argv[]);
 
+static int sh_status_from_exec_error(int ret)
+{
+    if (ret == -ENOENT)
+    {
+        return 127;
+    }
+
+    if (ret == -EACCES || ret == -ENOEXEC)
+    {
+        return 126;
+    }
+
+    return 1;
+}
+
+static void sh_status_to_text(int status, int8_t *buf, size_t buf_len)
+{
+    if (!buf || buf_len == 0)
+    {
+        return;
+    }
+
+    (void)snprintf((char *)buf, buf_len, "%d", status);
+    buf[buf_len - 1] = '\0';
+}
+
+static void sh_expand_special_args(int argc, int8_t *argv[])
+{
+    int i;
+
+    if (!argv || argc <= 0)
+    {
+        return;
+    }
+
+    for (i = 0; i < argc; i++)
+    {
+        if (!argv[i])
+        {
+            continue;
+        }
+
+        if (u_strcmp(argv[i], (const int8_t *)"$?") == 0)
+        {
+            sh_status_to_text(sh_last_status, sh_arg_storage[i], sizeof(sh_arg_storage[i]));
+            argv[i] = sh_arg_storage[i];
+        }
+    }
+}
+
 static void sh_put_u64(uint64_t value)
 {
     int8_t buf[32];
@@ -198,6 +285,8 @@ static int8_t sh_mode_type_char(uint32_t mode)
         return 'd';
     case STUPIDOS_VFS_S_IFCHR:
         return 'c';
+    case STUPIDOS_VFS_S_IFLNK:
+        return 'l';
     case STUPIDOS_VFS_S_IFREG:
         return '-';
     default:
@@ -708,23 +797,45 @@ static int sh_read_line(int8_t *line, size_t max_len)
          * shell 一次拿回一整段，再自己做最小行编辑。
          */
         room = (max_len > len + 1) ? (max_len - len - 1) : 0;
-        if (room == 0)
+        if (sh_input_pending_len > 0)
         {
-            want = SH_READ_CHUNK;
-        }
-        else if (room < SH_READ_CHUNK)
-        {
-            want = room;
+            size_t copy_len;
+
+            copy_len = sh_input_pending_len;
+            if (copy_len > sizeof(chunk))
+            {
+                copy_len = sizeof(chunk);
+            }
+            u_memcpy(chunk, sh_input_pending, copy_len);
+            if (copy_len < sh_input_pending_len)
+            {
+                memmove(sh_input_pending,
+                        sh_input_pending + copy_len,
+                        sh_input_pending_len - copy_len);
+            }
+            sh_input_pending_len -= copy_len;
+            nread = (ssize_t)copy_len;
         }
         else
         {
-            want = SH_READ_CHUNK;
-        }
+            if (room == 0)
+            {
+                want = SH_READ_CHUNK;
+            }
+            else if (room < SH_READ_CHUNK)
+            {
+                want = room;
+            }
+            else
+            {
+                want = SH_READ_CHUNK;
+            }
 
-        nread = u_read(STUPIDOS_STDIN_FILENO, chunk, want);
-        if (nread <= 0)
-        {
-            continue;
+            nread = u_read(STUPIDOS_STDIN_FILENO, chunk, want);
+            if (nread <= 0)
+            {
+                continue;
+            }
         }
 
         for (i = 0; i < (size_t)nread; i++)
@@ -862,6 +973,24 @@ static int sh_read_line(int8_t *line, size_t max_len)
              */
             if (ch == '\r' || ch == '\n')
             {
+                if (i + 1U < (size_t)nread)
+                {
+                    size_t rem;
+                    size_t copy_len;
+
+                    rem = (size_t)nread - (i + 1U);
+                    copy_len = rem;
+                    if (copy_len > sizeof(sh_input_pending) - sh_input_pending_len)
+                    {
+                        copy_len = sizeof(sh_input_pending) - sh_input_pending_len;
+                    }
+                    if (copy_len > 0)
+                    {
+                        u_memcpy(sh_input_pending + sh_input_pending_len, &chunk[i + 1U], copy_len);
+                        sh_input_pending_len += copy_len;
+                    }
+                }
+
                 /*
                  * 终端输入的最后一击也要立刻回显。
                  * 之前很多环境里内核并不会替我们做好行回显，
@@ -948,6 +1077,7 @@ static void sh_help(void)
     sh_puts((const int8_t *)"  run <path> ...  - run an ELF program\r\n");
     sh_puts((const int8_t *)"  ls [path]       - execute /bin/ls\r\n");
     sh_puts((const int8_t *)"  cat <path>      - execute /bin/cat\r\n");
+    sh_puts((const int8_t *)"  ln <src> <dst>  - execute /bin/ln\r\n");
     sh_puts((const int8_t *)"  ping [args]     - execute /bin/ping\r\n");
     sh_puts((const int8_t *)"  sleep [args]    - execute /bin/sleep\r\n");
     sh_puts((const int8_t *)"  netcfg ...      - execute /bin/netcfg\r\n");
@@ -1111,7 +1241,7 @@ static void sh_clear_screen(void)
     (void)u_write(STUPIDOS_STDOUT_FILENO, (const int8_t *)"\x1b[2J\x1b[H", 7);
 }
 
-static void sh_stat_cmd(const int8_t *path)
+static int sh_stat_cmd(const int8_t *path)
 {
     struct stupidos_stat st;
     int8_t perm[11];
@@ -1121,7 +1251,7 @@ static void sh_stat_cmd(const int8_t *path)
     if (ret < 0)
     {
         sh_puts((const int8_t *)"stat: failed\r\n");
-        return;
+        return -1;
     }
 
     sh_puts((const int8_t *)"\r\n");
@@ -1150,6 +1280,7 @@ static void sh_stat_cmd(const int8_t *path)
     sh_puts((const int8_t *)"\r\n  Ino: ");
     sh_put_u64((uint64_t)st.ino);
     sh_puts((const int8_t *)"\r\n");
+    return 0;
 }
 
 static void sh_uname_cmd(void)
@@ -1236,6 +1367,26 @@ static bool sh_contains_slash(const int8_t *path)
     return false;
 }
 
+static bool sh_busybox_has_applet(const int8_t *name)
+{
+    size_t i;
+
+    if (!name || name[0] == '\0')
+    {
+        return false;
+    }
+
+    for (i = 0; i < sizeof(sh_busybox_applets) / sizeof(sh_busybox_applets[0]); i++)
+    {
+        if (u_strcmp(name, sh_busybox_applets[i]) == 0)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static int sh_exec_search(int argc, int8_t *argv[])
 {
     /*
@@ -1310,6 +1461,14 @@ static int sh_exec_search(int argc, int8_t *argv[])
     {
         return -ENOENT;
     }
+    if (!sh_busybox_has_applet(argv[0]))
+    {
+        /*
+         * 只对“已知 applet”启用 busybox 回退（中文）：
+         * 避免把真正的未知命令全都打到 busybox usage，影响交互观感。
+         */
+        return -ENOENT;
+    }
     if (argc + 1 < SH_MAX_ARGS + 2)
     {
         int8_t *busybox_argv[SH_MAX_ARGS + 2];
@@ -1334,6 +1493,8 @@ static int sh_exec_search(int argc, int8_t *argv[])
 static int sh_exec_path(const int8_t *path, int argc, int8_t *argv[])
 {
     int pid;
+    int64_t wait_ret;
+    int32_t status;
 
     sh_restore_terminal();
     (void)fflush(NULL);
@@ -1349,9 +1510,27 @@ static int sh_exec_path(const int8_t *path, int argc, int8_t *argv[])
      * 否则像 ping / ls 这类 ELF 的输出会和 shell 自身的提示混在一起，
      * 用户看起来就像“程序没输出，等 exit 才一起出来”。
      */
-    (void)u_waitpid((int32_t)pid);
+    status = 0;
+    wait_ret = u_waitpid_status((int32_t)pid, &status);
+    if (wait_ret < 0)
+    {
+        /*
+         * 兼容旧内核：如果新 syscall 不存在，就退回“仅等待 pid”模式。
+         */
+        if (wait_ret == -ENOSYS)
+        {
+            wait_ret = u_waitpid((int32_t)pid);
+        }
+        if (wait_ret < 0)
+        {
+            sh_enable_interactive_mode();
+            return (int)wait_ret;
+        }
+        status = 0;
+    }
+
     sh_enable_interactive_mode();
-    return pid;
+    return (status >> 8) & 0xff;
 }
 
 int main(void)
@@ -1376,9 +1555,10 @@ int main(void)
     sh_enable_interactive_mode();
 
     /*
-     * 默认工作目录切到可写的 /tmp（中文）：
-     * 当前根文件系统仍以只读能力为主，用户在 "/" 下直接 mkdir 会看到 EROFS。
-     * 这里先把默认 cwd 放到 /tmp，保证开箱即用的交互体验更接近 Linux 习惯。
+     * 启动优先落在 /tmp（中文）：
+     * - /tmp 更贴近日常交互习惯，临时文件和测试不会污染根目录；
+     * - 如果镜像没有 /tmp，再回退到 /；
+     * - 根分区当前已支持可写，不再假设“根目录必定只读”。
      */
     if (u_chdir((const int8_t *)"/tmp") < 0)
     {
@@ -1391,10 +1571,16 @@ int main(void)
         prompt_len = sh_prompt();
         (void)prompt_len;
         argc = sh_read_line(sh_line_buf, sizeof(sh_line_buf));
+        if (argc < 0)
+        {
+            sh_last_status = 1;
+            continue;
+        }
         ret = sh_history_expand(sh_line_buf, sizeof(sh_line_buf));
         if (ret < 0)
         {
             sh_puts((const int8_t *)"history: no such entry\r\n");
+            sh_last_status = 1;
             continue;
         }
         u_memset(sh_argv_buf, 0, sizeof(sh_argv_buf));
@@ -1407,12 +1593,15 @@ int main(void)
         if (argc < 0)
         {
             sh_puts((const int8_t *)"shell: too many arguments\r\n");
+            sh_last_status = 2;
             continue;
         }
+        sh_expand_special_args(argc, sh_argv_buf);
 
         if ((uint64_t)sh_argv_buf[0] < 0x1000UL)
         {
             sh_puts((const int8_t *)"shell: invalid command pointer\r\n");
+            sh_last_status = 1;
             continue;
         }
 
@@ -1433,6 +1622,7 @@ int main(void)
         {
             sh_help();
             sh_history_add(sh_line_buf);
+            sh_last_status = 0;
             continue;
         }
 
@@ -1442,6 +1632,7 @@ int main(void)
             sh_puts(sh_cwd_buf);
             sh_puts((const int8_t *)"\r\n");
             sh_history_add(sh_line_buf);
+            sh_last_status = 0;
             continue;
         }
 
@@ -1454,10 +1645,12 @@ int main(void)
             if (ret < 0)
             {
                 sh_puts((const int8_t *)"cd: failed\r\n");
+                sh_last_status = 1;
             }
             else
             {
                 sh_refresh_cwd();
+                sh_last_status = 0;
             }
             sh_history_add(sh_line_buf);
             continue;
@@ -1465,9 +1658,12 @@ int main(void)
 
         if (u_strcmp(sh_cmd_buf, (const int8_t *)"exit") == 0)
         {
+            int exit_code;
+
             sh_history_add(sh_line_buf);
             sh_restore_terminal();
-            u_exit(0);
+            exit_code = (argc >= 2 && sh_argv_buf[1]) ? atoi((const char *)sh_argv_buf[1]) : sh_last_status;
+            u_exit(exit_code);
         }
 
         if (u_strcmp(sh_cmd_buf, (const int8_t *)"run") == 0)
@@ -1475,6 +1671,7 @@ int main(void)
             if (argc < 2)
             {
                 sh_puts((const int8_t *)"usage: run <path> [args...]\r\n");
+                sh_last_status = 2;
                 continue;
             }
 
@@ -1482,9 +1679,11 @@ int main(void)
             if (ret < 0)
             {
                 sh_puts((const int8_t *)"run: exec failed\r\n");
+                sh_last_status = sh_status_from_exec_error(ret);
                 continue;
             }
 
+            sh_last_status = ret;
             sh_history_add(sh_line_buf);
             continue;
         }
@@ -1493,6 +1692,7 @@ int main(void)
         {
             sh_history_print();
             sh_history_add(sh_line_buf);
+            sh_last_status = 0;
             continue;
         }
 
@@ -1500,6 +1700,7 @@ int main(void)
         {
             sh_clear_screen();
             sh_history_add(sh_line_buf);
+            sh_last_status = 0;
             continue;
         }
 
@@ -1508,8 +1709,9 @@ int main(void)
             const int8_t *target;
 
             target = (argc >= 2 && sh_argv_buf[1]) ? (const int8_t *)sh_argv_buf[1] : sh_cwd_buf;
-            sh_stat_cmd(target);
+            ret = sh_stat_cmd(target);
             sh_history_add(sh_line_buf);
+            sh_last_status = (ret < 0) ? 1 : 0;
             continue;
         }
 
@@ -1517,6 +1719,7 @@ int main(void)
         {
             sh_uname_cmd();
             sh_history_add(sh_line_buf);
+            sh_last_status = 0;
             continue;
         }
 
@@ -1524,17 +1727,20 @@ int main(void)
         {
             sh_time_cmd();
             sh_history_add(sh_line_buf);
+            sh_last_status = 0;
             continue;
         }
 
         ret = sh_exec_search(argc, sh_argv_buf);
         if (ret >= 0)
         {
+            sh_last_status = ret;
             sh_history_add(sh_line_buf);
             continue;
         }
 
-        sh_puts((const int8_t *)"unknown command\r\n");
+        sh_puts((const int8_t *)"command not found\r\n");
+        sh_last_status = sh_status_from_exec_error(ret);
         sh_history_add(sh_line_buf);
     }
 

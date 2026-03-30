@@ -121,6 +121,8 @@ static uint64_t net_counter_freq;
 static uint32_t net_config_changes;
 
 int net_arp_resolve(struct net_device *dev, uint32_t target_ip, uint8_t out_mac[6]);
+static int64_t net_dns_lookup_on_server(struct net_device *dev, const int8_t *hostname,
+                                        uint32_t *out_ipv4, uint32_t timeout_ms, uint32_t dns_server);
 
 static uint16_t net_bswap16(uint16_t v)
 {
@@ -1442,18 +1444,10 @@ static size_t net_dns_encode_name(const int8_t *hostname, uint8_t *out, size_t o
 
 int64_t net_dns_lookup(struct net_device *dev, const int8_t *hostname, uint32_t *out_ipv4, uint32_t timeout_ms)
 {
-    uint8_t packet[512];
-    uint8_t dns_mac[6];
-    struct net_dns_hdr *hdr;
-    uint8_t *question;
-    uint16_t txid;
-    uint16_t src_port;
-    size_t qname_len;
-    size_t payload_len;
-    ssize_t ret;
-    int probe_ret;
-    uint32_t dns_server;
-    uint32_t resolved_ip;
+    uint32_t dns_servers[4];
+    size_t dns_count;
+    size_t i;
+    int64_t ret;
 
     if (!dev || !hostname || !out_ipv4)
     {
@@ -1467,16 +1461,55 @@ int64_t net_dns_lookup(struct net_device *dev, const int8_t *hostname, uint32_t 
 
     if (net_ipv4_is_slirp_subnet(dev->gateway))
     {
-        dns_server = ((uint32_t)10 << 24) | ((uint32_t)0 << 16) | ((uint32_t)2 << 8) | 3U;
+        dns_servers[0] = ((uint32_t)10 << 24) | ((uint32_t)0 << 16) | ((uint32_t)2 << 8) | 3U;
+        dns_servers[1] = dev->gateway ? dev->gateway : (((uint32_t)10 << 24) | ((uint32_t)0 << 16) | ((uint32_t)2 << 8) | 2U);
+        dns_servers[2] = ((uint32_t)1 << 24) | ((uint32_t)1 << 16) | ((uint32_t)1 << 8) | 1U;
+        dns_servers[3] = ((uint32_t)8 << 24) | ((uint32_t)8 << 16) | ((uint32_t)8 << 8) | 8U;
+        dns_count = 4;
     }
     else if (dev->gateway)
     {
-        dns_server = dev->gateway;
+        dns_servers[0] = dev->gateway;
+        dns_servers[1] = ((uint32_t)10 << 24) | ((uint32_t)0 << 16) | ((uint32_t)2 << 8) | 3U;
+        dns_servers[2] = ((uint32_t)1 << 24) | ((uint32_t)1 << 16) | ((uint32_t)1 << 8) | 1U;
+        dns_servers[3] = ((uint32_t)8 << 24) | ((uint32_t)8 << 16) | ((uint32_t)8 << 8) | 8U;
+        dns_count = 4;
     }
     else
     {
-        dns_server = ((uint32_t)10 << 24) | ((uint32_t)0 << 16) | ((uint32_t)2 << 8) | 3U;
+        dns_servers[0] = ((uint32_t)10 << 24) | ((uint32_t)0 << 16) | ((uint32_t)2 << 8) | 3U;
+        dns_servers[1] = ((uint32_t)1 << 24) | ((uint32_t)1 << 16) | ((uint32_t)1 << 8) | 1U;
+        dns_servers[2] = ((uint32_t)8 << 24) | ((uint32_t)8 << 16) | ((uint32_t)8 << 8) | 8U;
+        dns_count = 3;
     }
+
+    for (i = 0; i < dns_count; i++)
+    {
+        ret = net_dns_lookup_on_server(dev, hostname, out_ipv4, timeout_ms, dns_servers[i]);
+        if (ret == 0)
+        {
+            return 0;
+        }
+    }
+
+    return ret;
+}
+
+static int64_t net_dns_lookup_on_server(struct net_device *dev, const int8_t *hostname,
+                                        uint32_t *out_ipv4, uint32_t timeout_ms, uint32_t dns_server)
+{
+    uint8_t packet[512];
+    uint8_t dns_mac[6];
+    struct net_dns_hdr *hdr;
+    uint8_t *question;
+    uint16_t txid;
+    uint16_t src_port;
+    size_t qname_len;
+    size_t payload_len;
+    ssize_t ret;
+    int probe_ret;
+    uint32_t resolved_ip;
+
     src_port = (uint16_t)(50000U + (net_clock_cycles() & 0x0fffU));
     if (src_port == 53U)
     {

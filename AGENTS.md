@@ -11,7 +11,7 @@
 3. 实现通用系统调用方便移植其他开源软件，键盘驱动，鼠标驱动，tty设备，设备树解析匹配，驱动模型，ttf字体解析并且显示（./Monaco.ttf）softirq，tasklet
 4. 移植python, tcc, ssh等软件上去。
 5. 关键的地方请添加中文注释。 
-6. 可以shiyonggdb-multiarch进行调试OS
+6. 可以使用gdb-multiarch进行调试OS
 7. 优化系统，让系统更加流畅
 
 现在开始执行，不要停。

@@ -23,6 +23,7 @@
 #define VFS_S_IFREG         0x8000
 #define VFS_S_IFDIR         0x4000
 #define VFS_S_IFCHR         0x2000
+#define VFS_S_IFLNK         0xA000
 #define VFS_S_IFSOCK        0xC000
 
 #define VFS_S_IRUSR         0x0100
@@ -71,7 +72,10 @@ struct vfs_inode_ops
     int (*readdir)(struct vfs_inode *dir, uint32_t index, struct vfs_dirent *out);
     ssize_t (*read)(struct vfs_inode *inode, uint64_t offset, void *buf, size_t len);
     ssize_t (*write)(struct vfs_inode *inode, uint64_t offset, const void *buf, size_t len);
+    ssize_t (*readlink)(struct vfs_inode *inode, int8_t *buf, size_t len);
     int (*create)(struct vfs_inode *dir, const int8_t *name, uint16_t mode, struct vfs_inode *out);
+    int (*link)(struct vfs_inode *old_inode, struct vfs_inode *new_dir, const int8_t *new_name);
+    int (*symlink)(struct vfs_inode *dir, const int8_t *name, const int8_t *target, struct vfs_inode *out);
     int (*mkdir)(struct vfs_inode *dir, const int8_t *name, uint16_t mode, struct vfs_inode *out);
     int (*unlink)(struct vfs_inode *dir, const int8_t *name, bool dir_only);
     int (*rename)(struct vfs_inode *old_dir, const int8_t *old_name,
@@ -139,6 +143,8 @@ int vfs_chdir(const int8_t *path);
 int vfs_open(const int8_t *path, int flags);
 int vfs_readdir(const int8_t *path, uint32_t index, struct vfs_dirent *out);
 int vfs_stat(const int8_t *path, struct vfs_stat *out);
+int vfs_lstat(const int8_t *path, struct vfs_stat *out);
+ssize_t vfs_readlink(const int8_t *path, int8_t *buf, size_t len);
 int vfs_fstat(int fd, struct vfs_stat *out);
 ssize_t vfs_read(int fd, void *buf, size_t len);
 ssize_t vfs_write(int fd, const void *buf, size_t len);
@@ -150,8 +156,11 @@ int vfs_close(int fd);
 int vfs_dup(int fd);
 int vfs_dup2(int oldfd, int newfd);
 int vfs_fcntl(int fd, int cmd, uint64_t arg);
+int vfs_fd_path(int fd, int8_t *out, size_t len);
 int vfs_getdents64(int fd, void *buf, size_t len);
 int vfs_mkdir(const int8_t *path, uint16_t mode);
+int vfs_link(const int8_t *old_path, const int8_t *new_path);
+int vfs_symlink(const int8_t *target, const int8_t *new_path);
 int vfs_unlink(const int8_t *path, bool dir_only);
 int vfs_rename(const int8_t *old_path, const int8_t *new_path);
 int vfs_truncate(const int8_t *path, uint64_t size);

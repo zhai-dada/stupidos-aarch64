@@ -96,7 +96,11 @@ typedef int pid_t;
 #define SYS_FBINFO      71
 #define SYS_FBFILL      72
 #define SYS_FBTEXT      73
-#define SYS_PIPE2       74
+#define SYS_MOUSEINFO   74
+#define SYS_PIPE2       75
+#define SYS_WAITPID_STATUS 76
+#define SYS_LINK        77
+#define SYS_SYMLINK     78
 
 #define STUPIDOS_PATH_MAX       256
 
@@ -119,6 +123,7 @@ typedef int pid_t;
 #define STUPIDOS_VFS_S_IFREG    0x8000
 #define STUPIDOS_VFS_S_IFDIR    0x4000
 #define STUPIDOS_VFS_S_IFCHR    0x2000
+#define STUPIDOS_VFS_S_IFLNK    0xA000
 #define STUPIDOS_VFS_S_IFSOCK   0xC000
 
 #define STUPIDOS_VFS_S_IRUSR    0x0100
@@ -223,6 +228,13 @@ struct stupidos_fbinfo
     uint64_t total_bytes;
 };
 
+struct stupidos_mouseinfo
+{
+    int32_t x;
+    int32_t y;
+    uint32_t buttons;
+};
+
 struct stupidos_linux_dirent64
 {
     uint64_t d_ino;
@@ -245,6 +257,9 @@ int u_nettest(void);
 int u_exec(const int8_t *path, int argc, const int8_t *argv[]);
 int64_t u_netping(uint32_t target_ip, uint16_t icmp_seq, uint32_t timeout_ms);
 int64_t u_waitpid(int32_t pid);
+int64_t u_waitpid_status(int32_t pid, int32_t *status);
+int64_t u_link(const int8_t *oldpath, const int8_t *newpath);
+int64_t u_symlink(const int8_t *oldpath, const int8_t *newpath);
 int64_t u_sleep_ms(uint32_t ms);
 int64_t u_netcfg(uint32_t ipv4, uint32_t netmask, uint32_t gateway);
 int64_t u_chdir(const int8_t *path);
@@ -267,7 +282,7 @@ int u_geteuid(void);
 int u_getegid(void);
 int u_access(const int8_t *path, int mode);
 int u_openat(int dirfd, const int8_t *path, int flags);
-int u_fstatat(int dirfd, const int8_t *path, struct stupidos_stat *out);
+int u_fstatat(int dirfd, const int8_t *path, struct stupidos_stat *out, int flags);
 ssize_t u_readlink(const int8_t *path, int8_t *buf, size_t len);
 int u_ioctl(int fd, uint64_t request, void *argp);
 int u_dup(int oldfd);
@@ -306,6 +321,7 @@ int64_t u_pipe2(int fds[2], int flags);
 int u_fbinfo(struct stupidos_fbinfo *out);
 int u_fbfill(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color);
 int u_fbtext(uint32_t x, uint32_t y, uint32_t fg, uint32_t bg, const int8_t *s);
+int u_mouseinfo(struct stupidos_mouseinfo *out);
 void u_exit(int code) __attribute__((noreturn));
 
 size_t u_strlen(const int8_t *str);

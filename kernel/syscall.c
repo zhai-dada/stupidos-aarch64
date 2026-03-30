@@ -18,6 +18,13 @@
 #include "net/net.h"
 #include "ui.h"
 
+#ifndef AT_FDCWD
+#define AT_FDCWD (-100)
+#endif
+#ifndef AT_SYMLINK_NOFOLLOW
+#define AT_SYMLINK_NOFOLLOW 0x100
+#endif
+
 static uint64_t sys_monotonic_usec(void)
 {
     uint64_t cnt;
@@ -35,6 +42,161 @@ static uint64_t sys_monotonic_usec(void)
 
 static uint64_t sys_random_state = 0x9e3779b97f4a7c15ULL;
 static uint32_t sys_getrandom_trace_count;
+
+static size_t sys_u64_to_dec(uint64_t value, int8_t *buf, size_t buf_len)
+{
+    size_t pos;
+
+    if (!buf || buf_len == 0)
+    {
+        return 0;
+    }
+
+    pos = buf_len;
+    buf[--pos] = '\0';
+    if (value == 0)
+    {
+        if (pos == 0)
+        {
+            return 0;
+        }
+        buf[--pos] = '0';
+        return buf_len - pos - 1U;
+    }
+
+    while (value > 0 && pos > 0)
+    {
+        buf[--pos] = (int8_t)('0' + (value % 10ULL));
+        value /= 10ULL;
+    }
+
+    return buf_len - pos - 1U;
+}
+
+static int32_t sys_stdio_target_fd(int64_t fd);
+
+static int sys_build_path_from_dirfd(int64_t dirfd, const int8_t *path, int8_t *out, size_t out_len)
+{
+    int32_t target_fd;
+    int8_t base[VFS_PATH_MAX];
+    size_t base_len;
+    size_t path_len;
+
+    if (!path || !out || out_len < 2)
+    {
+        return -EINVAL;
+    }
+
+    if (path[0] == '/')
+    {
+        return vfs_canonicalize_path(path, out, out_len);
+    }
+
+    if (dirfd == AT_FDCWD)
+    {
+        const int8_t *cwd;
+        size_t cwd_len;
+
+        cwd = task_cwd();
+        if (!cwd || cwd[0] == '\0')
+        {
+            cwd = (const int8_t *)"/";
+        }
+
+        cwd_len = strlen((int8_t *)cwd);
+        if (cwd_len + 1U > sizeof(base))
+        {
+            return -ENAMETOOLONG;
+        }
+        memcpy(base, cwd, cwd_len + 1U);
+    }
+    else
+    {
+        struct vfs_stat st;
+
+        target_fd = sys_stdio_target_fd(dirfd);
+        if (target_fd >= 0)
+        {
+            dirfd = target_fd;
+        }
+
+        if (dirfd < 3)
+        {
+            return -EBADF;
+        }
+
+        if (vfs_fstat((int)(dirfd - 3), &st) < 0)
+        {
+            return -EBADF;
+        }
+
+        if ((st.mode & VFS_S_IFMT) != VFS_S_IFDIR)
+        {
+            return -ENOTDIR;
+        }
+
+        if (vfs_fd_path((int)(dirfd - 3), base, sizeof(base)) < 0)
+        {
+            return -EBADF;
+        }
+    }
+
+    base_len = strlen((int8_t *)base);
+    path_len = strlen((int8_t *)path);
+    if (base_len + 1U + path_len + 1U > out_len)
+    {
+        return -ENAMETOOLONG;
+    }
+
+    memset(out, 0, out_len);
+    memcpy(out, base, base_len);
+    if (base_len == 0 || out[base_len - 1] != '/')
+    {
+        out[base_len++] = '/';
+    }
+    memcpy(out + base_len, path, path_len + 1U);
+    return vfs_canonicalize_path(out, out, out_len);
+}
+
+static int sys_fd_path_link(int64_t fd, int8_t *out, size_t len)
+{
+    int32_t target_fd;
+
+    if (!out || len == 0)
+    {
+        return -EINVAL;
+    }
+
+    target_fd = sys_stdio_target_fd(fd);
+    if (target_fd >= 0)
+    {
+        fd = target_fd;
+    }
+
+    if (fd >= 3)
+    {
+        int ret = vfs_fd_path((int)(fd - 3), out, len);
+        if (ret == 0)
+        {
+            return 0;
+        }
+    }
+
+    if (fd >= 0 && fd <= 2)
+    {
+        /*
+         * 标准流默认映射到控制终端，给 /proc/self/fd/0 这类探测一个稳定结果。
+         */
+        if (len < sizeof("/dev/tty"))
+        {
+            return -ENAMETOOLONG;
+        }
+        memcpy(out, (const int8_t *)"/dev/tty", sizeof("/dev/tty"));
+        return 0;
+    }
+
+    return -ENOENT;
+}
 
 struct futex_waiter
 {
@@ -1094,7 +1256,7 @@ static int64_t sys_time(void)
 
 static int64_t sys_exit(int64_t code)
 {
-    (void)code;
+    task_set_exit_code((int32_t)code);
     task_exit();
     __builtin_unreachable();
 }
@@ -1159,12 +1321,12 @@ static int64_t sys_netping(int64_t target_ip, int64_t seq, int64_t timeout_ms)
                     (uint32_t)timeout_ms);
 }
 
-static int64_t sys_waitpid(int64_t pid)
+static int64_t sys_waitpid_common(int64_t pid, int32_t *out_status)
 {
     struct task_struct *self;
-    struct task_struct *task;
-    bool has_child;
-    uint32_t idx;
+    int32_t child_pid;
+    int32_t status;
+    int ret;
 
     self = task_current();
     if (!self)
@@ -1172,87 +1334,71 @@ static int64_t sys_waitpid(int64_t pid)
         return -ESRCH;
     }
 
-    /*
-     * 兼容语义补齐（中文）：
-     * - waitpid(-1): 等待“任意一个子进程”
-     * - waitpid(pid): 等待指定子进程
-     *
-     * 当前仍是最小实现：不引入僵尸队列，只用 task 状态轮询 + wfe/sev。
-     */
-    if (pid == -1)
+    if (pid < -1 || pid == 0)
     {
-        for (;;)
+        return -EINVAL;
+    }
+
+    for (;;)
+    {
+        child_pid = 0;
+        status = 0;
+        ret = sched_wait_child(self->pid,
+                               (pid == -1) ? -1 : (int32_t)pid,
+                               &child_pid,
+                               &status);
+        if (ret == 0)
         {
-            has_child = false;
-
-            /*
-             * 关键优化（中文）：
-             * 旧实现按 PID 范围线性探测，PID 变大后会把 waitpid 开销放大到
-             * 每次几万次查找，直接拖慢前台 shell 交互。
-             *
-             * 这里改成按调度器 task 槽位扫描（固定 CONFIG_MAX_TASKS），
-             * 开销稳定且与历史 PID 大小无关。
-             */
-            for (idx = 0; idx < task_slot_count(); idx++)
+            if (out_status)
             {
-                task = task_slot_get(idx);
-                if (!task)
-                {
-                    continue;
-                }
-
-                if (task->ppid != self->pid)
-                {
-                    continue;
-                }
-
-                has_child = true;
-                if (task->state == TASK_DEAD)
-                {
-                    return task->pid;
-                }
+                *out_status = status;
             }
-
-            if (!has_child)
-            {
-                return -ECHILD;
-            }
-
-            enable_irq();
-            wfe();
-            disable_irq();
+            return (int64_t)child_pid;
         }
-    }
 
-    if (pid < -1)
-    {
-        return -EINVAL;
-    }
+        if (ret != -EAGAIN)
+        {
+            return (int64_t)ret;
+        }
 
-    task = task_by_pid((int32_t)pid);
-    if (!task)
-    {
-        return -ESRCH;
-    }
-
-    if (task == self)
-    {
-        return -EINVAL;
-    }
-
-    if (task->ppid != self->pid)
-    {
-        return -ECHILD;
-    }
-
-    while (task->state != TASK_DEAD)
-    {
         enable_irq();
         wfe();
         disable_irq();
     }
+}
 
-    return task->pid;
+static int64_t sys_waitpid(int64_t pid)
+{
+    return sys_waitpid_common(pid, 0);
+}
+
+static int64_t sys_waitpid_status(int64_t pid, int64_t status_ptr)
+{
+    int32_t status;
+    int64_t ret;
+
+    ret = sys_waitpid_common(pid, &status);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    if (!status_ptr)
+    {
+        return ret;
+    }
+
+    if (!sys_user_mem_valid((const void *)status_ptr, sizeof(status)))
+    {
+        return -EFAULT;
+    }
+
+    if (sys_copy_to_user((void *)status_ptr, &status, sizeof(status)) < 0)
+    {
+        return -EFAULT;
+    }
+
+    return ret;
 }
 
 static int64_t sys_sleep(int64_t ms)
@@ -1753,32 +1899,42 @@ static int64_t sys_access(int64_t path, int64_t mode)
 
 static int64_t sys_openat(int64_t dirfd, int64_t path, int64_t flags)
 {
-    /*
-     * 当前 VFS 还没有“按目录 fd 做相对路径解析”的能力。
-     * 先兼容最常见的 AT_FDCWD（-100）语义，其他 dirfd 返回 ENOTSUP。
-     */
-    if (dirfd != -100)
+    int8_t kpath[VFS_PATH_MAX];
+    int8_t resolved[VFS_PATH_MAX];
+    int fd;
+    int64_t ret;
+
+    ret = sys_copy_path_from_user(kpath, sizeof(kpath), (const int8_t *)path);
+    if (ret < 0)
     {
-        return -ENOTSUP;
+        return ret;
     }
 
-    return sys_open(path, flags);
+    ret = sys_build_path_from_dirfd(dirfd, kpath, resolved, sizeof(resolved));
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    fd = vfs_open(resolved, (int)flags);
+    if (fd < 0)
+    {
+        return fd;
+    }
+
+    return fd + 3;
 }
 
 static int64_t sys_fstatat(int64_t dirfd, int64_t path, int64_t out, int64_t flags)
 {
     int8_t kpath[VFS_PATH_MAX];
+    int8_t resolved[VFS_PATH_MAX];
     struct vfs_stat st;
     int64_t ret;
 
-    if (flags != 0 && flags != 0x100 /* AT_SYMLINK_NOFOLLOW */)
+    if (flags != 0 && flags != AT_SYMLINK_NOFOLLOW)
     {
         return -EINVAL;
-    }
-
-    if (dirfd != -100)
-    {
-        return -ENOTSUP;
     }
 
     ret = sys_copy_path_from_user(kpath, sizeof(kpath), (const int8_t *)path);
@@ -1787,7 +1943,20 @@ static int64_t sys_fstatat(int64_t dirfd, int64_t path, int64_t out, int64_t fla
         return ret;
     }
 
-    ret = vfs_stat(kpath, &st);
+    ret = sys_build_path_from_dirfd(dirfd, kpath, resolved, sizeof(resolved));
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    if (flags & AT_SYMLINK_NOFOLLOW)
+    {
+        ret = vfs_lstat(resolved, &st);
+    }
+    else
+    {
+        ret = vfs_stat(resolved, &st);
+    }
     if (ret < 0)
     {
         return ret;
@@ -1803,6 +1972,7 @@ static int64_t sys_readlink(int64_t path, int64_t buf, int64_t len)
     const int8_t *cwd;
     struct task_struct *task;
     size_t n;
+    int64_t fd_value;
     int64_t ret;
 
     if (!path || !buf || len <= 0)
@@ -1857,9 +2027,48 @@ static int64_t sys_readlink(int64_t path, int64_t buf, int64_t len)
         memcpy((int8_t *)target, (int8_t *)cwd, cwd_len);
         target[cwd_len] = '\0';
     }
+    else if (strncmp((const char *)kpath, "/proc/self/fd/", 14) == 0)
+    {
+        const int8_t *digits;
+        bool have_digit;
+
+        digits = &kpath[14];
+        fd_value = 0;
+        have_digit = false;
+        while (*digits)
+        {
+            if (*digits < '0' || *digits > '9')
+            {
+                return -ENOENT;
+            }
+
+            have_digit = true;
+            fd_value = (fd_value * 10) + (int64_t)(*digits - '0');
+            if (fd_value > 0x7fffffff)
+            {
+                return -ENOENT;
+            }
+            digits++;
+        }
+
+        if (!have_digit)
+        {
+            return -ENOENT;
+        }
+
+        ret = sys_fd_path_link(fd_value, target, sizeof(target));
+        if (ret < 0)
+        {
+            return ret;
+        }
+    }
     else
     {
-        return -ENOENT;
+        ret = vfs_readlink(kpath, target, sizeof(target));
+        if (ret < 0)
+        {
+            return ret;
+        }
     }
 
     n = strlen((int8_t *)target);
@@ -1875,6 +2084,27 @@ static int64_t sys_readlink(int64_t path, int64_t buf, int64_t len)
 
     memcpy((void *)buf, target, n);
     return (int64_t)n;
+}
+
+static int64_t sys_symlink(int64_t target, int64_t linkpath)
+{
+    int8_t ktarget[VFS_PATH_MAX];
+    int8_t klink[VFS_PATH_MAX];
+    int64_t ret;
+
+    ret = sys_copy_path_from_user(ktarget, sizeof(ktarget), (const int8_t *)target);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    ret = sys_copy_path_from_user(klink, sizeof(klink), (const int8_t *)linkpath);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    return vfs_symlink(ktarget, klink);
 }
 
 static int64_t sys_mkdir(int64_t path, int64_t mode)
@@ -1940,6 +2170,27 @@ static int64_t sys_rename(int64_t old_path, int64_t new_path)
     return vfs_rename(old_kpath, new_kpath);
 }
 
+static int64_t sys_link(int64_t old_path, int64_t new_path)
+{
+    int8_t old_kpath[VFS_PATH_MAX];
+    int8_t new_kpath[VFS_PATH_MAX];
+    int64_t ret;
+
+    ret = sys_copy_path_from_user(old_kpath, sizeof(old_kpath), (const int8_t *)old_path);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    ret = sys_copy_path_from_user(new_kpath, sizeof(new_kpath), (const int8_t *)new_path);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    return vfs_link(old_kpath, new_kpath);
+}
+
 static int64_t sys_truncate(int64_t path, int64_t length)
 {
     int8_t kpath[VFS_PATH_MAX];
@@ -1977,22 +2228,25 @@ static int64_t sys_ftruncate(int64_t fd, int64_t length)
 static int64_t sys_utimensat(int64_t dirfd, int64_t path, int64_t times, int64_t flags)
 {
     int8_t kpath[VFS_PATH_MAX];
+    int8_t resolved[VFS_PATH_MAX];
     struct vfs_timespec ts[2];
     struct vfs_timespec *atime;
     struct vfs_timespec *mtime;
+    struct vfs_stat st;
     int64_t ret;
 
-    if (dirfd != -100)
-    {
-        return -ENOTSUP;
-    }
-
-    if (flags != 0 && flags != 0x100 /* AT_SYMLINK_NOFOLLOW */)
+    if (flags != 0 && flags != AT_SYMLINK_NOFOLLOW)
     {
         return -EINVAL;
     }
 
     ret = sys_copy_path_from_user(kpath, sizeof(kpath), (const int8_t *)path);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    ret = sys_build_path_from_dirfd(dirfd, kpath, resolved, sizeof(resolved));
     if (ret < 0)
     {
         return ret;
@@ -2012,7 +2266,25 @@ static int64_t sys_utimensat(int64_t dirfd, int64_t path, int64_t times, int64_t
         mtime = &ts[1];
     }
 
-    return vfs_utimens(kpath, atime, mtime);
+    if (flags == AT_SYMLINK_NOFOLLOW)
+    {
+        ret = vfs_lstat(resolved, &st);
+        if (ret < 0)
+        {
+            return ret;
+        }
+
+        if ((st.mode & VFS_S_IFMT) == VFS_S_IFLNK)
+        {
+            /*
+             * 目前内核还不提供“修改 symlink 自身时间戳”的真正写路径，
+             * 但对大多数用户态程序来说，AT_SYMLINK_NOFOLLOW 只要不报错即可。
+             */
+            return 0;
+        }
+    }
+
+    return vfs_utimens(resolved, atime, mtime);
 }
 
 static int64_t sys_httpget(int64_t ipv4, int64_t port, int64_t path, int64_t outfd, int64_t timeout_ms)
@@ -2301,6 +2573,23 @@ static int64_t sys_fbtext(int64_t x, int64_t y, int64_t fg, int64_t bg, int64_t 
 
     ui_draw_text((uint32_t)x, (uint32_t)y, (uint32_t)fg, (uint32_t)bg, (const uint8_t *)buf);
     return 0;
+}
+
+static int64_t sys_mouseinfo(int64_t out)
+{
+    struct tty_mouse_state mouse;
+
+    if (!out)
+    {
+        return -EINVAL;
+    }
+
+    /*
+     * 这里直接复用 TTY 层维护的鼠标状态。
+     * 用户态 UI 只需要一个只读快照，不需要接触输入驱动内部细节。
+     */
+    tty_mouse_get_state(&mouse);
+    return sys_copy_to_user((void *)out, &mouse, sizeof(mouse));
 }
 
 static int64_t sys_ioctl(int64_t fd, int64_t request, int64_t argp)
@@ -2732,7 +3021,7 @@ static int64_t sys_getppid(void)
 
 static int64_t sys_exit_group(int64_t code)
 {
-    (void)code;
+    task_set_exit_code((int32_t)code);
     task_exit();
     __builtin_unreachable();
 }
@@ -3241,6 +3530,8 @@ int64_t syscall_dispatch(pt_regs_t *regs)
         return sys_netping((int64_t)regs->s_reg[0], (int64_t)regs->s_reg[1], (int64_t)regs->s_reg[2]);
     case SYS_WAITPID:
         return sys_waitpid((int64_t)regs->s_reg[0]);
+    case SYS_WAITPID_STATUS:
+        return sys_waitpid_status((int64_t)regs->s_reg[0], (int64_t)regs->s_reg[1]);
     case SYS_SLEEP:
         return sys_sleep((int64_t)regs->s_reg[0]);
     case SYS_NETCFG:
@@ -3339,6 +3630,10 @@ int64_t syscall_dispatch(pt_regs_t *regs)
         return sys_unlink((int64_t)regs->s_reg[0]);
     case SYS_RENAME:
         return sys_rename((int64_t)regs->s_reg[0], (int64_t)regs->s_reg[1]);
+    case SYS_LINK:
+        return sys_link((int64_t)regs->s_reg[0], (int64_t)regs->s_reg[1]);
+    case SYS_SYMLINK:
+        return sys_symlink((int64_t)regs->s_reg[0], (int64_t)regs->s_reg[1]);
     case SYS_TRUNCATE:
         return sys_truncate((int64_t)regs->s_reg[0], (int64_t)regs->s_reg[1]);
     case SYS_FTRUNCATE:
@@ -3375,6 +3670,8 @@ int64_t syscall_dispatch(pt_regs_t *regs)
         return sys_fbtext((int64_t)regs->s_reg[0], (int64_t)regs->s_reg[1],
                           (int64_t)regs->s_reg[2], (int64_t)regs->s_reg[3],
                           (int64_t)regs->s_reg[4]);
+    case SYS_MOUSEINFO:
+        return sys_mouseinfo((int64_t)regs->s_reg[0]);
     case SYS_PIPE2:
         return sys_pipe2((int64_t)regs->s_reg[0], (int64_t)regs->s_reg[1]);
     default:
